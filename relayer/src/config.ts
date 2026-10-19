@@ -99,6 +99,16 @@ function validateUrl(value: string, name: string): URL {
 }
 
 /**
+ * Emit a one-time deprecation warning for an environment variable that has
+ * been renamed.  The old name keeps working for one release.
+ */
+function warnDeprecated(oldName: string, newName: string): void {
+  console.warn(
+    `[perihelion] ${oldName} is deprecated and will be removed in a future release; use ${newName} instead.`,
+  );
+}
+
+/**
  * Build config from `process.env`, applying sensible defaults.
  * Throws a descriptive error and exits if required vars are missing or
  * any value is malformed/NaN.
@@ -117,13 +127,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
   }
 
   // --- Required: settlement contract id ---
-  const settlementContractId = env.PERIHELION_SETTLEMENT_CONTRACT ?? "";
+  // Preferred name is PERIHELION_SETTLEMENT_CONTRACT_ID; the old
+  // PERIHELION_SETTLEMENT_CONTRACT is accepted as a deprecated alias.
+  const settlementContractId =
+    env.PERIHELION_SETTLEMENT_CONTRACT_ID ?? env.PERIHELION_SETTLEMENT_CONTRACT ?? "";
   if (!settlementContractId) {
-    errors.push("PERIHELION_SETTLEMENT_CONTRACT is required");
+    errors.push(
+      "PERIHELION_SETTLEMENT_CONTRACT_ID is required (deprecated alias: PERIHELION_SETTLEMENT_CONTRACT)",
+    );
   } else if (!SOROBAN_CONTRACT_RE.test(settlementContractId)) {
     errors.push(
-      `PERIHELION_SETTLEMENT_CONTRACT must be a valid Soroban contract id (C…, 56 chars), got: "${settlementContractId}"`,
+      `PERIHELION_SETTLEMENT_CONTRACT_ID must be a valid Soroban contract id (C…, 56 chars), got: "${settlementContractId}"`,
     );
+  }
+  if (!env.PERIHELION_SETTLEMENT_CONTRACT_ID && env.PERIHELION_SETTLEMENT_CONTRACT) {
+    warnDeprecated("PERIHELION_SETTLEMENT_CONTRACT", "PERIHELION_SETTLEMENT_CONTRACT_ID");
   }
 
   // --- Required: EVM RPC URL ---
@@ -139,15 +157,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
   }
 
   // --- Required: Stellar RPC URL ---
-  const stellarRpcUrl = env.PERIHELION_STELLAR_RPC_URL ?? "";
+  // Preferred name is PERIHELION_SOROBAN_RPC_URL; the old
+  // PERIHELION_STELLAR_RPC_URL is accepted as a deprecated alias.
+  const stellarRpcUrl =
+    env.PERIHELION_SOROBAN_RPC_URL ?? env.PERIHELION_STELLAR_RPC_URL ?? "";
   if (!stellarRpcUrl) {
-    errors.push("PERIHELION_STELLAR_RPC_URL is required");
+    errors.push(
+      "PERIHELION_SOROBAN_RPC_URL is required (deprecated alias: PERIHELION_STELLAR_RPC_URL)",
+    );
   } else {
     try {
-      validateUrl(stellarRpcUrl, "PERIHELION_STELLAR_RPC_URL");
+      validateUrl(stellarRpcUrl, "PERIHELION_SOROBAN_RPC_URL");
     } catch (err) {
       errors.push(String(err));
     }
+  }
+  if (!env.PERIHELION_SOROBAN_RPC_URL && env.PERIHELION_STELLAR_RPC_URL) {
+    warnDeprecated("PERIHELION_STELLAR_RPC_URL", "PERIHELION_SOROBAN_RPC_URL");
   }
 
   // --- Required: source EID (positive integer) ---

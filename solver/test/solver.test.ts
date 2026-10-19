@@ -14,7 +14,7 @@ import {
   type Hex,
 } from "@perihelion/sdk";
 import { Solver, FatalError, type Executor, type Logger } from "../src/solver.js";
-import { Executor as FillExecutor } from "../src/executor.js";
+import { Executor as FillExecutor, DefiniteFailureError } from "../src/executor.js";
 import type { SolverConfig } from "../src/config.js";
 import type { InventoryProvider } from "../src/inventory.js";
 import { RATE_SCALE, type PricingDeps } from "../src/quote.js";
@@ -1103,6 +1103,105 @@ test("issue #727: reservation is held after successful fill until next tick refr
   assert.ok(fillASettled, "intentA should have been filled");
 
   await consider(recordB);
+  assert.ok(
+    skips.some((s) => s.includes("insufficient")),
+    "intentB should be skipped due to insufficient inventory (reservation still held)",
+  );
+});
+
+// ─── Issue 950: DefiniteFailureError releases the reservation immediately ─────
+
+test("issue #950: a DefiniteFailureError releases the reservation in the same tick", async () => {
+  const intentA = buildTestIntent();
+  const intentB = buildIntent({ ...intentA, nonce: "424242" });
+  const recordA = buildTestRecord(intentA);
+  const recordB = buildTestRecord(intentB);
+
+  const inventory: InventoryProvider = { availableBalance: async () => 990000n };
+
+  const mockExecutor: Executor = {
+    fill: mock.fn(async (signed) => {
+      if (signed.intent.nonce === intentA.nonce) {
+        throw new DefiniteFailureError("fill_intent simulation failed");
+      }
+      return { settlementTx: "0xfilled" };
+    }),
+  };
+
+  const errors: string[] = [];
+  const mockLogger: Logger = {
+    info: () => {},
+    warn: () => {},
+    error: (msg) => errors.push(msg),
+  };
+
+  global.fetch = mock.fn(async () => ({ ok: true, status: 200, json: async () => ({ records: [], nextCursor: undefined }) })) as any;
+
+  const solver = new Solver(baseConfig, mockExecutor, mockLogger, undefined, inventory, async () => true, testPricingDeps);
+  const consider = (solver as unknown as { consider(record: IntentRecord): Promise<void> }).consider.bind(solver);
+
+  await consider(recordA);
+  assert.ok(errors.some((e) => e.includes("fill failed")), "intentA's fill should have failed");
+
+  // The definite failure must have released intentA's reservation immediately,
+  // so intentB can fill against the same balance without waiting for a refresh.
+  await consider(recordB);
+  assert.equal(
+    (mockExecutor.fill as ReturnType<typeof mock.fn>).mock.callCount(),
+    2,
+    "intentB's fill should be attempted in the same tick after a definite failure released the reservation",
+  );
+});
+
+test("issue #950: a plain Error keeps the reservation held until the next refresh", async () => {
+  const intentA = buildTestIntent();
+  const intentB = buildIntent({ ...intentA, nonce: "434343" });
+  const recordA = buildTestRecord(intentA);
+  const recordB = buildTestRecord(intentB);
+
+  const inventory: InventoryProvider = { availableBalance: async () => 990000n };
+
+  const mockExecutor: Executor = {
+    fill: mock.fn(async (signed) => {
+      if (signed.intent.nonce === intentA.nonce) {
+        throw new Error("simulated indefinite fill failure");
+      }
+      return { settlementTx: "0xfilled" };
+    }),
+  };
+
+  const skips: string[] = [];
+  const mockMetrics: import("../src/metrics.js").Metrics = {
+    recordFillAttempt: () => {},
+    recordFillWon: () => {},
+    recordFillLost: () => {},
+    recordSkip: (reason) => skips.push(reason),
+    recordFee: () => {},
+    recordFees: () => {},
+    snapshot: () => ({} as any),
+  };
+
+  const mockLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+  global.fetch = mock.fn(async () => ({ ok: true, status: 200, json: async () => ({ records: [], nextCursor: undefined }) })) as any;
+
+  const solver = new Solver(baseConfig, mockExecutor, mockLogger, mockMetrics, inventory, async () => true, testPricingDeps);
+  const consider = (solver as unknown as { consider(record: IntentRecord): Promise<void> }).consider.bind(solver);
+
+  await consider(recordA);
+  assert.equal(
+    (mockExecutor.fill as ReturnType<typeof mock.fn>).mock.callCount(),
+    1,
+    "intentA's fill should have been attempted once",
+  );
+
+  // An indefinite failure must keep the reservation held, so intentB is
+  // skipped for insufficient inventory until the next refresh.
+  await consider(recordB);
+  assert.equal(
+    (mockExecutor.fill as ReturnType<typeof mock.fn>).mock.callCount(),
+    1,
+    "intentB's fill should not be attempted while the indefinite reservation is held",
+  );
   assert.ok(
     skips.some((s) => s.includes("insufficient")),
     "intentB should be skipped due to insufficient inventory (reservation still held)",

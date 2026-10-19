@@ -117,3 +117,109 @@ export class PerihelionHashMismatchError extends PerihelionError {
     this.serverHash = serverHash;
   }
 }
+
+/**
+ * Thrown when a contract call reverts with a custom error decoded from the
+ * escrow ABI. `errorName` is the Solidity error identifier (e.g.
+ * `"NoPendingOwner"`), `selector` is the 4-byte selector as a hex string, and
+ * `args` holds any decoded error arguments.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await escrow.write.cancelOwnershipTransfer();
+ * } catch (e) {
+ *   if (e instanceof PerihelionContractError && e.errorName === "NoPendingOwner") {
+ *     // nothing to cancel — no pending transfer exists
+ *   }
+ * }
+ * ```
+ */
+export class PerihelionContractError extends PerihelionError {
+  readonly errorName: string;
+  readonly selector?: string;
+  readonly args?: readonly unknown[];
+  constructor(
+    errorName: string,
+    selector?: string,
+    args?: readonly unknown[],
+    options?: ErrorOptions,
+  ) {
+    super(
+      `[Perihelion] Contract reverted with ${errorName}` +
+        (selector ? ` (selector ${selector})` : ""),
+      options,
+    );
+    this.errorName = errorName;
+    this.selector = selector;
+    this.args = args;
+  }
+}
+
+/**
+ * Thrown when `cancelOwnershipTransfer` is called but no ownership transfer is
+ * pending. The caller is the owner; the failure is that there is nothing to
+ * cancel, not that the caller lacks ownership.
+ */
+export class NoPendingOwnerError extends PerihelionContractError {
+  constructor(selector?: string, options?: ErrorOptions) {
+    super("NoPendingOwner", selector, undefined, options);
+  }
+}
+
+/**
+ * Thrown when an asset is being allowlisted but the address has no contract
+ * code. No transfer is attempted; the asset simply is not a contract.
+ */
+export class NotAContractError extends PerihelionContractError {
+  constructor(selector?: string, options?: ErrorOptions) {
+    super("NotAContract", selector, undefined, options);
+  }
+}
+
+/**
+ * Thrown when a call is made while the contract is paused. The contract
+ * reverts with OpenZeppelin's `EnforcedPause()` error.
+ */
+export class EnforcedPauseError extends PerihelionContractError {
+  constructor(selector?: string, options?: ErrorOptions) {
+    super("EnforcedPause", selector, undefined, options);
+  }
+}
+
+/** Known custom error names emitted by the escrow contract. */
+export type EscrowErrorName =
+  | "NoPendingOwner"
+  | "NotAContract"
+  | "EnforcedPause"
+  | "NotOwner"
+  | "TransferFailed"
+  | "NotAllowed"
+  | "InvalidAmount"
+  | "InvalidDeadline"
+  | "AlreadySettled"
+  | "IntentExpired"
+  | "Unauthorized"
+  | "ReentrancyGuardReentrantCall";
+
+/**
+ * Map a decoded contract error name to the matching typed SDK error. Unknown
+ * names fall back to a generic {@link PerihelionContractError}.
+ */
+export function contractErrorFromName(
+  errorName: string,
+  selector?: string,
+  args?: readonly unknown[],
+  options?: ErrorOptions,
+): PerihelionContractError {
+  switch (errorName) {
+    case "NoPendingOwner":
+      return new NoPendingOwnerError(selector, options);
+    case "NotAContract":
+      return new NotAContractError(selector, options);
+    case "EnforcedPause":
+      return new EnforcedPauseError(selector, options);
+    default:
+      return new PerihelionContractError(errorName, selector, args, options);
+  }
+}

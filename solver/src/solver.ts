@@ -22,7 +22,7 @@ import type { Metrics, FillFees } from "./metrics.js";
 import type { InventoryProvider } from "./inventory.js";
 import { InFlightTracker } from "./inventory.js";
 import { SeenLRU } from "./seen-lru.js";
-import { DefiniteFailureError } from "./executor.js";
+import { DefiniteFailureError, LockOwnedByOtherError } from "./executor.js";
 
 /** Pluggable execution backend — abstracts the two settlement legs. */
 export interface Executor {
@@ -32,6 +32,14 @@ export interface Executor {
    * confirmed. Returns the Stellar settlement tx hash and optional fee breakdown.
    */
   fill(signed: SignedIntent): Promise<{ settlementTx: string; fees?: FillFees }>;
+
+  /**
+   * Optional: report the persisted progress stage for an intent
+   * (`"lock"`, `"await_registration"`, `"fill"`, `"done"`). Used for logging
+   * and metrics so operators can see where intents stall. Implementations
+   * that do not persist stages may omit it.
+   */
+  stage?(hash: Hex): string | undefined;
 }
 
 /** Minimal logger interface so callers can inject structured logging. */
@@ -620,7 +628,16 @@ export class Solver {
     }
 
     this.consecutiveImplausibleTriggers = 0;
-    this.log.info("filling intent", { hash, profitBps: decision.profitBps });
+    // A retry resumes from the executor's persisted per-intent stage: if a
+    // previous attempt already locked on the EVM escrow, `fill` skips the lock
+    // and proceeds straight to the registration wait / Soroban leg instead of
+    // re-submitting `lock` (which would revert with `AlreadyLocked`).
+    const retry = this.retryState.get(hash);
+    this.log.info("filling intent", {
+      hash,
+      profitBps: decision.profitBps,
+      attempt: (retry?.attempts ?? 0) + 1,
+    });
     this.metrics?.recordFillAttempt(intent.destAsset);
     const reserved = BigInt(intent.minDestAmount);
     this.inFlight.reserve(intent.destAsset, reserved);
@@ -649,17 +666,35 @@ export class Solver {
       // Terminal: filled successfully.
       this.seen.add(hash, deadlineMs);
       this.retryState.delete(hash);
-      // Best-effort: report "settled" to the mempool so the record leaves
+      // Best-effort: report "filled" to the mempool so the record leaves
       // "pending" immediately rather than waiting for deadline eviction.
+      // "filled" is deliberately *not* terminal: at this point we have only
+      // delivered on Stellar — the source-chain escrow has not released yet,
+      // and the LayerZero message may still be in flight, be rejected, or
+      // lose the race with cancelExpired. A separate watcher that observes
+      // the EVM `Released` event promotes the record to "settled".
       // A failed report must never fail or retry the fill — the on-chain
       // settlement already succeeded.
-      await this.reportSettled(hash);
+      await this.reportFilled(hash);
     } catch (err) {
       caughtErr = err;
       if (err instanceof FatalError) throw err;
-      this.log.error("fill failed", { hash, err: String(err) });
-      this.metrics?.recordFillLost(intent.destAsset, String(err));
-      this.scheduleRetry(hash, deadlineMs);
+      if (err instanceof LockOwnedByOtherError) {
+        // The escrow already holds a lock for this intent owned by another
+        // solver: this solver can never complete the fill, so retire the
+        // intent as lost instead of retrying until the budget is exhausted.
+        this.log.warn("retiring intent: locked by another solver", {
+          hash,
+          owner: err.owner,
+        });
+        this.metrics?.recordFillLost(intent.destAsset, "locked_by_other_solver");
+        this.seen.add(hash, deadlineMs);
+        this.retryState.delete(hash);
+      } else {
+        this.log.error("fill failed", { hash, err: String(err) });
+        this.metrics?.recordFillLost(intent.destAsset, String(err));
+        this.scheduleRetry(hash, deadlineMs);
+      }
     } finally {
       if (fillSucceeded) {
         // Successful fill: the capital has left the account on-chain but the
@@ -670,8 +705,13 @@ export class Solver {
         this.inFlight.holdForRefresh(intent.destAsset, reserved);
       } else if (caughtErr instanceof DefiniteFailureError) {
         // Definite failure (on-chain revert / rejection): the transaction
-        // never landed so the capital was never spent.  Release immediately
-        // so the next intent can use the same balance.
+        // never landed so the capital was never spent.  Release the
+        // InFlightTracker reservation in the same tick so the next intent can
+        // use the same balance immediately, rather than holding it until the
+        // next refresh.  The executor is responsible for wrapping definite
+        // failures (simulation errors, sendTransaction ERROR, FAILED tx
+        // results, pre-broadcast reverts) in DefiniteFailureError; anything
+        // else (timeouts, unknown errors) is treated as indefinite below.
         this.inFlight.release(intent.destAsset, reserved);
       } else {
         // Indefinite failure (timeout, network error, etc.): the transaction
@@ -684,29 +724,44 @@ export class Solver {
   }
 
   /**
-   * Best-effort: report `"settled"` to the mempool after a successful fill.
+   * Best-effort: report `"filled"` to the mempool after a successful fill.
    * Errors are logged and swallowed — a failed status report must never
    * affect the on-chain outcome or retry logic.
+   *
+   * `"filled"` is an intermediate, non-terminal status: it means the solver
+   * has delivered on Stellar but the source-chain escrow has not released
+   * yet. Only a component that observes the EVM `Released` event may report
+   * `"settled"`, so a user whose release fails is not shown a completed
+   * bridge and is not steered away from the refund path.
    *
    * Only called when {@link SolverConfig.mempoolStatusToken} is configured.
    * Without a token the PATCH endpoint requires no auth in local/dev setups,
    * but we skip reporting entirely when the operator has not provided one to
    * avoid noisy 401s in production environments that do require auth.
    */
-  private async reportSettled(hash: Hex): Promise<void> {
+  private async reportFilled(hash: Hex): Promise<void> {
     const token = this.config.mempoolStatusToken;
     if (!token) return;
     try {
-      await this.client.reportStatus(hash, "settled" satisfies MempoolIntentStatus, token);
-      this.log.info("reported settled to mempool", { hash });
+      await this.client.reportStatus(hash, "filled" satisfies MempoolIntentStatus, token);
+      this.log.info("reported filled to mempool", { hash });
     } catch (err) {
-      this.log.warn("failed to report settled to mempool (non-fatal)", {
+      this.log.warn("failed to report filled to mempool (non-fatal)", {
         hash,
         err: String(err),
       });
     }
   }
 
+  /**
+   * Schedule a retry of a failed fill.
+   *
+   * The retry does **not** restart at `lock`: the executor persists per-intent
+   * progress, so a retry after a successful lock resumes at the registration
+   * wait / Soroban leg (see {@link Executor.fill}). This is what makes a
+   * partial failure — lock landed, Soroban leg failed — recoverable with
+   * exactly one `lock` transaction.
+   */
   private scheduleRetry(hash: string, deadlineMs: number): void {
     const state = this.retryState.get(hash) ?? { attempts: 0, nextRetryAt: 0 };
     const attempts = state.attempts + 1;
@@ -715,6 +770,13 @@ export class Solver {
       this.seen.add(hash, deadlineMs);
       this.retryState.delete(hash);
     } else {
+      this.log.info("scheduling fill retry", {
+        hash,
+        attempts,
+        // The executor resumes from its persisted stage; surface it so
+        // operators can see where the intent is stalling.
+        stage: this.executor.stage?.(hash) ?? "unknown",
+      });
       this.retryState.set(
         hash,
         { attempts, nextRetryAt: Date.now() + retryBackoff(attempts - 1) },

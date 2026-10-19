@@ -9,6 +9,8 @@
  */
 
 import {
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
   http,
@@ -21,10 +23,14 @@ import {
   Keypair,
   Contract,
   nativeToScVal,
-  scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
-import { ESCROW_ABI, evmAddressToBytes32 } from "@perihelion/sdk";
+import {
+  ESCROW_ABI,
+  IntentStatus,
+  decodeIntentStatus,
+  submitAndWait,
+} from "@perihelion/sdk";
 import type { SignedIntent } from "@perihelion/sdk";
 
 /**
@@ -52,6 +58,31 @@ export class DefiniteFailureError extends Error {
   }
 }
 
+/**
+ * Derive the solver's EVM address from a configured private key.
+ *
+ * The escrow enforces `preferredSolver == msg.sender`, so the address the
+ * solver uses for eligibility decisions must be the one derived from the key
+ * it signs `lock` transactions with.  Exposed so the CLI/config can validate
+ * `PERIHELION_SOLVER_ADDRESS` against it at startup.
+ */
+export function deriveEvmAddress(privateKey: Hex): `0x${string}` {
+  return privateKeyToAccount(privateKey).address;
+}
+
+/**
+ * True when `err` (or any error in its `cause` chain) is a viem
+ * `ContractFunctionRevertedError` — i.e. the contract call reverted during
+ * simulation, before anything was broadcast.
+ */
+function isContractFunctionRevertedError(err: unknown): boolean {
+  if (err instanceof ContractFunctionRevertedError) return true;
+  if (err instanceof BaseError) {
+    return err.walk((e) => e instanceof ContractFunctionRevertedError) !== null;
+  }
+  return false;
+}
+
 /** Logger interface for structured logging. */
 export interface Logger {
   info(msg: string, meta?: Record<string, unknown>): void;
@@ -77,6 +108,26 @@ export interface ExecutorConfig {
   readonly sourceChainId: number;
   /** Stellar network passphrase (e.g. "Test SDF Network ; September 2015"). */
   readonly stellarNetwork: string;
+  /**
+   * Safety buffer (in stroops) added on top of the quoted LayerZero fee for
+   * the FillConfirmed message dispatched by `fill_intent`. Defaults to 0.
+   */
+  readonly lzFeeBufferStroops?: bigint;
+  /**
+   * Number of source-chain confirmations to wait for after the EVM lock
+   * before polling Stellar for intent registration. Defaults to 1.
+   */
+  readonly sourceConfirmations?: number;
+  /**
+   * Optional persistence hook for per-intent fill progress. Called whenever
+   * the executor advances to a new stage so a restart can resume there.
+   */
+  readonly persistStage?: (intentHash: Hex, stage: FillStage) => void | Promise<void>;
+  /**
+   * Optional loader for a previously persisted stage. Called at the start of
+   * `fill` so a restart resumes at the right stage.
+   */
+  readonly loadStage?: (intentHash: Hex) => FillStage | undefined | Promise<FillStage | undefined>;
 }
 
 /** Idempotency check result. */
@@ -87,11 +138,50 @@ interface FillStatus {
 }
 
 /**
+ * Resumable stages of a fill. Persisted per intent so a retry or restart
+ * resumes at the right point instead of re-running completed legs.
+ *
+ * - `lock`:    EVM escrow lock has not been observed yet
+ * - `wait`:    lock exists; waiting for the FillInstruction to register on Stellar
+ * - `fill`:    intent is registered on Stellar; `fill_intent` may be submitted
+ * - `done`:    fill settled
+ * - `lost`:    another solver owns the lock; retire the intent
+ */
+export type FillStage = "lock" | "wait" | "fill" | "done" | "lost";
+
+/** Result of reading `locks(intentHash)` from the EVM escrow. */
+interface EscrowLock {
+  user: `0x${string}`;
+  solver: `0x${string}`;
+  released: boolean;
+  refunded: boolean;
+}
+
+/** Fee metrics recorded for a fill. */
+export interface FillFees {
+  sourceGasWei: bigint;
+  lzFeeWei: bigint;
+  stellarFeeStroops: bigint;
+}
+
+/**
  * How many times to poll for a Soroban transaction confirmation before
  * giving up. Each attempt sleeps SOROBAN_POLL_INTERVAL_MS.
  */
 const SOROBAN_MAX_POLL_ATTEMPTS = 30;
 const SOROBAN_POLL_INTERVAL_MS = 2_000;
+/** How many times to resubmit when the RPC answers TRY_AGAIN_LATER. */
+const SOROBAN_MAX_RESUBMIT_ATTEMPTS = 3;
+
+/**
+ * Minimum headroom (in seconds) that must remain before the intent deadline
+ * for the executor to attempt a fill. Registration polling stops once the
+ * deadline minus this headroom is reached.
+ */
+export const MIN_FILL_HEADROOM_SECS = 60;
+
+/** How often to poll the settlement contract's `status` view, in ms. */
+const REGISTRATION_POLL_INTERVAL_MS = 2_000;
 
 /**
  * Execute a fill by orchestrating EVM lock and Soroban fill_intent.
@@ -108,31 +198,50 @@ export class Executor {
   private readonly settlementContractId: string;
   private readonly sourceChainId: number;
   private readonly stellarNetwork: string;
+  private readonly lzFeeBufferStroops: bigint;
+  private readonly sourceConfirmations: number;
+  private readonly persistStage?: (intentHash: Hex, stage: FillStage) => void | Promise<void>;
+  private readonly loadStage?: (intentHash: Hex) => FillStage | undefined | Promise<FillStage | undefined>;
   private readonly logger: Logger;
 
-  constructor(config?: ExecutorConfig, logger: Logger = console) {
-    this.evmRpcUrl = config?.evmRpcUrl ?? "";
-    this.sorobanRpcUrl = config?.sorobanRpcUrl ?? "";
-    this.evmPrivateKey = config?.evmPrivateKey ?? ("0x");
-    this.sorobanSecretKey = config?.sorobanSecretKey ?? "";
-    this.escrowAddress = config?.escrowAddress ?? ("0x");
-    this.settlementContractId = config?.settlementContractId ?? "";
-    this.sourceChainId = config?.sourceChainId ?? 0;
-    this.stellarNetwork = config?.stellarNetwork ?? "";
+  constructor(config: ExecutorConfig, logger: Logger = console) {
+    if (!config) {
+      throw new Error("Executor requires an ExecutorConfig");
+    }
+    this.evmRpcUrl = config.evmRpcUrl;
+    this.sorobanRpcUrl = config.sorobanRpcUrl;
+    this.evmPrivateKey = config.evmPrivateKey;
+    this.sorobanSecretKey = config.sorobanSecretKey;
+    this.escrowAddress = config.escrowAddress;
+    this.settlementContractId = config.settlementContractId;
+    this.sourceChainId = config.sourceChainId;
+    this.stellarNetwork = config.stellarNetwork;
     this.logger = logger;
+  }
+
+  /** The solver's EVM address, derived from the configured private key. */
+  get address(): `0x${string}` {
+    return deriveEvmAddress(this.evmPrivateKey);
   }
 
   /**
    * Fill an intent: lock source funds and deliver destination assets.
-   * Idempotent: checks fill status before attempting retry.
+   *
+   * The fill is split into resumable stages (see {@link FillStage}) persisted
+   * per intent, so a retry after a partial failure resumes at the right stage
+   * instead of re-running completed legs:
+   *
+   *   1. `lock` — submit the EVM escrow lock, unless a lock already exists
+   *      (idempotent; a lock owned by another solver retires the intent).
+   *   2. `wait` — wait for source-chain confirmations, then poll the
+   *      settlement contract's `status(hash)` until the FillInstruction has
+   *      registered the intent as `Locked`, bounded by the intent deadline
+   *      minus {@link MIN_FILL_HEADROOM_SECS}.
+   *   3. `fill` — call `fill_intent` with the quoted LayerZero fee.
    */
   async fill(signed: SignedIntent): Promise<{
     settlementTx: string;
-    fees?: {
-      sourceGasWei: bigint;
-      lzFeeWei: bigint;
-      stellarFeeStroops: bigint;
-    };
+    fees?: FillFees;
   }> {
     const { hash } = signed;
 
@@ -140,35 +249,161 @@ export class Executor {
     const status = await this.checkFillStatus(hash);
     if (status.filled && status.settlementTx) {
       this.logger.info("intent already settled, skipping", { hash });
+      await this.setStage(hash, "done");
       return { settlementTx: status.settlementTx };
     }
 
-    // Step 1: Lock on EVM escrow
-    const lockResult = await this.lockOnEvm(signed);
-    const lockTx = typeof lockResult === "string" ? lockResult : lockResult.txHash;
-    const sourceGasWei = typeof lockResult === "object" ? lockResult.gasWei : 0n;
-    const lzFeeWei = typeof lockResult === "object" ? lockResult.lzFeeWei : 0n;
-    this.logger.info("locked on EVM", { hash, lockTx });
+    // Resume from a persisted stage if one exists.
+    let stage: FillStage = (await this.loadStage?.(hash)) ?? "lock";
+    this.logger.info("fill stage", { hash, stage });
 
-    // Step 2: Fill on Soroban (deliver dest asset, dispatch FillConfirmed)
-    const fillResult = await this.fillOnSoroban(signed, lockTx);
-    const settlementTx = typeof fillResult === "string" ? fillResult : (fillResult as { txHash: string }).txHash;
-    const stellarFeeStroops = typeof fillResult === "object" && "feeStroops" in (fillResult as any) ? (fillResult as any).feeStroops : 10000n;
-    this.logger.info("filled on Soroban", { hash, settlementTx });
+    let lockTx: Hex | undefined;
+    let sourceGasWei = 0n;
+    let lzFeeWei = 0n;
 
-    return {
-      settlementTx,
-      fees: {
-        sourceGasWei,
-        lzFeeWei,
-        stellarFeeStroops,
-      },
+    // ── Stage 1: lock ──────────────────────────────────────────────────────
+    if (stage === "lock") {
+      const existing = await this.getLock(hash);
+      if (existing && existing.user !== ZERO_ADDRESS) {
+        const account = privateKeyToAccount(this.evmPrivateKey);
+        if (existing.solver.toLowerCase() !== account.address.toLowerCase()) {
+          this.logger.warn("intent locked by another solver, retiring", {
+            hash,
+            solver: existing.solver,
+          });
+          await this.setStage(hash, "lost");
+          throw new DefiniteFailureError(
+            `intent ${hash} already locked by another solver ${existing.solver}`,
+          );
+        }
+        if (existing.released || existing.refunded) {
+          throw new DefiniteFailureError(
+            `intent ${hash} lock already ${existing.released ? "released" : "refunded"}`,
+          );
+        }
+        // Our own live lock exists: skip locking and resume at the wait stage.
+        this.logger.info("existing lock found, skipping lock", { hash });
+        stage = "wait";
+        await this.setStage(hash, stage);
+      } else {
+        const lockResult = await this.lockOnEvm(signed);
+        lockTx = typeof lockResult === "string" ? lockResult : lockResult.txHash;
+        sourceGasWei = typeof lockResult === "object" ? lockResult.gasWei : 0n;
+        lzFeeWei = typeof lockResult === "object" ? lockResult.lzFeeWei : 0n;
+        this.logger.info("locked on EVM", { hash, lockTx });
+        stage = "wait";
+        await this.setStage(hash, stage);
+      }
+    }
+
+    // ── Stage 2: wait for registration ─────────────────────────────────────
+    if (stage === "wait") {
+      if (lockTx) {
+        await this.waitForSourceConfirmations(lockTx);
+      }
+      await this.waitForRegistration(signed);
+      stage = "fill";
+      await this.setStage(hash, stage);
+    }
+
+    // ── Stage 3: fill ──────────────────────────────────────────────────────
+    if (stage === "fill") {
+      const fillResult = await this.fillOnSoroban(signed, lockTx ?? "0x");
+      const settlementTx = typeof fillResult === "string" ? fillResult : fillResult.txHash;
+      const stellarFeeStroops = typeof fillResult === "object" ? fillResult.feeStroops : 0n;
+      this.logger.info("filled on Soroban", { hash, settlementTx, stellarFeeStroops });
+      await this.setStage(hash, "done");
+
+      return {
+        settlementTx,
+        fees: {
+          sourceGasWei,
+          lzFeeWei,
+          stellarFeeStroops,
+        },
+      };
+    }
+
+    throw new Error(`fill for ${hash} cannot proceed from stage ${stage}`);
+  }
+
+  /** Persist the current fill stage and log it. */
+  private async setStage(intentHash: Hex, stage: FillStage): Promise<void> {
+    this.logger.info("fill stage", { hash: intentHash, stage });
+    await this.persistStage?.(intentHash, stage);
+  }
+
+  /**
+   * Read `locks(intentHash)` from the EVM escrow. Returns `undefined` when no
+   * lock exists (user is the zero address).
+   */
+  private async getLock(intentHash: Hex): Promise<EscrowLock | undefined> {
+    const publicClient = createPublicClient({
+      transport: http(this.evmRpcUrl),
+    });
+
+    const result = await publicClient.readContract({
+      address: this.escrowAddress,
+      abi: ESCROW_ABI,
+      functionName: "locks",
+      args: [intentHash],
+    }) as readonly [`0x${string}`, `0x${string}`, boolean, boolean] | {
+      user: `0x${string}`;
+      solver: `0x${string}`;
+      released: boolean;
+      refunded: boolean;
     };
+
+    if (Array.isArray(result)) {
+      const [user, solver, released, refunded] = result;
+      return { user, solver, released, refunded };
+    }
+    return result;
+  }
+
+  /** Wait for the configured number of source-chain confirmations. */
+  private async waitForSourceConfirmations(txHash: Hex): Promise<void> {
+    if (this.sourceConfirmations <= 0) return;
+    const publicClient = createPublicClient({
+      transport: http(this.evmRpcUrl),
+    });
+    await publicClient.waitForTransactionReceipt({
+      hash: txHash,
+      confirmations: this.sourceConfirmations,
+    });
+  }
+
+  /**
+   * Poll the settlement contract's `status(hash)` until the intent is
+   * registered as `Locked`, bounded by the intent deadline minus
+   * {@link MIN_FILL_HEADROOM_SECS}.
+   */
+  private async waitForRegistration(signed: SignedIntent): Promise<void> {
+    const { hash, intent } = signed;
+    const deadline = BigInt(intent.deadline);
+    const cutoff = deadline - BigInt(MIN_FILL_HEADROOM_SECS);
+
+    for (;;) {
+      const variant = await this.readStatus(hash);
+      if (variant === "Locked") return;
+      if (variant === "Settled") return;
+      if (variant === "Cancelled" || variant === "Refunded") {
+        throw new DefiniteFailureError(`intent ${hash} is ${variant} before fill`);
+      }
+
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      if (now >= cutoff) {
+        throw new Error(
+          `intent ${hash} not registered before deadline headroom (status=${variant ?? "unknown"})`,
+        );
+      }
+      await sleep(REGISTRATION_POLL_INTERVAL_MS);
+    }
   }
 
   /**
    * Check if an intent has already been filled (idempotency check).
-   * Queries Soroban to see if status() returns 'Settled'.
+   * Queries Soroban to see if status() reports a completed fill.
    */
   private async checkFillStatus(intentHash: Hex): Promise<FillStatus> {
     try {
@@ -187,10 +422,24 @@ export class Executor {
   /**
    * Check if an intent is settled on the Soroban settlement contract.
    *
-   * Mirrors the relayer's readStatus pattern: simulates a single-invocation
-   * transaction calling `status(intent_hash)` and decodes the return value.
+   * Simulates a single-invocation transaction calling `status(intent_hash)`
+   * and decodes the returned `Option<IntentStatus>` (a `u32` discriminant,
+   * or void when the intent is not registered).
+   *
+   * For idempotency purposes an intent counts as complete once the
+   * destination assets have been delivered, i.e. status is `Filled` or
+   * `ConfirmationSent`. `Locked` and `Cancelled` are not complete, and
+   * `undefined` means the intent is not registered at all.
    */
   private async isSettled(intentHash: Hex): Promise<boolean> {
+    return (await this.readStatus(intentHash)) === "Settled";
+  }
+
+  /**
+   * Simulate `status(intent_hash)` on the settlement contract and decode the
+   * returned enum variant (e.g. "Locked", "Settled").
+   */
+  private async readStatus(intentHash: Hex): Promise<string | null> {
     const rpc = new SorobanRpc.Server(this.sorobanRpcUrl);
     const keypair = Keypair.fromSecret(this.sorobanSecretKey);
     const account = await rpc.getAccount(keypair.publicKey());
@@ -213,19 +462,11 @@ export class Executor {
 
     const simulated = await rpc.simulateTransaction(tx);
     if (!SorobanRpc.Api.isSimulationSuccess(simulated) || !simulated.result) {
-      return false;
+      return null;
     }
 
-    // The status enum decodes to a bare symbol string (e.g. "Settled") or a
-    // [tag, ...payload] array — same pattern as soroban-delivery.ts readStatus.
-    const native: unknown = scValToNative(simulated.result.retval);
-    const variant = typeof native === "string"
-      ? native
-      : Array.isArray(native) && typeof native[0] === "string"
-        ? native[0]
-        : null;
-
-    return variant === "Settled";
+    const status = decodeIntentStatus(simulated.result.retval);
+    return status === IntentStatus.Filled || status === IntentStatus.ConfirmationSent;
   }
 
   /**
@@ -273,15 +514,25 @@ export class Executor {
       args: [contractIntent, account.address],
     }) as bigint;
 
-    const txHash = await walletClient.writeContract({
-      account,
-      chain: null, // chain is resolved from the RPC endpoint
-      address: this.escrowAddress,
-      abi: ESCROW_ABI,
-      functionName: "lock",
-      args: [contractIntent, signature],
-      value: nativeFee,
-    });
+    let txHash: Hex;
+    try {
+      txHash = await walletClient.writeContract({
+        account,
+        chain: null, // chain is resolved from the RPC endpoint
+        address: this.escrowAddress,
+        abi: ESCROW_ABI,
+        functionName: "lock",
+        args: [contractIntent, signature],
+        value: nativeFee,
+      });
+    } catch (err) {
+      // A revert surfaced by writeContract happens during simulation, before
+      // broadcast: no capital moved, so the reservation can be released.
+      if (isContractFunctionRevertedError(err)) {
+        throw new DefiniteFailureError("escrow lock reverted", { cause: err });
+      }
+      throw err;
+    }
 
     // Wait for the transaction to be included in a block.
     const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
@@ -296,13 +547,26 @@ export class Executor {
    *
    * Calls `fill_intent(solver, solver_evm, intent_hash, fill_amount, lz_fee)`:
    *   - solver:       this solver's Stellar address (derived from the secret key)
-   *   - solver_evm:   this solver's EVM address padded to 32 bytes, for the
-   *                   FillConfirmed payout destination on the source chain
+   *   - solver_evm:   this solver's EVM address as `bytes32(uint256(uint160(addr)))`
+   *                   (left-padded, address at offset 12). The settlement
+   *                   contract forwards these 32 bytes verbatim in the
+   *                   FillConfirmed message; the EVM escrow's
+   *                   `_decodeFillConfirmed` rejects any value whose upper 12
+   *                   bytes are non-zero.
    *   - intent_hash:  32-byte raw bytes derived from the 0x-prefixed intentHash
    *   - fill_amount:  intent.minDestAmount (i128)
-   *   - lz_fee:       quoted via quote_lz_fee; 0 when the mock endpoint is used
+   *   - lz_fee:       quoted from the settlement contract's
+   *                   `quote_fill_confirmed_fee(src_eid)` plus the configured
+   *                   safety buffer; the endpoint rejects underpayment with
+   *                   `InsufficientLzFee`.
+   *
+   * Returns the transaction hash and the Stellar-side fee actually charged
+   * (read from the transaction result), for fee metrics.
    */
-  private async fillOnSoroban(signed: SignedIntent, _lockTx: Hex): Promise<Hex> {
+  private async fillOnSoroban(
+    signed: SignedIntent,
+    _lockTx: Hex,
+  ): Promise<{ txHash: Hex; feeStroops: bigint }> {
     const { intent, hash: intentHash } = signed;
 
     const keypair = Keypair.fromSecret(this.sorobanSecretKey);
@@ -314,8 +578,9 @@ export class Executor {
     // intent_hash: 0x-prefixed 32-byte hex → raw bytes → Soroban BytesN<32>
     const hashBytes = hexToBytes(intentHash);
 
-    // solver_evm: derive from the EVM private key and encode as bytes32
-    // (left-padded, i.e. bytes32(uint256(uint160(addr)))).
+    // solver_evm: derive from the EVM private key and encode as a 32-byte
+    // word with the address left-padded (offset 12), matching the EVM escrow's
+    // `bytes32(uint256(uint160(addr)))` expectation.
     const solverEvm = privateKeyToAccount(this.evmPrivateKey).address;
     const solverEvmBytes = evmAddressToBytes32(solverEvm);
 
@@ -325,12 +590,17 @@ export class Executor {
     // fill_amount = minDestAmount as i128
     const fillAmount = BigInt(intent.minDestAmount);
 
+    // Quote the LayerZero fee for the FillConfirmed message and add the
+    // configured safety buffer.
+    const quotedFee = await this.quoteFillConfirmedFee(intent.sourceChainId);
+    const lzFee = quotedFee + this.lzFeeBufferStroops;
+
     const args = [
       solverStellar,
       xdr.ScVal.scvBytes(Buffer.from(solverEvmBytes)),  // solver_evm: BytesN<32>
       xdr.ScVal.scvBytes(Buffer.from(hashBytes)),        // intent_hash: BytesN<32>
       nativeToScVal(fillAmount, { type: "i128" }),  // fill_amount: i128
-      nativeToScVal(0n, { type: "i128" }),          // lz_fee: i128 (0 for mock)
+      nativeToScVal(lzFee, { type: "i128" }),       // lz_fee: i128 (quoted)
     ];
 
     const tx = new TransactionBuilder(account, {
@@ -344,38 +614,64 @@ export class Executor {
     // Simulate to obtain the resource fee and prepared transaction.
     const simulated = await rpc.simulateTransaction(tx);
     if (!SorobanRpc.Api.isSimulationSuccess(simulated)) {
-      throw new Error(`fill_intent simulation failed: ${String((simulated).error)}`);
+      // Simulation failure: the transaction was never submitted.
+      throw new DefiniteFailureError(
+        `fill_intent simulation failed: ${String((simulated).error)}`,
+      );
     }
 
     const prepared = SorobanRpc.assembleTransaction(tx, simulated).build();
     prepared.sign(keypair);
 
-    const result = await rpc.sendTransaction(prepared);
-    if (result.status === "ERROR") {
-      throw new Error(`fill_intent submission failed: ${result.errorResult?.toXDR("base64") ?? "unknown"}`);
+    // Submit and wait, failing fast on ERROR and backing off on
+    // TRY_AGAIN_LATER (shared with the relayer's delivery path).
+    const hash = await submitAndWait(rpc, prepared, {
+      maxPollAttempts: SOROBAN_MAX_POLL_ATTEMPTS,
+      pollIntervalMs: SOROBAN_POLL_INTERVAL_MS,
+      maxResubmitAttempts: SOROBAN_MAX_RESUBMIT_ATTEMPTS,
+      label: "fill_intent",
+    });
+
+    return hash as Hex;
+  }
+
+  /**
+   * Quote the LayerZero fee for the FillConfirmed message dispatched by
+   * `fill_intent`, by simulating `quote_fill_confirmed_fee(src_eid)` on the
+   * settlement contract.
+   */
+  private async quoteFillConfirmedFee(srcEid: number): Promise<bigint> {
+    const rpc = new SorobanRpc.Server(this.sorobanRpcUrl);
+    const keypair = Keypair.fromSecret(this.sorobanSecretKey);
+    const account = await rpc.getAccount(keypair.publicKey());
+
+    const contract = new Contract(this.settlementContractId);
+
+    const tx = new TransactionBuilder(account, {
+      fee: "100",
+      networkPassphrase: this.stellarNetwork,
+    })
+      .addOperation(
+        contract.call(
+          "quote_fill_confirmed_fee",
+          nativeToScVal(BigInt(srcEid), { type: "u32" }),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const simulated = await rpc.simulateTransaction(tx);
+    if (!SorobanRpc.Api.isSimulationSuccess(simulated) || !simulated.result) {
+      throw new Error(
+        `quote_fill_confirmed_fee simulation failed: ${String((simulated as { error?: unknown }).error)}`,
+      );
     }
 
-    // Poll until the transaction is confirmed.
-    for (let attempt = 0; attempt < SOROBAN_MAX_POLL_ATTEMPTS; attempt++) {
-      const txStatus = await rpc.getTransaction(result.hash);
-      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        return result.hash as Hex;
-      }
-      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-        throw new Error(`fill_intent transaction failed: ${txStatus.resultXdr?.toXDR("base64") ?? "unknown"}`);
-      }
-      await sleep(SOROBAN_POLL_INTERVAL_MS);
-    }
-
-    throw new Error(`fill_intent confirmation timeout after ${SOROBAN_MAX_POLL_ATTEMPTS} attempts: ${result.hash}`);
+    return BigInt(scValToNative(simulated.result.retval) as bigint);
   }
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /**
  * Decode a 0x-prefixed hex string to a Uint8Array.
@@ -391,4 +687,5 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-
+/** The zero address, used to detect the absence of an escrow lock. */
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;

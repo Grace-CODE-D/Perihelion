@@ -87,7 +87,7 @@ the source chain.
 | `version`     | `0x01`                                                           |
 | `type`        | `0x02` (FillConfirmed)                                           |
 | `intent_hash` | 32 bytes of `0x11`                                               |
-| `solver_evm`  | 32-byte word; low 20 bytes = EVM address `0xAA…AA`               |
+| `solver_evm`  | 32-byte word; low 20 bytes (offsets 12–31) = EVM address `0xAA…AA`; high 12 bytes zero |
 | `amount`      | `1_000_000` (u128, big-endian) — informational, not used by EVM  |
 | `ledger`      | `42` (u64, big-endian) — informational                           |
 
@@ -118,13 +118,23 @@ inbound decoder tests (`test.rs`) each load these vectors and assert rejection.
 A new decoder implementation is conformant only if it rejects every vector here
 and accepts every golden vector above.
 
-### `solver_evm` address encoding (issue #60)
+### `solver_evm` address encoding (issues #60, #946)
 
 An EVM address occupies the **low 20 bytes** (160 bits) of the 32-byte
-`solver_evm` word. The high 12 bytes must be zero. A decoder that silently
-truncates a word with non-zero high bytes would redirect funds to a different
-address; decoders must therefore reject such words with a `MalformedPayload`
-error rather than truncating.
+`solver_evm` word — i.e. it is written at byte offsets 12–31 and the word is
+equivalent to `bytes32(uint256(uint160(addr)))`. The high 12 bytes (offsets
+0–11) must be zero. A decoder that silently truncates a word with non-zero high
+bytes would redirect funds to a different address; decoders must therefore
+reject such words with a `MalformedPayload` error rather than truncating.
+
+The canonical encoder for this field is the SDK helper
+`evmAddressToBytes32` from `@perihelion/sdk` (left-pads the 20 address bytes
+into offsets 12–31). Both the solver executor and the relayer must use it
+instead of hand-rolling the conversion; a left-justified encoding (address in
+offsets 0–19) is rejected by the EVM decoder and would leave the solver
+unrepaid (issue #946). The SDK helper is cross-checked in tests against
+`fill_confirmed.hex` above and against the EVM `_decodeFillConfirmed` decoder,
+so the encoder and decoder cannot drift apart.
 
 `neg/fill_confirmed_nonzero_high.hex` contains a valid-length FillConfirmed
 with the first byte of `solver_evm` set to `0xFF`. Both decoders must reject it.

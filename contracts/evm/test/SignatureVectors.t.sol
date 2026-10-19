@@ -154,12 +154,123 @@ contract SignatureVectorsTest is Test {
         );
     }
 
+    // ─── ERC-1271 vectors ─────────────────────────────────────────────────────
+
+    function test_erc1271_magic_value_accepted() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(
+            MockERC1271Wallet.Mode.ReturnMagic,
+            bytes4(0x1626ba7e)
+        );
+        bytes memory sig = hex"deadbeef";
+        assertTrue(
+            harness.verifyEIP712(EXPECTED_INTENT_HASH, address(wallet), sig),
+            "ERC-1271 wallet returning magic value must be accepted"
+        );
+    }
+
+    function test_erc1271_wrong_value_rejected() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(
+            MockERC1271Wallet.Mode.ReturnMagic,
+            bytes4(0xffffffff)
+        );
+        bytes memory sig = hex"deadbeef";
+        assertFalse(
+            harness.verifyEIP712(EXPECTED_INTENT_HASH, address(wallet), sig),
+            "ERC-1271 wallet returning wrong value must be rejected"
+        );
+    }
+
+    function test_erc1271_revert_rejected() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(
+            MockERC1271Wallet.Mode.Revert,
+            bytes4(0x1626ba7e)
+        );
+        bytes memory sig = hex"deadbeef";
+        assertFalse(
+            harness.verifyEIP712(EXPECTED_INTENT_HASH, address(wallet), sig),
+            "ERC-1271 wallet that reverts must be rejected"
+        );
+    }
+
+    function test_erc1271_empty_return_rejected() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(
+            MockERC1271Wallet.Mode.ReturnEmpty,
+            bytes4(0x1626ba7e)
+        );
+        bytes memory sig = hex"deadbeef";
+        assertFalse(
+            harness.verifyEIP712(EXPECTED_INTENT_HASH, address(wallet), sig),
+            "ERC-1271 wallet returning no data must be rejected"
+        );
+    }
+
+    function test_erc1271_short_return_rejected() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(
+            MockERC1271Wallet.Mode.ReturnShort,
+            bytes4(0x1626ba7e)
+        );
+        bytes memory sig = hex"deadbeef";
+        assertFalse(
+            harness.verifyEIP712(EXPECTED_INTENT_HASH, address(wallet), sig),
+            "ERC-1271 wallet returning fewer than 32 bytes must be rejected"
+        );
+    }
+
+    function test_erc1271_does_not_accept_ecdsa_vectors() public {
+        // A contract wallet must not fall back to ECDSA: a valid ECDSA
+        // signature for SIGNER must be rejected when intent.user is a contract.
+        MockERC1271Wallet wallet = new MockERC1271Wallet(
+            MockERC1271Wallet.Mode.ReturnMagic,
+            bytes4(0xffffffff)
+        );
+        bytes memory sig = _vectorSig(0);
+        assertFalse(
+            harness.verifyEIP712(EXPECTED_INTENT_HASH, address(wallet), sig),
+            "contract wallet must not accept ECDSA signatures"
+        );
+    }
+
     // ─── Helper ───────────────────────────────────────────────────────────────
 
     function _vectorSig(uint256 index) internal view returns (bytes memory) {
         string memory json = vm.readFile(VECTORS_FILE);
         string memory key = string.concat(".vectors[", vm.toString(index), "].signature");
         return vm.parseJsonBytes(json, key);
+    }
+}
+
+/// @dev Minimal ERC-1271 wallet used to exercise the contract-wallet branch of
+///      the signature verifier.  Behaviour is selected by `mode`.
+contract MockERC1271Wallet {
+    enum Mode {
+        ReturnMagic, // return the configured 4-byte value (left-padded to 32 bytes)
+        Revert,      // revert on isValidSignature
+        ReturnEmpty, // return zero-length data
+        ReturnShort  // return fewer than 32 bytes
+    }
+
+    Mode internal immutable mode;
+    bytes4 internal immutable magic;
+
+    constructor(Mode _mode, bytes4 _magic) {
+        mode = _mode;
+        magic = _magic;
+    }
+
+    function isValidSignature(bytes32, bytes calldata) external view returns (bytes4) {
+        if (mode == Mode.Revert) revert("MockERC1271: invalid signature");
+        if (mode == Mode.ReturnEmpty) {
+            assembly {
+                return(0, 0)
+            }
+        }
+        if (mode == Mode.ReturnShort) {
+            assembly {
+                mstore(0, 0)
+                return(0, 4)
+            }
+        }
+        return magic;
     }
 }
 
@@ -197,9 +308,46 @@ contract SigVerifyHarness {
         address preferredSolver;
     }
 
-    /// @notice Replicate PerihelionEscrow._verify exactly.
+    // ERC-1271 magic value: bytes4(keccak256("isValidSignature(bytes32,bytes)"))
+    bytes4 private constant ERC1271_MAGIC_VALUE = 0x1626ba7e;
+
+    // Bounded gas stipend for the ERC-1271 staticcall, mirroring the escrow.
+    uint256 private constant ERC1271_GAS_STIPEND = 30_000;
+
+    /// @notice Replicate PerihelionEscrow._verify exactly, including the
+    ///         ERC-1271 branch for contract wallets.
     function verifyEIP712(bytes32 digest, address signer, bytes calldata signature)
         external
+        view
+        returns (bool)
+    {
+        if (signer.code.length > 0) {
+            return _verifyERC1271(digest, signer, signature);
+        }
+        return _verifyECDSA(digest, signer, signature);
+    }
+
+    /// @dev ERC-1271 path: staticcall isValidSignature with a bounded gas
+    ///      stipend and accept only the magic value with >= 32 bytes returned.
+    function _verifyERC1271(bytes32 digest, address signer, bytes calldata signature)
+        private
+        view
+        returns (bool)
+    {
+        (bool ok, bytes memory ret) = signer.staticcall{ gas: ERC1271_GAS_STIPEND }(
+            abi.encodeWithSelector(
+                bytes4(keccak256("isValidSignature(bytes32,bytes)")),
+                digest,
+                signature
+            )
+        );
+        if (!ok || ret.length < 32) return false;
+        return bytes4(ret) == ERC1271_MAGIC_VALUE;
+    }
+
+    /// @dev ECDSA path: 65-byte signature, EIP-2 low-s, v in {27,28}.
+    function _verifyECDSA(bytes32 digest, address signer, bytes calldata signature)
+        private
         pure
         returns (bool)
     {

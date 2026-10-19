@@ -18,6 +18,7 @@
  * toSmallestUnits("0.99", 7)
  */
 
+import type { Address } from "viem";
 import { PerihelionValidationError } from "./errors.js";
 
 /** Upper bound on `decimals`, generous for any real asset but small enough to rule out unbounded BigInt exponentiation. */
@@ -109,4 +110,32 @@ export function fromSmallestUnits(smallest: string, decimals: number): string {
   // Only prepend the sign if the magnitude is actually nonzero — avoids "-0".
   const sign = negative && (whole !== 0n || frac !== "") ? "-" : "";
   return frac ? `${sign}${whole}.${frac}` : `${sign}${whole}`;
+}
+
+/**
+ * Encode a 20-byte EVM address into a 32-byte buffer, right-justified
+ * (zeros in bytes 0–11, address in bytes 12–31).
+ *
+ * This matches the EVM ABI encoding `bytes32(uint256(uint160(addr)))` and is
+ * the layout the escrow's `_decodeFillConfirmed` expects for `solver_evm`:
+ * the upper 12 bytes must be zero, otherwise the payload is rejected as
+ * `MalformedPayload` (issue #946).
+ *
+ * @param address 0x-prefixed 20-byte hex EVM address.
+ * @returns 32-byte buffer with the address left-padded.
+ * @throws If `address` is not a 0x-prefixed 20-byte hex string.
+ */
+export function evmAddressToBytes32(address: Address): Uint8Array {
+  if (typeof address !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new PerihelionValidationError(
+      `evmAddressToBytes32: expected a 0x-prefixed 20-byte hex address, got "${String(address)}"`,
+      "address",
+    );
+  }
+  const out = new Uint8Array(32);
+  const hex = address.slice(2);
+  for (let i = 0; i < 20; i++) {
+    out[12 + i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }

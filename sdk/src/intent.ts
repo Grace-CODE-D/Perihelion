@@ -14,6 +14,8 @@ import {
   isAddress,
   recoverTypedDataAddress,
   zeroAddress,
+  type Hex as ViemHex,
+  type PublicClient,
   type TypedDataDomain,
 } from "viem";
 import type { Address, Hex, Intent } from "./types.js";
@@ -446,29 +448,115 @@ const SECP256K1_HALF_N =
   0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
 
 /**
- * Recover the signer of an intent and check it matches `intent.user`.
+ * ERC-1271 magic value returned by `isValidSignature(bytes32,bytes)` when a
+ * contract wallet accepts a signature: `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+ */
+export const ERC1271_MAGIC_VALUE = "0x1626ba7e" as const;
+
+/** Minimal ERC-1271 ABI fragment used to verify contract-wallet signatures. */
+export const ERC1271_ABI = [
+  {
+    type: "function",
+    name: "isValidSignature",
+    stateMutability: "view",
+    inputs: [
+      { name: "hash", type: "bytes32" },
+      { name: "signature", type: "bytes" },
+    ],
+    outputs: [{ name: "magicValue", type: "bytes4" }],
+  },
+] as const;
+
+/**
+ * Options for {@link verifyIntent}.
+ */
+export interface VerifyIntentOptions {
+  /**
+   * A viem `PublicClient` used to detect whether `intent.user` is a contract
+   * (via `getCode`) and, if so, to call its ERC-1271 `isValidSignature`.
+   *
+   * Required when `intent.user` may be a smart-contract wallet (Safe multisig,
+   * ERC-4337 account, etc.). Without it, contract users are rejected because
+   * the ECDSA recovery path cannot validate their signatures.
+   */
+  client?: PublicClient;
+  /**
+   * Override the contract-detection step. When provided, `getCode` is not
+   * called and this value decides which verification path is taken:
+   * `true` → ERC-1271, `false` → ECDSA. Useful when the caller already knows
+   * (or has cached) whether the user account is a contract.
+   */
+  isContract?: boolean;
+}
+
+/**
+ * Verify an intent signature, supporting both EOAs (ECDSA) and smart-contract
+ * wallets (ERC-1271).
  *
- * Matches `PerihelionEscrow._verify` exactly: only a canonical 65-byte
- * `r ‖ s ‖ v` signature is accepted.
- * - **64-byte EIP-2098 "compact" signatures are rejected outright.** viem's
- *   recovery path accepts them, but the on-chain verifier does not (it checks
- *   `signature.length != 65` before touching `r`/`s`/`v`), so accepting them
- *   here would let a signature the contract would refuse pass SDK-side checks —
- *   and, worse, a compact re-encoding of an already-valid 65-byte signature
- *   recovers to the *same* signer, giving each signed intent a second valid
- *   byte-string (malleability) purely from the encoding choice.
- * - Any length other than 65 bytes is rejected immediately.
- * - The EIP-2 low-s check is applied unconditionally to the one accepted
- *   length, rejecting the high-s (`s > n/2`) malleable counterpart of every
- *   signature.
+ * Mirrors `PerihelionEscrow._verify`:
+ * - **Contract users** (`intent.user.code.length > 0`): the signature is
+ *   validated by calling `isValidSignature(digest, signature)` on the account
+ *   and checking for the ERC-1271 magic value `0x1626ba7e`. Any revert, call
+ *   failure, or non-magic return value is treated as an invalid signature.
+ *   Detecting a contract requires {@link VerifyIntentOptions.client} (or an
+ *   explicit {@link VerifyIntentOptions.isContract} flag).
+ * - **EOA users**: only a canonical 65-byte `r ‖ s ‖ v` signature is accepted.
+ *   - **64-byte EIP-2098 "compact" signatures are rejected outright.** viem's
+ *     recovery path accepts them, but the on-chain verifier does not (it checks
+ *     `signature.length != 65` before touching `r`/`s`/`v`), so accepting them
+ *     here would let a signature the contract would refuse pass SDK-side checks —
+ *     and, worse, a compact re-encoding of an already-valid 65-byte signature
+ *     recovers to the *same* signer, giving each signed intent a second valid
+ *     byte-string (malleability) purely from the encoding choice.
+ *   - Any length other than 65 bytes is rejected immediately.
+ *   - The EIP-2 low-s check is applied unconditionally to the one accepted
+ *     length, rejecting the high-s (`s > n/2`) malleable counterpart of every
+ *     signature.
  *
  * @param domain  Must be built with {@link perihelionDomain}.
+ * @param options See {@link VerifyIntentOptions}. Supply `client` (or
+ *                `isContract`) when the user may be a contract wallet.
  */
 export async function verifyIntent(
   intent: Intent,
   signature: Hex,
   domain: TypedDataDomain,
+  options?: VerifyIntentOptions,
 ): Promise<boolean> {
+  // Determine whether the user account is a contract. An explicit override
+  // wins; otherwise ask the chain when a client is available.
+  let isContract = options?.isContract;
+  if (isContract === undefined && options?.client) {
+    try {
+      const code = await options.client.getCode({ address: intent.user as Address });
+      isContract = code !== undefined && code !== "0x";
+    } catch {
+      // If we cannot determine the account type, fall through to the ECDSA
+      // path; a contract user will then simply fail verification.
+      isContract = false;
+    }
+  }
+
+  if (isContract) {
+    if (!options?.client) return false;
+    const digest = hashIntent(intent, domain);
+    try {
+      const result = await options.client.readContract({
+        address: intent.user as Address,
+        abi: ERC1271_ABI,
+        functionName: "isValidSignature",
+        args: [digest as ViemHex, signature as ViemHex],
+      });
+      return (
+        typeof result === "string" &&
+        result.toLowerCase() === ERC1271_MAGIC_VALUE
+      );
+    } catch {
+      // Reverts (including a missing function) mean the signature is invalid.
+      return false;
+    }
+  }
+
   // Strictly require a canonical 65-byte (r, s, v) signature:
   // "0x" + r[32] + s[32] + v[1] = 132 hex chars. This rejects 64-byte EIP-2098
   // compact signatures outright, matching PerihelionEscrow._verify's

@@ -10,6 +10,12 @@ import {
     ILayerZeroReceiver
 } from "./interfaces/ILayerZero.sol";
 
+/// @dev Minimal ERC-1271 interface for smart-contract wallet signature validation.
+interface IERC1271 {
+    /// @notice Returns the magic value `0x1626ba7e` when `hash` is validly signed by this account.
+    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
+}
+
 /// @title Perihelion Escrow
 /// @notice Source-chain leg of the Perihelion bridge, and a LayerZero OApp.
 ///
@@ -189,9 +195,9 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @notice Extra delay beyond `deadline` before the local refund fallback opens,
     ///         giving an in-flight FillConfirmed time to land first (race guard).
     uint256 public confirmationGrace = 2 hours;
-    /// @notice Emergency halt. Blocks new `lock`s and local `cancelExpired` refunds;
-    ///         in-flight settlement still completes via `lzReceive` so funds are
-    ///         never stranded mid-flight. Mirrors the Soroban side's pause.
+    /// @notice Emergency halt. Blocks new `lock`s only; local `cancelExpired`
+    ///         refunds and inbound settlement via `lzReceive` remain available so
+    ///         funds are never stranded mid-flight. Mirrors the Soroban side's pause.
     bool public paused;
     /// @notice When a guardian-initiated pause auto-expires (0 if no guardian
     ///         pause is active, or the current pause is owner-controlled).
@@ -356,6 +362,10 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     error StaleNonce();
     error NotOwner();
     error NotPendingOwner();
+    /// @dev `cancelOwnershipTransfer` was called while no handover is pending.
+    error NoPendingOwner();
+    /// @dev An address expected to be a contract (e.g. an allowlisted asset) has no code.
+    error NotAContract();
     error NotAuthorized();
     error Reentrancy();
     error EnforcedPause();
@@ -431,8 +441,12 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     // --- Admin ---------------------------------------------------------------
 
     /// @notice Set the trusted Stellar settlement peer.
+    /// @dev Reverts with {ZeroAddress} for `bytes32(0)`: a zero peer would make every
+    ///      inbound message revert with {UntrustedPeer} and route FillInstructions to
+    ///      the zero receiver, silently disabling settlement.
     /// @param peer 32-byte LayerZero address of the trusted Stellar settlement OApp.
     function setPeer(bytes32 peer) external onlyOwner {
+        if (peer == bytes32(0)) revert ZeroAddress();
         stellarPeer = peer;
         emit PeerSet(peer);
     }
@@ -455,12 +469,13 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         emit GuardianSet(newGuardian);
     }
 
-    /// @notice Emergency halt / resume. Blocks new locks and local refunds; does
-    ///         not block inbound settlement so in-flight funds still resolve.
+    /// @notice Emergency halt / resume. Blocks new locks only; local `cancelExpired`
+    ///         refunds and inbound settlement remain available so in-flight funds
+    ///         still resolve.
     ///         Owner calling this clears any guardian-initiated expiry — if called
     ///         with `true` the pause becomes indefinite; if `false` it also resets
     ///         the guardian cooldown so the guardian remains operational.
-    /// @param _paused True to halt new locks and local refunds; false to resume.
+    /// @param _paused True to halt new locks; false to resume.
     function setPaused(bool _paused) external onlyOwner {
         paused = _paused;
         guardianPauseExpiry = 0; // owner takes full control; no auto-expiry
@@ -505,7 +520,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @param asset Address of the ERC-20 token to allow or disallow.
     /// @param allowed True to add to allowlist, false to remove.
     function setAssetAllowed(address asset, bool allowed) external onlyOwner {
-        if (allowed && asset.code.length == 0) revert TransferFailed();
+        if (allowed && asset.code.length == 0) revert NotAContract();
         assetAllowed[asset] = allowed;
         emit AssetAllowed(asset, allowed);
     }
@@ -588,7 +603,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///         event so off-chain monitors can clearly distinguish a cancellation
     ///         from a transfer-to-zero. Reverts if no handover is pending.
     function cancelOwnershipTransfer() external onlyOwner {
-        if (pendingOwner == address(0)) revert NotOwner();
+        if (pendingOwner == address(0)) revert NoPendingOwner();
         pendingOwner = address(0);
         emit OwnershipTransferCancelled(owner);
     }
@@ -642,10 +657,11 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @notice Solver claims an intent: verify the user's signature, pull the
     ///         funds (measured-delta), and dispatch FillInstruction to Stellar.
     /// @dev `msg.value` funds the LayerZero send. Call {quoteFee} to size it.
-    ///      The LayerZero endpoint is expected to refund any excess nativeFee to
-    ///      `msg.sender` (the refundAddress passed to endpoint.send); this is the
-    ///      standard V2 convention. Callers should still use {quoteFee} to minimise
-    ///      over-payment rather than relying on endpoint refunds.
+    ///      Exactly the quoted fee is forwarded to the endpoint; any excess
+    ///      (`msg.value - quoted`) is refunded to `msg.sender` by this contract.
+    ///      Callers should use {quoteFee} to minimise over-payment.
+    ///      Reverts with {ZeroAddress} while `stellarPeer` is unset, so no lock can
+    ///      be created whose FillInstruction would go nowhere.
     ///      The user must have approved this contract for `sourceAmount` of `sourceAsset`.
     /// @param intent The user's signed intent specifying bridge parameters.
     /// @param signature EIP-712 signature over the intent by intent.user.
@@ -655,6 +671,9 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         nonReentrant
         whenNotPaused
     {
+        // Refuse to lock before a peer is configured: the FillInstruction would be
+        // dispatched to the zero receiver and no FillConfirmed could ever arrive.
+        if (stellarPeer == bytes32(0)) revert ZeroAddress();
         // `lock` is split into narrowly-scoped helpers so no single frame holds
         // enough live locals to exceed the legacy codegen's 16-slot stack limit
         // (#857). Order of checks, effects and interactions is unchanged.
@@ -940,8 +959,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// so it is best-effort only — do not rely on third-party keepers for liveness.
     ///
     /// # Liveness guarantee
-    /// The refund IS guaranteed to be available (barring contract pause) once the
-    /// grace period elapses. The guarantee is ENFORCED by the user's SDK helper
+    /// The refund IS guaranteed to be available once the grace period elapses;
+    /// `cancelExpired` is not pause-gated. The guarantee is ENFORCED by the user's SDK helper
     /// or a front-end integration that watches for expired intents. Liveness is
     /// a **user responsibility**, not a protocol feature. If neither the user nor
     /// any keeper calls `cancelExpired`, the funds remain locked until the grace
@@ -967,10 +986,10 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     /// @notice Quote the LayerZero native fee for a FillInstruction to Stellar for a specific payer.
     ///         Solvers should call this off-chain passing their own address as `payer` and pass
-    ///         the result (with a small buffer) as `msg.value` to {lock}. Any excess is refunded by
-    ///         the endpoint to the caller per the LayerZero V2 convention.
+    ///         the result (with a small buffer) as `msg.value` to {lock}. {lock} forwards exactly
+    ///         the quoted fee to the endpoint and refunds any excess to the caller itself.
     /// @param intent Intent whose FillInstruction message size determines the fee.
-    /// @param payer The address that will call lock (refund destination for LayerZero endpoint).
+    /// @param payer The address that will call lock (used for the quote context).
     /// @return nativeFee Estimated native token fee in wei.
     function quoteFee(Intent calldata intent, address payer) public view returns (uint256 nativeFee) {
         // Use a placeholder hash — the fee depends only on message size, not content.
@@ -1219,11 +1238,25 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     // --- Internal: signature & token safety ----------------------------------
 
+    /// @dev Verify an intent signature. Contract accounts (Safe, ERC-4337 smart
+    ///      accounts) are validated via ERC-1271 with a bounded gas stipend; EOAs use
+    ///      the 65-byte ECDSA path. Returns false rather than reverting on failure.
     function _verify(bytes32 digest, address signer, bytes calldata signature)
         private
-        pure
+        view
         returns (bool)
     {
+        // ERC-1271 path for smart-contract wallets.
+        if (signer.code.length > 0) {
+            uint256 gasStipend = gasleft();
+            if (gasStipend > 100_000) gasStipend = 100_000;
+            (bool ok, bytes memory ret) = signer.staticcall{ gas: gasStipend }(
+                abi.encodeWithSelector(IERC1271.isValidSignature.selector, digest, signature)
+            );
+            if (!ok || ret.length < 32) return false;
+            return abi.decode(ret, (bytes4)) == IERC1271.isValidSignature.selector;
+        }
+
         if (signature.length != 65) return false;
         bytes32 r;
         bytes32 s;

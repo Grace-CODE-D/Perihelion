@@ -85,6 +85,10 @@ export class IntentStore {
    * back to the oldest record overall so a store saturated with `pending`
    * intents still makes room. `Map` iterates in insertion order, so the first
    * match in each pass is the oldest.
+   *
+   * `filled` is a non-terminal intermediate state (delivered on Stellar,
+   * awaiting source-chain release), so it is not preferred for eviction; it
+   * falls through to the oldest-overall pass like `pending`.
    */
   private evictOne(): void {
     for (const [hash, record] of this.records) {
@@ -106,6 +110,10 @@ export class IntentStore {
   /**
    * Update a record's status. Refuses to move a record out of a terminal
    * status (`settled`/`refunded`/`expired`) — those are final.
+   *
+   * `filled` is a non-terminal intermediate state (delivered on Stellar,
+   * awaiting source-chain release), so a `filled` record remains mutable and
+   * can transition to `settled` once the source chain emits `Released`.
    *
    * The stored record is frozen, so the status change is applied by replacing
    * the record with a new frozen copy rather than mutating in place. This stays

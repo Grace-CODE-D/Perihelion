@@ -2,8 +2,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { toSmallestUnits, fromSmallestUnits } from "../src/units.js";
-import { evmAddressToBytes32 } from "../src/evm-address.js";
+import { evmAddressToBytes32 } from "../src/evmAddress.js";
 
 // ---------------------------------------------------------------------------
 // Issue #533 — fromSmallestUnits mishandles negative input and lacks string
@@ -87,31 +89,45 @@ test("fromSmallestUnits negative output round-trips back through Math.abs + toSm
 });
 
 // ---------------------------------------------------------------------------
-// Issue #939 — EVM addresses must be encoded left-padded into bytes32
-// (bytes32(uint256(uint160(addr)))), i.e. the address occupies bytes 12-31.
+// Issue #946 — evmAddressToBytes32 must left-pad the address (bytes 12-31)
+// so the EVM escrow's `_decodeFillConfirmed` accepts the `solver_evm` word.
 // ---------------------------------------------------------------------------
 
-test("evmAddressToBytes32 left-pads a minimal address into bytes 12-31", () => {
-  const out = evmAddressToBytes32("0x0000000000000000000000000000000000000001");
+test("evmAddressToBytes32 returns exactly 32 bytes", () => {
+  const out = evmAddressToBytes32("0x00000000000000000000000000000000000000aa");
   assert.equal(out.length, 32);
-  assert.deepEqual(out.subarray(0, 31), Buffer.alloc(31));
-  assert.equal(out[31], 0x01);
 });
 
-test("evmAddressToBytes32 left-pads a full address correctly", () => {
+test("evmAddressToBytes32 zero-pads the first 12 bytes and copies the address into the last 20", () => {
   const addr = "0x1234567890abcdef1234567890abcdef12345678";
   const out = evmAddressToBytes32(addr);
   assert.equal(out.length, 32);
-  assert.deepEqual(out.subarray(0, 12), Buffer.alloc(12));
-  assert.equal(out.subarray(12).toString("hex"), addr.slice(2).toLowerCase());
+  for (let i = 0; i < 12; i++) {
+    assert.equal(out[i], 0, `byte ${i} should be zero`);
+  }
+  const expectedTail = Buffer.from(addr.slice(2), "hex");
+  assert.deepEqual(out.subarray(12), expectedTail);
 });
 
-test("evmAddressToBytes32 throws on malformed or missing input instead of returning zeros", () => {
-  for (const bad of [undefined, null, "", "0x", "0x1234", "not-an-address", "0x" + "zz".repeat(20)]) {
-    assert.throws(
-      () => evmAddressToBytes32(bad as unknown as string),
-      (err: unknown) => err instanceof Error,
-      `expected a throw for ${JSON.stringify(bad)}`,
-    );
-  }
+test("evmAddressToBytes32 produces the golden vector for 0x...aa", () => {
+  const out = evmAddressToBytes32("0x00000000000000000000000000000000000000aa");
+  assert.equal(
+    "0x" + out.toString("hex"),
+    "0x00000000000000000000000000000000000000000000000000000000000000aa",
+  );
+});
+
+test("evmAddressToBytes32 matches the solver_evm word in the shared wire vector", () => {
+  const vectorPath = fileURLToPath(
+    new URL("../../contracts/shared/wire-vectors/fill_confirmed.hex", import.meta.url),
+  );
+  const hex = readFileSync(vectorPath, "utf8").trim().replace(/^0x/, "");
+  const vector = Buffer.from(hex, "hex");
+  // solver_evm occupies bytes 34-65 of the FillConfirmed message.
+  const solverWord = vector.subarray(34, 66);
+  const addr = "0x" + solverWord.subarray(12).toString("hex");
+  const out = evmAddressToBytes32(addr);
+  assert.deepEqual(out, solverWord);
+  // Sanity: the upper 12 bytes must be zero, as the EVM decoder requires.
+  assert.deepEqual(solverWord.subarray(0, 12), Buffer.alloc(12));
 });

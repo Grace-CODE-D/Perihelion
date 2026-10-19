@@ -431,6 +431,41 @@ announcement:
 
 ---
 
+## 6.2 Service configuration (relayer, solver, mempool)
+
+The relayer, solver and mempool share one configuration scheme: **one variable
+name per setting**, so a single shared `.env` configures all three services.
+The old, service-specific names are still accepted for one release and log a
+deprecation warning; use the unified name in new deployments.
+
+| Setting | Unified variable | Deprecated alias(es) | Required | Default |
+| ------- | ---------------- | -------------------- | -------- | ------- |
+| Soroban settlement contract id | `PERIHELION_SETTLEMENT_CONTRACT` | `PERIHELION_SETTLEMENT_CONTRACT_ID` (solver) | yes | — |
+| Stellar / Soroban RPC URL | `PERIHELION_STELLAR_RPC_URL` | `PERIHELION_SOROBAN_RPC_URL` (solver) | yes | — |
+| Source chain id | `PERIHELION_SOURCE_CHAIN_ID` | — | **yes (all services)** | none — must be set explicitly |
+| Metrics/health bind host | `PERIHELION_HEALTH_HOST` | `PERIHELION_METRICS_HOST` (solver), `PERIHELION_MEMPOOL_HOST` (mempool) | no | `127.0.0.1` |
+| Metrics/health bind port | `PERIHELION_HEALTH_PORT` | `PERIHELION_METRICS_PORT` (solver), `PERIHELION_MEMPOOL_PORT` (mempool) | no | service-specific (see below) |
+| Solver address | `PERIHELION_SOLVER_ADDRESS` | — | yes (solver) | — |
+| Solver private key | `PERIHELION_SOLVER_PRIVATE_KEY` | — | yes (solver) | — |
+| Relayer private key | `PERIHELION_RELAYER_PRIVATE_KEY` | — | yes (relayer) | — |
+| Mempool database URL | `PERIHELION_MEMPOOL_DATABASE_URL` | — | yes (mempool) | — |
+
+Notes:
+
+- **`PERIHELION_SOURCE_CHAIN_ID` is required by every service and has no
+  default.** The solver previously defaulted to `8453` in one loader and `1` in
+  another, which could silently point the two at different chains; that is
+  removed. Startup fails if the variable is unset.
+- **`PERIHELION_SOLVER_ADDRESS` is validated** against the address derived from
+  `PERIHELION_SOLVER_PRIVATE_KEY`; a mismatch is a startup error.
+- The bind host/port defaults are per service: relayer `127.0.0.1:8080`, solver
+  `127.0.0.1:8081`, mempool `127.0.0.1:8082`. Set `PERIHELION_HEALTH_HOST` /
+  `PERIHELION_HEALTH_PORT` explicitly in container deployments to bind `0.0.0.0`.
+- `docker-compose.yml` sets each setting once under its unified name and shares
+  it across the three services.
+
+---
+
 ## 7. Recommended production parameters
 
 | Parameter             | Recommendation                                               |

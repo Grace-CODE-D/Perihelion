@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { nativeToScVal, scValToNative, xdr } from "@stellar/stellar-sdk";
+import { nativeToScVal, scValToNative, scvU32, scvVoid } from "@stellar/stellar-sdk";
 import { FatalError } from "../src/relayer.js";
 import { SorobanDestinationDelivery } from "../src/soroban-delivery.js";
 import type { BridgeMessage } from "../src/types.js";
@@ -36,6 +36,44 @@ test("Soroban delivery rejects invalid intent hash lengths", () => {
       .intentHashScVal("0x1234"),
     FatalError,
   );
+});
+
+test("Soroban delivery encodes the intent deadline in the FillInstruction", () => {
+  const delivery = makeDelivery();
+  const deadline = 1_700_000_123n;
+  const message = {
+    srcEid: 1,
+    dstEid: 2,
+    intentHash: INTENT_HASH,
+    messageType: 0,
+    solver: "0x0000000000000000000000000000000000000001",
+    recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    destAsset: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    amount: "1000",
+    nonce: 7,
+    deadline,
+  };
+
+  const scVal = (delivery as unknown as {
+    appendLzReceiveCall(args: {
+      message: unknown;
+      guid: string;
+      payload: Uint8Array;
+    }): { operations(): Array<{ body(): { invokeHostFunction(): { invokeContractOp(): { contractAddress(): unknown; functionName(): unknown; args(): unknown[] } } } }> };
+  }).appendLzReceiveCall({
+    message,
+    guid: "0x" + "11".repeat(32),
+    payload: new Uint8Array([1, 2, 3]),
+  });
+
+  const op = scVal.operations()[0]!.body().invokeHostFunction().invokeContractOp();
+  const args = op.args();
+  const decoded = scValToNative(args[args.length - 1] as Parameters<typeof scValToNative>[0]) as {
+    deadline: bigint;
+  };
+
+  assert.equal(decoded.deadline, deadline);
+  assert.notEqual(decoded.deadline, 0n);
 });
 
 test("Soroban delivery preserves FatalError", async () => {

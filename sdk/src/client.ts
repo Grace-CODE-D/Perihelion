@@ -74,7 +74,9 @@ export interface ListPendingPageResult {
  *   (network connection errors and 5xx HTTP responses) up to `maxRetries` times with exponential backoff.
  *   Timeouts and caller-initiated aborts are never retried.
  * - **Polling ({@link waitForSettlement})**: Repeatedly calls {@link getIntent} until a terminal status
- *   (`settled`, `refunded`, `expired`) is reached or `timeoutMs` elapses.
+ *   (`settled`, `refunded`, `expired`) is reached or `timeoutMs` elapses. The intermediate
+ *   `filled` status (delivered on the destination chain, awaiting source-chain release) is
+ *   **not** terminal, so polling continues through it.
  */
 export class PerihelionClient {
   private readonly base: string;
@@ -381,6 +383,12 @@ export class PerihelionClient {
    * Poll until the intent reaches a terminal state (`settled`, `refunded`, or
    * `expired`) or the timeout elapses.
    *
+   * The intermediate `filled` status is **not** terminal: it means the intent
+   * has been delivered on the destination chain but the source chain has not
+   * yet released the escrowed funds. Polling continues through `filled` until
+   * the record becomes `settled` (source-chain `Released` observed) or another
+   * terminal state is reached.
+   *
    * **Retry policy**: Repeatedly polls {@link getIntent} at configured `intervalMs`.
    * Each poll attempt inherits `getIntent`'s retry policy for transient errors,
    * but the total elapsed polling time is strictly bounded by `timeoutMs`.
@@ -455,11 +463,13 @@ export class PerihelionClient {
    * 1. It exists and has not been settled or previously refunded.
    * 2. Its deadline has passed **and** the confirmation grace period has elapsed.
    * 3. No `FillConfirmed` was received — the status is still `'pending'`.
-   *    An intent with status `'claimed'`, `'settling'`, or `'expired'` is **not**
-   *    refundable: `settling` means a cross-chain message is already in flight
-   *    (calling `cancelExpired` would race it and likely revert with
-   *    `AlreadyFinalized`), and `claimed` / `expired` indicate the on-chain
-   *    state has already diverged from the refund path.
+   *    An intent with status `'claimed'`, `'settling'`, `'filled'`, or
+   *    `'expired'` is **not** refundable: `settling` means a cross-chain message
+   *    is already in flight (calling `cancelExpired` would race it and likely
+   *    revert with `AlreadyFinalized`), `filled` means the intent was delivered
+   *    on the destination chain and is awaiting source-chain release (the
+   *    refund path no longer applies), and `claimed` / `expired` indicate the
+   *    on-chain state has already diverged from the refund path.
    *
    * This helper detects when a bridge has definitively failed and the user's
    * funds can be recovered locally without waiting for cross-chain confirmation.
@@ -501,8 +511,9 @@ export class PerihelionClient {
   ): boolean {
     // Condition 3: only 'pending' intents are candidates — no settlement is
     // in progress or has already completed. This also excludes 'settling',
-    // which has a cross-chain message in flight and must not be treated as
-    // refundable purely on elapsed time.
+    // which has a cross-chain message in flight, and 'filled', which has been
+    // delivered on the destination chain and is awaiting source-chain release;
+    // neither must be treated as refundable purely on elapsed time.
     if (record.status !== "pending") {
       return false;
     }

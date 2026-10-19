@@ -19,18 +19,59 @@ import { SolverMetrics } from "./metrics.js";
 import { createLogger } from "./logger.js";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { privateKeyToAccount } from "viem/accounts";
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const executorConfig = hasExecutorConfig() ? loadExecutorConfig() : undefined;
   const metrics = new SolverMetrics();
 
   // Structured JSON logger — replaces console for production-grade output.
   const log = createLogger();
 
-  const executor = new Executor(executorConfig, log);
+  const mode = (process.env.PERIHELION_SOLVER_MODE ?? "").trim().toLowerCase();
+  const watchOnly = mode === "watch";
+  if (mode !== "" && !watchOnly) {
+    throw new Error(
+      `invalid PERIHELION_SOLVER_MODE "${process.env.PERIHELION_SOLVER_MODE}"; expected "watch" or unset`,
+    );
+  }
+
+  let executor: Executor | undefined;
+  if (watchOnly) {
+    // Watch-only mode: evaluate and log decisions, never invoke the executor.
+    // The explicit PERIHELION_SOLVER_ADDRESS (if any) is used for eligibility.
+    log.warn(
+      "PERIHELION_SOLVER_MODE=watch: running in watch-only mode; no fills will be submitted",
+      { solverAddress: config.solverAddress },
+    );
+  } else {
+    if (!hasExecutorConfig()) {
+      throw new Error(
+        "missing executor configuration: set PERIHELION_EVM_RPC_URL, PERIHELION_EVM_PRIVATE_KEY and PERIHELION_STELLAR_SECRET (or run with PERIHELION_SOLVER_MODE=watch for a dry run)",
+      );
+    }
+    const executorConfig = loadExecutorConfig();
+
+    // The escrow enforces preferredSolver == msg.sender, so the address used
+    // for eligibility decisions must be the one derived from the signing key.
+    const derivedAddress = privateKeyToAccount(
+      executorConfig.evmPrivateKey,
+    ).address;
+    if (
+      config.solverAddress &&
+      config.solverAddress.toLowerCase() !== derivedAddress.toLowerCase()
+    ) {
+      throw new Error(
+        `PERIHELION_SOLVER_ADDRESS (${config.solverAddress}) does not match the address derived from PERIHELION_EVM_PRIVATE_KEY (${derivedAddress})`,
+      );
+    }
+    config.solverAddress = derivedAddress;
+
+    executor = new Executor(executorConfig, log);
+  }
 
   const solver = new Solver(config, executor, log, metrics);
+======
 
   // Minimal HTTP server for Prometheus scraping.
   //

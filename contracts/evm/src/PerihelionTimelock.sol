@@ -268,7 +268,16 @@ contract PerihelionTimelock {
         Operation storage op = operations[id];
         if (!op.exists) revert UnknownOperation();
         if (op.executed) revert AlreadyExecuted();
-        if (op.confirmations < threshold) revert NotEnoughConfirmations();
+        // Count only confirmations from addresses that are owners right now
+        // (issue #934): a removed owner's confirmation must not keep counting
+        // towards the threshold. The cached `op.confirmations` counter is kept
+        // for event emission only; the authoritative check uses the live set.
+        uint256 validConfirmations = 0;
+        uint256 n = _owners.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (confirmedBy[id][_owners[i]]) validConfirmations += 1;
+        }
+        if (validConfirmations < threshold) revert NotEnoughConfirmations();
         if (op.readyAt == 0 || block.timestamp < op.readyAt) revert NotReady();
         if (block.timestamp > op.readyAt + GRACE_PERIOD) revert Expired();
 
@@ -309,8 +318,17 @@ contract PerihelionTimelock {
             // Threshold reached: delete the operation and its cancel state.
             delete operations[id];
             delete cancelConfirmations[id];
-            // Individual cancelConfirmedBy entries are left as-is; they cannot
-            // be re-used because the operation slot no longer exists.
+            // Clear the per-owner flags for the current owner set (issue #935).
+            // Mappings of mappings cannot be deleted wholesale, and a
+            // re-proposal of the identical operation reuses the same id, so
+            // stale flags would otherwise brick it (AlreadyConfirmed /
+            // AlreadyCancelConfirmed) and leave stale cancel votes behind.
+            uint256 n = _owners.length;
+            for (uint256 i = 0; i < n; i++) {
+                address o = _owners[i];
+                delete confirmedBy[id][o];
+                delete cancelConfirmedBy[id][o];
+            }
             emit Cancelled(id);
         }
     }

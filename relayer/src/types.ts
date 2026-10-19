@@ -62,11 +62,12 @@ export interface BridgeMessage {
   /** Monotonic per-source-endpoint nonce for ordering and replay protection. */
   readonly nonce: number;
   /**
-   * Cancellation reason decoded from the source event. Required for
-   * `CancelIntent` messages (the settlement contract validates it) and ignored
-   * for all other message types.
+   * User-signed intent deadline, in Unix seconds, carried in the FillInstruction.
+   * Decoded from the source `Locked` event and delivered verbatim so the
+   * destination contract can validate the fill window instead of treating the
+   * intent as already expired.
    */
-  readonly reason?: CancelReason;
+  readonly deadline: bigint;
   /** Exact LayerZero message bytes observed on the source chain. */
   readonly rawPayload: Hex;
 }

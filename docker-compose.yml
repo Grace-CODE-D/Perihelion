@@ -86,13 +86,14 @@ services:
       PERIHELION_EVM_RPC_URL: http://anvil:8545
       # Local placeholder endpoint ids; the settlement peer must use the same values.
       PERIHELION_SOURCE_EID: 31337
+      PERIHELION_SOURCE_CHAIN_ID: 31337
       # Stellar configuration
-      PERIHELION_STELLAR_RPC_URL: http://stellar:8000/rpc
+      PERIHELION_SOROBAN_RPC_URL: http://stellar:8000/rpc
       STELLAR_NETWORK: "Standalone Network ; February 2017"
       PERIHELION_STELLAR_EID: 99161
       # Relayer configuration
       PERIHELION_ESCROW_ADDRESS: ${PERIHELION_ESCROW_ADDRESS:?set PERIHELION_ESCROW_ADDRESS to the deployed escrow}
-      PERIHELION_SETTLEMENT_CONTRACT: ${PERIHELION_SETTLEMENT_CONTRACT:?set PERIHELION_SETTLEMENT_CONTRACT to the deployed settlement contract}
+      PERIHELION_SETTLEMENT_CONTRACT_ID: ${PERIHELION_SETTLEMENT_CONTRACT_ID:?set PERIHELION_SETTLEMENT_CONTRACT_ID to the deployed settlement contract}
       SIGNER_SECRET: ${SIGNER_SECRET:?set SIGNER_SECRET to a valid Stellar secret key}
       PERIHELION_CONFIRMATIONS: "1"
       PERIHELION_POLL_INTERVAL_MS: "5000"
