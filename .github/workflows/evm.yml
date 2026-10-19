@@ -33,6 +33,7 @@ jobs:
       pull-requests: read
     outputs:
       evm: ${{ steps.filter.outputs.evm }}
+      sdk_escrow: ${{ steps.filter.outputs.sdk_escrow }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
@@ -43,6 +44,13 @@ jobs:
             evm:
               - 'contracts/evm/**'
               - '.github/workflows/evm.yml'
+            sdk_escrow:
+              - 'contracts/evm/**'
+              - '.github/workflows/evm.yml'
+              - 'sdk/src/escrow-abi.ts'
+              - 'sdk/src/escrow-client.ts'
+              - 'sdk/test/escrow-client.test.ts'
+              - 'scripts/gen-escrow-abi.mjs'
 
   evm:
     name: EVM (Solidity)
@@ -195,20 +203,24 @@ jobs:
 
   # The SDK's ESCROW_ABI is generated from the contract build; fail if the
   # committed copy is stale, then exercise PerihelionEscrowClient against a
-  # deployed escrow on Anvil.
+  # deployed escrow on Anvil (getLock, and refundStatus against cancelExpired).
   sdk-abi:
     name: SDK ABI in sync
+    needs: changes
+    if: needs.changes.outputs.sdk_escrow == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+        with:
+          submodules: recursive
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09  # v1.6.0
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: 22
           cache: npm

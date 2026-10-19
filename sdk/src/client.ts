@@ -466,31 +466,36 @@ export class PerihelionClient {
   }
 
   /**
-   * Check if an intent is refundable via `cancelExpired` (issue #175).
+   * **Off-chain hint only** — estimate from a mempool record whether the
+   * intent looks refundable via `cancelExpired` (issue #175).
    *
-   * An intent is refundable if **all three** conditions hold:
-   * 1. It exists and has not been settled or previously refunded.
-   * 2. Its deadline has passed **and** the confirmation grace period has elapsed.
-   * 3. No `FillConfirmed` was received — the status is still `'pending'`.
-   *    Every other {@link MempoolIntentStatus} is **not** refundable: `filled`
+   * Do not use this to decide whether to call `cancelExpired`. Mempool
+   * statuses are best-effort reports from relayers and solvers, and the status
+   * endpoint is unauthenticated unless the operator configures a token. A wrong
+   * or malicious `settled` report hides a refundable lock, and a stale
+   * `pending` after an on-chain release suggests a call that will revert. Use
+   * {@link PerihelionEscrowClient.isRefundable} (or
+   * {@link PerihelionEscrowClient.refundStatus}), which reads the escrow's
+   * `locks` record, `confirmationGrace` and block time and mirrors
+   * `cancelExpired`'s checks exactly.
+   *
+   * This hint returns `true` when both conditions hold:
+   * 1. The mempool status is still `'pending'`. Every other
+   *    {@link MempoolIntentStatus} is treated as not refundable: `filled`
    *    means the intent was delivered on the destination chain and is awaiting
-   *    source-chain release (the refund path no longer applies; calling
-   *    `cancelExpired` would race the confirmation and likely revert with
-   *    `AlreadyFinalized`), `settled` and `refunded` are terminal, and
-   *    `expired` indicates the on-chain state has already diverged from the
-   *    refund path.
+   *    source-chain release, `settled` and `refunded` are terminal, and
+   *    `expired` indicates the record has diverged from the refund path.
+   * 2. Its deadline has passed **and** the confirmation grace period has elapsed.
    *
-   * This helper detects when a bridge has definitively failed and the user's
-   * funds can be recovered locally without waiting for cross-chain confirmation.
-   *
-   * **Typical usage**: After `waitForSettlement` times out or returns `'expired'`,
-   * check `isRefundable` to see if the user can recover via the local fallback.
+   * It is useful for cheaply filtering a list of records (e.g. in a UI) before
+   * confirming each candidate on-chain.
    *
    * ```ts
-   * const grace = await escrowClient.confirmationGrace(); // live contract value
    * const record = await client.waitForSettlement(hash);
-   * if (client.isRefundable(record, grace * 1_000)) {
-   *   // Call escrow.cancelExpired(hash) to recover funds
+   * const grace = await escrowClient.confirmationGrace(); // bigint seconds
+   * if (client.isRefundable(record, Number(grace) * 1_000)) {
+   *   // Hint only: confirm on-chain before sending the transaction.
+   *   if (await escrowClient.isRefundable(hash)) await escrowClient.cancelExpired(hash);
    * }
    * ```
    *
@@ -508,8 +513,9 @@ export class PerihelionClient {
    *   boundary, mirroring {@link isExpired}'s `clockSkew` parameter. Useful
    *   when `now` comes from a client clock that may run fast.
    *   Default: `0`.
-   * @returns `true` if the intent can be refunded via `cancelExpired`.
+   * @returns `true` if the mempool record suggests the intent is refundable.
    *
+   * @see {PerihelionEscrowClient.isRefundable} for the authoritative on-chain check.
    * @see {PerihelionEscrowClient.confirmationGrace} to read the live grace period.
    */
   isRefundable(

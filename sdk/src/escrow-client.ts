@@ -10,6 +10,8 @@
  * - `cancelExpired()` to recover expired intents
  * - `confirmationGrace()` and `getLock()` (over the `locks` mapping getter)
  *   to verify intent status
+ * - `isRefundable()` / `refundStatus()` to check, from chain state, whether
+ *   `cancelExpired()` would currently succeed
  *
  * This client provides type-safe helpers over viem's PublicClient and
  * WalletClient to perform these on-chain actions directly.
@@ -38,6 +40,31 @@ export interface Lock {
   deadline: bigint;
   released: boolean;
   refunded: boolean;
+}
+
+/**
+ * Why `cancelExpired` would revert right now, named after the contract error it
+ * would revert with.
+ */
+export type RefundBlocker = "NotLocked" | "AlreadyFinalized" | "DeadlineNotPassed";
+
+/** Result of {@link PerihelionEscrowClient.refundStatus}. */
+export interface RefundStatus {
+  /** `true` if `cancelExpired(intentHash)` passes all of its checks at `blockNumber`. */
+  refundable: boolean;
+  /** When not refundable, the error `cancelExpired` would revert with. */
+  reason?: RefundBlocker;
+  /** The on-chain lock record, if one exists. */
+  lock?: Lock;
+  /**
+   * Unix time (seconds) from which the lock is refundable: `deadline +
+   * confirmationGrace`. Present whenever a lock exists.
+   */
+  refundableAt?: bigint;
+  /** Block the state was read at; every value above is from this one block. */
+  blockNumber: bigint;
+  /** Timestamp of `blockNumber`, compared against `refundableAt`. */
+  blockTimestamp: bigint;
 }
 
 /**
@@ -150,6 +177,95 @@ export class PerihelionEscrowClient {
    * @throws If the underlying RPC call fails (network, timeout, etc.).
    */
   async getLock(intentHash: Hex): Promise<Lock | undefined> {
+    return this._readLock(intentHash);
+  }
+
+  /**
+   * Check, from chain state, whether `cancelExpired(intentHash)` would succeed.
+   *
+   * This is the authoritative refundability check. Unlike
+   * {@link PerihelionClient.isRefundable}, it does not trust the mempool's
+   * best-effort status reports.
+   *
+   * See {@link refundStatus} for the exact semantics and for the reason a
+   * lock is not refundable.
+   *
+   * @param intentHash The hash of the intent.
+   * @returns `true` if `cancelExpired` passes all of its checks at the latest block.
+   * @throws If the underlying RPC call fails (network, timeout, etc.).
+   */
+  async isRefundable(intentHash: Hex): Promise<boolean> {
+    return (await this.refundStatus(intentHash)).refundable;
+  }
+
+  /**
+   * Evaluate `cancelExpired`'s checks against the escrow's state at the latest
+   * block, in the contract's order:
+   *
+   * 1. a lock exists (`NotLocked`),
+   * 2. it is neither released nor refunded (`AlreadyFinalized`),
+   * 3. `block.timestamp >= deadline + confirmationGrace` (`DeadlineNotPassed`).
+   *
+   * The lock, the grace period and the timestamp are all read at the same
+   * block, so the verdict cannot mix state from different blocks.
+   * `cancelExpired` is not pause-gated, so pausing does not affect the result.
+   *
+   * A transaction lands in a later block than the one read here, with a
+   * timestamp at least as high, so a `refundable: true` verdict stays true
+   * unless another transaction finalizes the lock first. Near the boundary
+   * the check is conservative: it can report `DeadlineNotPassed` for a call
+   * that would succeed one block later. It does not predict a revert from
+   * the asset token itself (`TransferFailed`).
+   *
+   * @param intentHash The hash of the intent.
+   * @returns The verdict, the reason when not refundable, and the state it was based on.
+   * @throws If the underlying RPC call fails (network, timeout, etc.).
+   */
+  async refundStatus(intentHash: Hex): Promise<RefundStatus> {
+    const block = await this.publicClient.getBlock({ blockTag: "latest" });
+    const blockNumber = block.number;
+    const blockTimestamp = block.timestamp;
+    const [lock, grace] = await Promise.all([
+      this._readLock(intentHash, blockNumber),
+      this.publicClient.readContract({
+        address: this.escrowAddress,
+        abi: ESCROW_ABI,
+        functionName: "confirmationGrace",
+        blockNumber,
+      }),
+    ]);
+
+    if (!lock) {
+      return { refundable: false, reason: "NotLocked", blockNumber, blockTimestamp };
+    }
+    const refundableAt = lock.deadline + grace;
+    const base = { lock, refundableAt, blockNumber, blockTimestamp };
+    if (lock.released || lock.refunded) {
+      return { refundable: false, reason: "AlreadyFinalized", ...base };
+    }
+    if (blockTimestamp < refundableAt) {
+      return { refundable: false, reason: "DeadlineNotPassed", ...base };
+    }
+    return { refundable: true, ...base };
+  }
+
+  /**
+   * Read the confirmation grace period (in seconds): how long after an
+   * intent's deadline {@link cancelExpired} becomes callable.
+   *
+   * @returns The grace period in seconds.
+   */
+  async confirmationGrace(): Promise<bigint> {
+    const grace = await this.publicClient.readContract({
+      address: this.escrowAddress,
+      abi: ESCROW_ABI,
+      functionName: "confirmationGrace",
+    });
+    return grace as bigint;
+  }
+
+  // Read locks(intentHash), optionally at a pinned block; undefined if no lock exists.
+  private async _readLock(intentHash: Hex, blockNumber?: bigint): Promise<Lock | undefined> {
     const [
       solver,
       user,
@@ -164,6 +280,7 @@ export class PerihelionEscrowClient {
       abi: ESCROW_ABI,
       functionName: "locks",
       args: [intentHash],
+      blockNumber,
     });
     if (user === zeroAddress) return undefined;
     return {
@@ -176,22 +293,6 @@ export class PerihelionEscrowClient {
       released,
       refunded,
     };
-  }
-
-  /**
-   * Read the confirmation grace period (in seconds).
-   * Used by {@link PerihelionClient.isRefundable} to determine when
-   * an expired intent becomes refundable via {@link cancelExpired}.
-   *
-   * @returns The grace period in seconds.
-   */
-  async confirmationGrace(): Promise<bigint> {
-    const grace = await this.publicClient.readContract({
-      address: this.escrowAddress,
-      abi: ESCROW_ABI,
-      functionName: "confirmationGrace",
-    });
-    return grace as bigint;
   }
 
   // Convert SDK intent to contract tuple format.
