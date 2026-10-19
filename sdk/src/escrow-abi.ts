@@ -1466,28 +1466,6 @@ export const ESCROW_ABI = [
     "type": "error",
     "name": "ExceedsMaxIntentAmount",
     "inputs": []
-    type: "error",
-    name: "NotOwner",
-  },
-  {
-    type: "error",
-    name: "NoPendingOwner",
-  },
-  {
-    type: "error",
-    name: "NotAContract",
-  },
-  {
-    type: "error",
-    name: "ZeroAddress",
-  },
-  {
-    type: "error",
-    name: "TransferFailed",
-  },
-  {
-    type: "error",
-    name: "EnforcedPause",
   },
   {
     "type": "error",
@@ -1537,6 +1515,16 @@ export const ESCROW_ABI = [
   {
     "type": "error",
     "name": "NativeTransferFailed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NoPendingOwner",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotAContract",
     "inputs": []
   },
   {
