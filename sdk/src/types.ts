@@ -64,6 +64,74 @@ export type IntentStatus =
   | "expired"; // deadline passed before any claim
 
 /**
+ * On-chain `IntentStatus` enum as defined by the settlement contract
+ * (`contracts/soroban/settlement/src/types.rs`).
+ *
+ * The contract declares a `#[contracttype]` C-like enum with explicit
+ * discriminants, which Soroban encodes as a `u32`. `status(intent_hash)`
+ * returns `Option<IntentStatus>`, so an absent intent decodes to `undefined`.
+ */
+export enum OnChainIntentStatus {
+  Locked = 0,
+  Filled = 1,
+  ConfirmationSent = 2,
+  Cancelled = 3,
+}
+
+/**
+ * Decode the `ScVal` returned by the settlement contract's `status` view into
+ * an {@link OnChainIntentStatus}.
+ *
+ * Accepts the raw `ScVal` (or an already-converted native value) and returns
+ * `undefined` when the intent is not registered (`scvVoid` / `undefined`).
+ * Throws on values that are not a valid `IntentStatus` discriminant.
+ */
+export function decodeIntentStatus(scVal: unknown): OnChainIntentStatus | undefined {
+  const native = toNativeStatus(scVal);
+  if (native === undefined || native === null) return undefined;
+  if (typeof native !== "number" || !Number.isInteger(native)) {
+    throw new Error(`Unexpected IntentStatus value: ${String(native)}`);
+  }
+  switch (native) {
+    case OnChainIntentStatus.Locked:
+    case OnChainIntentStatus.Filled:
+    case OnChainIntentStatus.ConfirmationSent:
+    case OnChainIntentStatus.Cancelled:
+      return native;
+    default:
+      throw new Error(`Unknown IntentStatus discriminant: ${native}`);
+  }
+}
+
+/**
+ * Whether an on-chain status means the intent has been (or is being) settled,
+ * i.e. the destination leg is complete for idempotency purposes.
+ */
+export function isSettledStatus(status: OnChainIntentStatus | undefined): boolean {
+  return status === OnChainIntentStatus.Filled || status === OnChainIntentStatus.ConfirmationSent;
+}
+
+/**
+ * Normalise an `ScVal`-like value to the native representation produced by
+ * `scValToNative`. Handles raw `ScVal` objects (`{ switch: { name }, u32 }`)
+ * as well as already-converted numbers/`undefined`.
+ */
+function toNativeStatus(scVal: unknown): unknown {
+  if (scVal === undefined || scVal === null) return undefined;
+  if (typeof scVal === "number") return scVal;
+  if (typeof scVal === "object") {
+    const obj = scVal as { switch?: { name?: string }; u32?: unknown; value?: unknown };
+    const name = obj.switch?.name;
+    if (name === "scvVoid") return undefined;
+    if (name === "scvU32") return obj.u32;
+    if (name === "scvU64" || name === "scvI64") return obj.value;
+    // Already-converted native value wrapped in an object.
+    if ("value" in obj && typeof obj.value === "number") return obj.value;
+  }
+  return scVal;
+}
+
+/**
  * Subset of {@link IntentStatus} values that the mempool can store and accept
  * via `PATCH /intents/:hash/status`.
  *

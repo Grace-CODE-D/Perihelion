@@ -344,7 +344,97 @@ export class EVMSourceWatcher implements SourceWatcher {
       blockHeaders.push(...headers.filter((header): header is NonNullable<typeof header> => header !== null));
     }
 
+    // Observe refund events on the source chain so the relayer can report
+    // `refunded` to the mempool only when a real refund exists.
+    await this.scanRefunds(fromBlock, head);
+
     return { messages, head, headHash, parentHash, blockHeaders: blockHeaders.length > 0 ? blockHeaders : undefined };
+  }
+
+  /**
+   * Scan the escrow for `Refunded` / `RefundedLocalTimeout` events and invoke
+   * the configured `onRefund` callback for each one.
+   *
+   * The scan window starts at the greater of `fromBlock` and the last scanned
+   * block, so repeated polls do not re-report the same refund. Callers that
+   * need a full backfill can construct the watcher with a low `fromBlock`.
+   */
+  private async scanRefunds(fromBlock: number, head: number): Promise<void> {
+    const onRefund = this.config.onRefund;
+    if (!onRefund) return;
+
+    const start = this.lastRefundScanBlock === null
+      ? fromBlock
+      : Math.max(fromBlock, this.lastRefundScanBlock + 1);
+    if (start > head) return;
+
+    let scanHead = start;
+    while (scanHead <= head) {
+      const toBlock = Math.min(scanHead + this.maxBlockRange - 1, head);
+      let logs: Log[] = [];
+
+      try {
+        logs = await this.client.getLogs({
+          address: this.config.escrowAddress as `0x${string}`,
+          events: REFUND_EVENT_ABIS,
+          fromBlock: BigInt(scanHead),
+          toBlock: BigInt(toBlock),
+        });
+      } catch (err) {
+        if (this._isProviderRangeError(err)) {
+          if (this.maxBlockRange <= 1) throw err;
+          this.maxBlockRange = Math.max(1, Math.floor(this.maxBlockRange / 2));
+          console.warn("EVMSourceWatcher: provider range error during refund scan, halving max block range", {
+            newMaxBlockRange: this.maxBlockRange,
+            err: String(err),
+          });
+          continue;
+        }
+        throw err;
+      }
+
+      for (const log of logs) {
+        const observation = this.decodeRefundLog(log);
+        if (observation === null) continue;
+        try {
+          await onRefund(observation);
+        } catch (err) {
+          console.warn("EVMSourceWatcher: onRefund callback failed", {
+            intentHash: observation.intentHash,
+            err: String(err),
+          });
+        }
+      }
+
+      scanHead = toBlock + 1;
+    }
+
+    this.lastRefundScanBlock = head;
+  }
+
+  /**
+   * Decode a `Refunded` / `RefundedLocalTimeout` log into an observation.
+   * Returns `null` if the log does not carry a usable intent hash.
+   */
+  decodeRefundLog(log: Log): EvmRefundObservation | null {
+    if (log.blockNumber === undefined || log.blockNumber === null) return null;
+    const topics = log.topics as Hex[];
+    if (!topics || topics.length < 2) return null;
+
+    const intentHash = topics[1] as Hex;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(intentHash)) return null;
+
+    const eventName = (log as { eventName?: string }).eventName;
+    const kind: EvmRefundObservation["kind"] =
+      eventName === "RefundedLocalTimeout" ? "RefundedLocalTimeout" : "Refunded";
+
+    return {
+      intentHash,
+      kind,
+      blockNumber: Number(log.blockNumber),
+      transactionHash: (log.transactionHash ?? "0x") as Hex,
+      logIndex: Number(log.logIndex ?? 0),
+    };
   }
 
   private _isProviderRangeError(err: unknown): boolean {

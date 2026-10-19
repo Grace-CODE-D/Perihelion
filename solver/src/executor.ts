@@ -21,10 +21,14 @@ import {
   Keypair,
   Contract,
   nativeToScVal,
-  scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
-import { ESCROW_ABI } from "@perihelion/sdk";
+import {
+  ESCROW_ABI,
+  IntentStatus,
+  decodeIntentStatus,
+  submitAndWait,
+} from "@perihelion/sdk";
 import type { SignedIntent } from "@perihelion/sdk";
 
 /**
@@ -92,6 +96,8 @@ interface FillStatus {
  */
 const SOROBAN_MAX_POLL_ATTEMPTS = 30;
 const SOROBAN_POLL_INTERVAL_MS = 2_000;
+/** How many times to resubmit when the RPC answers TRY_AGAIN_LATER. */
+const SOROBAN_MAX_RESUBMIT_ATTEMPTS = 3;
 
 /**
  * Execute a fill by orchestrating EVM lock and Soroban fill_intent.
@@ -168,7 +174,7 @@ export class Executor {
 
   /**
    * Check if an intent has already been filled (idempotency check).
-   * Queries Soroban to see if status() returns 'Settled'.
+   * Queries Soroban to see if status() reports a completed fill.
    */
   private async checkFillStatus(intentHash: Hex): Promise<FillStatus> {
     try {
@@ -187,8 +193,14 @@ export class Executor {
   /**
    * Check if an intent is settled on the Soroban settlement contract.
    *
-   * Mirrors the relayer's readStatus pattern: simulates a single-invocation
-   * transaction calling `status(intent_hash)` and decodes the return value.
+   * Simulates a single-invocation transaction calling `status(intent_hash)`
+   * and decodes the returned `Option<IntentStatus>` (a `u32` discriminant,
+   * or void when the intent is not registered).
+   *
+   * For idempotency purposes an intent counts as complete once the
+   * destination assets have been delivered, i.e. status is `Filled` or
+   * `ConfirmationSent`. `Locked` and `Cancelled` are not complete, and
+   * `undefined` means the intent is not registered at all.
    */
   private async isSettled(intentHash: Hex): Promise<boolean> {
     const rpc = new SorobanRpc.Server(this.sorobanRpcUrl);
@@ -216,16 +228,8 @@ export class Executor {
       return false;
     }
 
-    // The status enum decodes to a bare symbol string (e.g. "Settled") or a
-    // [tag, ...payload] array — same pattern as soroban-delivery.ts readStatus.
-    const native: unknown = scValToNative(simulated.result.retval);
-    const variant = typeof native === "string"
-      ? native
-      : Array.isArray(native) && typeof native[0] === "string"
-        ? native[0]
-        : null;
-
-    return variant === "Settled";
+    const status = decodeIntentStatus(simulated.result.retval);
+    return status === IntentStatus.Filled || status === IntentStatus.ConfirmationSent;
   }
 
   /**
@@ -351,32 +355,20 @@ export class Executor {
     const prepared = SorobanRpc.assembleTransaction(tx, simulated).build();
     prepared.sign(keypair);
 
-    const result = await rpc.sendTransaction(prepared);
-    if (result.status === "ERROR") {
-      throw new Error(`fill_intent submission failed: ${result.errorResult?.toXDR("base64") ?? "unknown"}`);
-    }
+    // Submit and wait, failing fast on ERROR and backing off on
+    // TRY_AGAIN_LATER (shared with the relayer's delivery path).
+    const hash = await submitAndWait(rpc, prepared, {
+      maxPollAttempts: SOROBAN_MAX_POLL_ATTEMPTS,
+      pollIntervalMs: SOROBAN_POLL_INTERVAL_MS,
+      maxResubmitAttempts: SOROBAN_MAX_RESUBMIT_ATTEMPTS,
+      label: "fill_intent",
+    });
 
-    // Poll until the transaction is confirmed.
-    for (let attempt = 0; attempt < SOROBAN_MAX_POLL_ATTEMPTS; attempt++) {
-      const txStatus = await rpc.getTransaction(result.hash);
-      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        return result.hash as Hex;
-      }
-      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-        throw new Error(`fill_intent transaction failed: ${txStatus.resultXdr?.toXDR("base64") ?? "unknown"}`);
-      }
-      await sleep(SOROBAN_POLL_INTERVAL_MS);
-    }
-
-    throw new Error(`fill_intent confirmation timeout after ${SOROBAN_MAX_POLL_ATTEMPTS} attempts: ${result.hash}`);
+    return hash as Hex;
   }
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /**
  * Decode a 0x-prefixed hex string to a Uint8Array.

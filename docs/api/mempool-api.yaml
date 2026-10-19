@@ -420,6 +420,7 @@ components:
         - pending
         - filled
         - settled
+        - cancelling
         - refunded
         - expired
 

@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { scValToNative } from "@stellar/stellar-sdk";
+import { nativeToScVal, scValToNative, scvU32, scvVoid } from "@stellar/stellar-sdk";
 import { FatalError } from "../src/relayer.js";
 import { SorobanDestinationDelivery } from "../src/soroban-delivery.js";
 

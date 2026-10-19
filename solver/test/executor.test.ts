@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildIntent, hashIntent, perihelionDomain } from "@perihelion/sdk";
 import type { Hex, SignedIntent } from "@perihelion/sdk";
+import { nativeToScVal, scvU32, scvVoid } from "@stellar/stellar-sdk";
 import { Executor, type ExecutorConfig, type Logger } from "../src/executor.js";
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
@@ -239,6 +240,72 @@ test("checkFillStatus: swallows isSettled errors and returns filled=false", asyn
   // Must not throw — query failure is treated as "not yet settled"
   const result = await ex.checkFillStatus(makeSignedIntent().hash);
   assert.equal(result.filled, false);
+});
+
+// ─── isSettled: decoding real ScVal status encodings ─────────────────────────
+//
+// `status(intent_hash)` returns `Option<IntentStatus>`, where `IntentStatus` is
+// a `#[contracttype]` C-like enum (Locked = 0, Filled = 1, ConfirmationSent = 2,
+// Cancelled = 3). Soroban encodes it as a `u32`, and `None` as void. These tests
+// feed real `ScVal` encodings through the decoder to verify classification.
+
+type StatusDecoder = {
+  decodeStatus(retval: unknown): unknown;
+};
+
+function statusDecoder(): StatusDecoder {
+  const ex = expose() as unknown as StatusDecoder;
+  assert.equal(
+    typeof ex.decodeStatus,
+    "function",
+    "Executor must expose a decodeStatus helper for status ScVals",
+  );
+  return ex;
+}
+
+test("isSettled: Filled (scvU32(1)) counts as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(1)), "Filled");
+});
+
+test("isSettled: ConfirmationSent (scvU32(2)) counts as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(2)), "ConfirmationSent");
+});
+
+test("isSettled: Locked (scvU32(0)) does not count as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(0)), "Locked");
+});
+
+test("isSettled: Cancelled (scvU32(3)) does not count as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(3)), "Cancelled");
+});
+
+test("isSettled: None (scvVoid()) decodes as not registered", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvVoid()), undefined);
+});
+
+test("isSettled: native u32 values are classified correctly", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(nativeToScVal(1, { type: "u32" })), "Filled");
+  assert.equal(
+    decoder.decodeStatus(nativeToScVal(2, { type: "u32" })),
+    "ConfirmationSent",
+  );
+  assert.equal(decoder.decodeStatus(nativeToScVal(0, { type: "u32" })), "Locked");
+  assert.equal(
+    decoder.decodeStatus(nativeToScVal(3, { type: "u32" })),
+    "Cancelled",
+  );
+  assert.equal(decoder.decodeStatus(nativeToScVal(null)), undefined);
+});
+
+test("isSettled: unknown discriminants decode as undefined", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(99)), undefined);
 });
 
 // ─── Constructor: config validation ──────────────────────────────────────────

@@ -15,6 +15,7 @@ import {
   xdr,
   Address,
   Asset,
+  Operation,
   type Account,
 } from "@stellar/stellar-sdk";
 import { FatalError, type DestinationDelivery } from "./relayer.js";
@@ -24,6 +25,119 @@ import {
   type PendingMessage,
   type MessageKey,
 } from "./types.js";
+
+/**
+ * Settlement contract `IntentStatus` discriminants.
+ *
+ * `IntentStatus` is a `#[contracttype]` C-like enum with explicit
+ * discriminants, which Soroban encodes as a `u32`. `status()` returns
+ * `Option<IntentStatus>`, so `scValToNative` yields a number or `undefined`.
+ */
+export enum IntentStatus {
+  Locked = 0,
+  Filled = 1,
+  ConfirmationSent = 2,
+  Cancelled = 3,
+}
+
+/**
+ * Decode the return value of the settlement contract's `status(intent_hash)`
+ * view into an {@link IntentStatus}.
+ *
+ * Returns `undefined` when the intent is not registered (`None` / void) or the
+ * value is not a recognised discriminant.
+ */
+export function decodeIntentStatus(retval: xdr.ScVal | undefined | null): IntentStatus | undefined {
+  if (!retval) return undefined;
+  let native: unknown;
+  try {
+    native = scValToNative(retval);
+  } catch {
+    return undefined;
+  }
+  if (native === undefined || native === null) return undefined;
+  const numeric = typeof native === "bigint" ? Number(native) : native;
+  if (typeof numeric !== "number" || !Number.isInteger(numeric)) return undefined;
+  switch (numeric) {
+    case IntentStatus.Locked:
+      return IntentStatus.Locked;
+    case IntentStatus.Filled:
+      return IntentStatus.Filled;
+    case IntentStatus.ConfirmationSent:
+      return IntentStatus.ConfirmationSent;
+    case IntentStatus.Cancelled:
+      return IntentStatus.Cancelled;
+    default:
+      return undefined;
+  }
+}
+
+/** Options for {@link submitAndWait}. */
+export interface SubmitAndWaitOptions {
+  /** Maximum number of `getTransaction` polls (default 20). */
+  maxAttempts?: number;
+  /** Delay between polls in milliseconds (default 1000). */
+  pollIntervalMs?: number;
+  /** Maximum number of resubmissions on `TRY_AGAIN_LATER` (default 3). */
+  maxResubmits?: number;
+  /** Base backoff delay in milliseconds for `TRY_AGAIN_LATER` (default 1000). */
+  backoffMs?: number;
+}
+
+/**
+ * Submit a signed transaction and wait for it to be included in a ledger.
+ *
+ * Branches on the `sendTransaction` result status:
+ * - `ERROR`: reject immediately with the decoded `errorResult` XDR.
+ * - `TRY_AGAIN_LATER`: back off and resubmit.
+ * - `PENDING` / `DUPLICATE`: poll `getTransaction` until confirmed.
+ *
+ * Shared by the relayer and the solver.
+ */
+export async function submitAndWait(
+  rpc: SorobanRpc.Server,
+  transaction: Parameters<SorobanRpc.Server["sendTransaction"]>[0],
+  options: SubmitAndWaitOptions = {},
+): Promise<string> {
+  const maxAttempts = options.maxAttempts ?? 20;
+  const pollIntervalMs = options.pollIntervalMs ?? 1000;
+  const maxResubmits = options.maxResubmits ?? 3;
+  const backoffMs = options.backoffMs ?? 1000;
+
+  let resubmits = 0;
+  for (;;) {
+    const result = await rpc.sendTransaction(transaction);
+
+    if (result.status === "ERROR") {
+      const errorXdr = result.errorResult ? result.errorResult.toXDR("base64") : "unknown error";
+      throw new Error(`Transaction rejected by RPC: ${errorXdr}`);
+    }
+
+    if (result.status === "TRY_AGAIN_LATER") {
+      if (resubmits >= maxResubmits) {
+        throw new Error(`Transaction not accepted after ${resubmits} retries: ${result.hash}`);
+      }
+      resubmits += 1;
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * resubmits));
+      continue;
+    }
+
+    // PENDING or DUPLICATE: poll for confirmation.
+    let attempts = 0;
+    while (attempts < maxAttempts) {
+      const status = await rpc.getTransaction(result.hash);
+      if (status.status === "SUCCESS") {
+        return result.hash;
+      }
+      if (status.status === "FAILED") {
+        throw new Error(`Transaction failed: ${status.resultXdr}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      attempts += 1;
+    }
+    throw new Error(`Transaction confirmation timeout: ${result.hash}`);
+  }
+}
 
 /** Configuration for SorobanDestinationDelivery. */
 export interface SorobanDeliveryConfig {
@@ -64,56 +178,33 @@ export class SorobanDestinationDelivery implements DestinationDelivery {
 
   async deliver(pending: PendingMessage): Promise<string> {
     try {
-      // 1. Check if the settlement contract entry is archived
-      const isArchived = await this.isEntryArchived();
-
-      // 2. Get signer account to build transaction
+      // 1. Get signer account to build transaction
       const account = await this.getSignerAccount();
 
-      // 3. Build transaction
-      let builder = new TransactionBuilder(account, {
+      // 2. Build transaction with the lz_receive invocation
+      const builder = new TransactionBuilder(account, {
         fee: "10000",
         networkPassphrase: this.networkPassphrase,
       });
-
-      // 4. If archived, prepend RestoreFootprint operation
-      if (isArchived) {
-        builder = await this.prependRestoreFootprint(builder);
-      }
-
-      // 5. Append lz_receive invocation
-      builder = await this.appendLzReceiveCall(builder, pending);
-
+      await this.appendLzReceiveCall(builder, pending);
       builder.setTimeout(this.timeoutSeconds);
       let transaction = builder.build();
 
-      // 6. Simulate and prepare the transaction
-      const simulated = await this.rpc.simulateTransaction(transaction);
-      if (SorobanRpc.Api.isSimulationSuccess(simulated)) {
-        transaction = SorobanRpc.assembleTransaction(transaction, simulated).build();
-      } else {
+      // 3. Simulate; restore archived entries if the simulation asks for it.
+      let simulated = await this.rpc.simulateTransaction(transaction);
+      if (SorobanRpc.Api.isSimulationRestore(simulated)) {
+        await this.restoreFootprint(simulated.restorePreamble);
+        transaction = builder.build();
+        simulated = await this.rpc.simulateTransaction(transaction);
+      }
+      if (!SorobanRpc.Api.isSimulationSuccess(simulated)) {
         throw new Error(`Simulation failed: ${String(simulated.error)}`);
       }
+      transaction = SorobanRpc.assembleTransaction(transaction, simulated).build();
 
-      // 7. Sign and submit
+      // 4. Sign and submit, waiting for confirmation.
       transaction.sign(this.signerKeypair);
-      const result = await this.rpc.sendTransaction(transaction);
-
-      // 8. Poll for confirmation
-      let attempts = 0;
-      const maxAttempts = 20;
-      while (attempts < maxAttempts) {
-        const status = await this.rpc.getTransaction(result.hash);
-        if (status.status === "SUCCESS") {
-          return result.hash;
-        }
-        if (status.status === "FAILED") {
-          throw new Error(`Transaction failed: ${status.resultXdr}`);
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        attempts += 1;
-      }
-      throw new Error(`Transaction confirmation timeout: ${result.hash}`);
+      return await submitAndWait(this.rpc, transaction);
     } catch (err) {
       if (err instanceof FatalError) throw err;
       if (err instanceof Error && /signer|secret key|network passphrase/i.test(err.message)) {
@@ -126,21 +217,21 @@ export class SorobanDestinationDelivery implements DestinationDelivery {
   async isDelivered(key: MessageKey): Promise<boolean> {
     try {
       const { intentHash, messageType } = key;
-      const resultValue = await this.readStatus(intentHash);
-      if (resultValue === null) return false;
+      const status = await this.readStatus(intentHash);
 
-      // Map message type to delivery criteria
-      // FillInstruction is delivered if intent exists at all (status != NotFound)
-      // CancelIntent is delivered if status == Cancelled
-      // FillConfirmed is delivered if status == Settled
+      // Map message type to delivery criteria.
+      // FillInstruction is delivered once the intent is registered at all.
+      // CancelIntent is delivered when status == Cancelled.
+      // FillConfirmed is delivered when the fill is complete (Filled or
+      // ConfirmationSent).
       if (messageType === "FillInstruction") {
-        return resultValue !== "NotFound";
+        return status !== undefined;
       }
       if (messageType === "CancelIntent") {
-        return resultValue === "Cancelled";
+        return status === IntentStatus.Cancelled;
       }
       if (messageType === "FillConfirmed") {
-        return resultValue === "Settled";
+        return status === IntentStatus.Filled || status === IntentStatus.ConfirmationSent;
       }
 
       return false;
@@ -155,9 +246,10 @@ export class SorobanDestinationDelivery implements DestinationDelivery {
    *
    * Soroban RPC has no direct "call a view" endpoint, so this simulates a
    * single-invocation transaction and decodes the return value. Returns the
-   * status variant name, or `null` if the contract produced no value.
+   * numeric {@link IntentStatus}, or `undefined` if the intent is not
+   * registered.
    */
-  private async readStatus(intentHash: string): Promise<string | null> {
+  private async readStatus(intentHash: string): Promise<IntentStatus | undefined> {
     const contract = new Contract(this.settlementContractId);
     const account = await this.getSignerAccount();
     const tx = new TransactionBuilder(account, {
@@ -169,63 +261,32 @@ export class SorobanDestinationDelivery implements DestinationDelivery {
       .build();
 
     const simulated = await this.rpc.simulateTransaction(tx);
-    if (!SorobanRpc.Api.isSimulationSuccess(simulated) || !simulated.result) return null;
+    if (!SorobanRpc.Api.isSimulationSuccess(simulated) || !simulated.result) return undefined;
 
-    // Soroban enums decode either to a bare symbol or to a [tag, ...payload]
-    // vec; both carry the variant name in the leading position.
-    const native: unknown = scValToNative(simulated.result.retval);
-    if (typeof native === "string") return native;
-    if (Array.isArray(native) && typeof native[0] === "string") return native[0];
-    return null;
-  }
-
-  private async isEntryArchived(): Promise<boolean> {
-    try {
-      const entries = await this.rpc.getLedgerEntries(
-        new Contract(this.settlementContractId).getFootprint(),
-      );
-
-      const entry = entries.entries?.[0];
-      if (!entry?.liveUntilLedgerSeq) {
-        return false;
-      }
-
-      const currentLedger = await this.rpc.getLatestLedger();
-      const ttlThreshold = 1000; // Consider archived if TTL < 1000 ledgers
-
-      return (entry.liveUntilLedgerSeq - currentLedger.sequence) < ttlThreshold;
-    } catch {
-      return false;
-    }
+    return decodeIntentStatus(simulated.result.retval);
   }
 
   private async getSignerAccount(): Promise<Account> {
     return await this.rpc.getAccount(this.signerKeypair.publicKey());
   }
 
-  private async prependRestoreFootprint(
-    builder: TransactionBuilder,
-  ): Promise<TransactionBuilder> {
-    try {
-      const entries = await this.rpc.getLedgerEntries(
-        new Contract(this.settlementContractId).getFootprint(),
-      );
+  /**
+   * Submit a `RestoreFootprint` transaction for the footprint provided by a
+   * simulation's `restorePreamble`, and wait for it to be included.
+   */
+  private async restoreFootprint(preamble: SorobanRpc.Api.RestorePreamble): Promise<void> {
+    const account = await this.getSignerAccount();
+    const transaction = new TransactionBuilder(account, {
+      fee: preamble.minResourceFee,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .setSorobanData(preamble.transactionData.build())
+      .addOperation(Operation.restoreFootprint({}))
+      .setTimeout(this.timeoutSeconds)
+      .build();
 
-      if (!entries.entries || entries.entries.length === 0) {
-        return builder;
-      }
-
-      // Known limitation (issue #427): RestoreFootprint operation is not yet built.
-      // When a settlement contract ledger entry is archived (TTL < 1000 ledgers),
-      // delivery should restore it before invoking lz_receive. Until that is
-      // implemented, delivery fails at simulation with an archived-entry error,
-      // triggering a retry. Past maxAttempts, the message is dead-lettered rather
-      // than delivered. A long-idle contract entry means messages are lost.
-      // TODO(#303): implement RestoreFootprint restoration.
-      return builder;
-    } catch {
-      return builder;
-    }
+    transaction.sign(this.signerKeypair);
+    await submitAndWait(this.rpc, transaction);
   }
 
   private async getPeer(srcEid: number): Promise<Buffer | null> {
