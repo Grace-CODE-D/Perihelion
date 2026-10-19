@@ -31,6 +31,19 @@ versioned independently.
   requested `chainId`, instead of a bare `Error`. Its `name` is now
   `"PerihelionUndeployedChainError"` (was `"UndeployedChainError"`); callers
   matching on the name string should switch to `instanceof`.
+- **sdk**: doc-comments now match the mempool's real behaviour — duplicate
+  `submitIntent` calls return `201` and overwrite the record (not `409`);
+  `reportStatus` accepts only `MempoolIntentStatus` values (not `claimed`) and
+  returns `404` for terminal records; `listPending` pages are bounded by the
+  requested `limit` (server range 1–1000); `MIN_FILL_HEADROOM_SECS` refers to
+  the renamed Soroban `MIN_DISPATCH_WINDOW`. `IntentStatus` now includes
+  `filled`, which `MempoolIntentStatus` was silently dropping, so
+  `reportStatus(hash, "filled")` type-checks.
+- **docs**: `mempool-api.yaml` documents `201` for `POST /intents` (no `409`),
+  `limit` 1–1000 with default 100, and the five statuses the server accepts
+  (dropping `cancelling`). New SDK and mempool contract tests pin the SDK, the
+  spec and the server to each other. Restored the tail of
+  `mempool/test/contract.test.ts`, which an earlier commit had truncated.
 - **Soroban settlement:** `lz_receive_bytes` accepts the raw LayerZero `message`
   bytes, decodes them with the same codec the differential-fuzz harness
   exercises, and dispatches through the same endpoint/peer checks, pause gate,
