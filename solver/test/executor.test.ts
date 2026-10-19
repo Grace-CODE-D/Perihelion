@@ -19,7 +19,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildIntent, hashIntent, perihelionDomain } from "@perihelion/sdk";
 import type { Hex, SignedIntent } from "@perihelion/sdk";
-import { Executor, type ExecutorConfig, type Logger } from "../src/executor.js";
+import {
+  DefiniteFailureError,
+  Executor,
+  type ExecutorConfig,
+  type Logger,
+} from "../src/executor.js";
+import { InFlightTracker } from "../src/in-flight.js";
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
 
@@ -245,6 +251,185 @@ test("checkFillStatus: swallows isSettled errors and returns filled=false", asyn
 
 test("Executor: constructs without throwing for valid config", () => {
   assert.doesNotThrow(() => new Executor(BASE_CONFIG, SILENT_LOGGER));
+});
+
+test("Executor: rejects a missing config", () => {
+  assert.throws(
+    () => new Executor(undefined as unknown as ExecutorConfig, SILENT_LOGGER),
+    /executor config is required/i,
+  );
+});
+
+// ─── DefiniteFailureError classification ─────────────────────────────────────
+
+test("DefiniteFailureError: is an Error subclass", () => {
+  const err = new DefiniteFailureError("boom");
+  assert.ok(err instanceof Error);
+  assert.ok(err instanceof DefiniteFailureError);
+  assert.equal(err.name, "DefiniteFailureError");
+  assert.equal(err.message, "boom");
+});
+
+test("DefiniteFailureError: preserves cause", () => {
+  const cause = new Error("revert");
+  const err = new DefiniteFailureError("lock reverted", { cause });
+  assert.equal(err.cause, cause);
+});
+
+test("lockOnEvm: simulation failure throws DefiniteFailureError", async () => {
+  class SimFailingExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {
+      throw new Error("fill_intent simulation failed");
+    }
+  }
+  const ex = new SimFailingExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError, "expected DefiniteFailureError");
+      assert.match(err.message, /simulation failed/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: sendTransaction status ERROR throws DefiniteFailureError", async () => {
+  class ErrorStatusExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      throw new DefiniteFailureError("sendTransaction returned ERROR");
+    }
+  }
+  const ex = new ErrorStatusExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError);
+      assert.match(err.message, /ERROR/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: FAILED receipt throws DefiniteFailureError", async () => {
+  class FailedReceiptExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      return "0xdeadbeef" as Hex;
+    }
+    protected override async waitForLockReceipt(): Promise<{ status: string }> {
+      return { status: "reverted" };
+    }
+  }
+  const ex = new FailedReceiptExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError);
+      assert.match(err.message, /reverted|FAILED/i);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: pre-broadcast ContractFunctionRevertedError throws DefiniteFailureError", async () => {
+  class RevertExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      const revert = new Error("execution reverted: InsufficientBalance");
+      revert.name = "ContractFunctionRevertedError";
+      throw revert;
+    }
+  }
+  const ex = new RevertExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError);
+      assert.match(err.message, /InsufficientBalance/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: timeout remains a plain Error (indefinite)", async () => {
+  class TimeoutExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      throw new Error("transaction timed out");
+    }
+  }
+  const ex = new TimeoutExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(!(err instanceof DefiniteFailureError), "timeout must stay indefinite");
+      assert.ok(err instanceof Error);
+      assert.match(err.message, /timed out/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: unknown error remains a plain Error (indefinite)", async () => {
+  class UnknownExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      throw new Error("socket hang up");
+    }
+  }
+  const ex = new UnknownExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(!(err instanceof DefiniteFailureError));
+      assert.match(err.message, /socket hang up/);
+      return true;
+    },
+  );
+});
+
+// ─── Reservation release on definite failure ─────────────────────────────────
+
+test("fill: simulation failure releases the InFlightTracker reservation in the same tick", async () => {
+  const signed = makeSignedIntent();
+  const tracker = new InFlightTracker();
+  tracker.reserve(signed.hash);
+
+  class SimFailingExecutor extends Executor {
+    protected override async checkFillStatus() {
+      return { filled: false };
+    }
+    protected override async lockOnEvm(): Promise<Hex> {
+      throw new DefiniteFailureError("fill_intent simulation failed");
+    }
+    protected override async fillOnSoroban(): Promise<Hex> {
+      throw new Error("fillOnSoroban must not be called after simulation failure");
+    }
+  }
+
+  const executor = new SimFailingExecutor(BASE_CONFIG, SILENT_LOGGER);
+
+  await assert.rejects(
+    async () => {
+      try {
+        await executor.fill(signed);
+      } catch (err) {
+        if (err instanceof DefiniteFailureError) {
+          // Definite failure: release immediately, no need to wait for refresh.
+          tracker.release(signed.hash);
+        }
+        throw err;
+      }
+    },
+    (err: unknown) => err instanceof DefiniteFailureError,
+  );
+
+  assert.equal(
+    tracker.has(signed.hash),
+    false,
+    "reservation must be released in the same tick after a definite failure",
+  );
 });
 
 // ─── loadExecutorConfig ───────────────────────────────────────────────────────

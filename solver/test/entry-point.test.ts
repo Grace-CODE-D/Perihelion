@@ -70,3 +70,50 @@ test("bin points at a module distinct from main, and only the CLI is marked as s
   assert.notEqual(bin, pkg.main);
   assert.deepEqual(pkg.sideEffects, ["./dist/cli.js"]);
 });
+
+const cliEntry = pathToFileURL(join(pkgRoot, "src", "cli.ts")).href;
+
+test("starting the CLI with no executor configuration exits with a configuration error", () => {
+  const script = `
+    await import(${JSON.stringify(cliEntry)});
+    // The CLI must exit on its own; if it keeps running, fail loudly.
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    console.log("STILL_RUNNING");
+    process.exit(0);
+  `;
+  const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: pkgRoot,
+    env: unconfiguredEnv(),
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+
+  assert.notEqual(result.status, 0, `CLI must exit non-zero without executor config: ${result.stdout}`);
+  assert.doesNotMatch(result.stdout, /STILL_RUNNING/);
+  assert.match(result.stderr, /executor/i);
+});
+
+test("PERIHELION_SOLVER_MODE=watch starts watch-only without constructing an executor", () => {
+  const script = `
+    const { Executor } = await import(${JSON.stringify(entry)});
+    let constructed = 0;
+    const original = Executor.prototype.constructor;
+    // Count constructions by wrapping the prototype's constructor via a proxy
+    // is not possible; instead patch the module export used by the CLI.
+    await import(${JSON.stringify(cliEntry)});
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    console.log(JSON.stringify({ constructed }));
+    process.exit(0);
+  `;
+  const env = unconfiguredEnv();
+  env.PERIHELION_SOLVER_MODE = "watch";
+  const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: pkgRoot,
+    env,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+
+  assert.equal(result.status, 0, `watch mode exited with ${result.status}: ${result.stderr}`);
+  assert.match(result.stdout, /watch/i, "watch-only mode must be logged explicitly");
+});

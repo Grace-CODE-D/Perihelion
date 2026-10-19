@@ -56,6 +56,17 @@ export class InFlightTracker {
     this.reserved.set(asset, (this.reserved.get(asset) ?? 0n) + amount);
   }
 
+  /**
+   * Amount currently in the *active* reservation bucket for `asset`, excluding
+   * the post-fill `held` bucket.  Exposed so tests can assert that a definite
+   * fill failure releases the reservation in the same tick (before any
+   * `flushHeld()` call), rather than only observing the combined total from
+   * {@link reservedFor}.
+   */
+  activeReservedFor(asset: string): bigint {
+    return this.reserved.get(asset) ?? 0n;
+  }
+
   /** Release a previously reserved amount (call after a *definite* fill failure). */
   release(asset: string, amount: bigint): void {
     const current = this.reserved.get(asset) ?? 0n;

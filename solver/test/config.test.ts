@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { privateKeyToAccount } from "viem/accounts";
 import { loadConfig } from "../src/config.js";
 import { hasExecutorConfig, loadExecutorConfig } from "../src/executor-config.js";
 
@@ -169,6 +170,45 @@ test("loadExecutorConfig rejects a non-positive source chain id", () => {
     () => loadExecutorConfig({ ...baseExecutorEnv(), PERIHELION_SOURCE_CHAIN_ID: "-1" }),
     /PERIHELION_SOURCE_CHAIN_ID must be a positive integer/,
   );
+});
+
+test("loadExecutorConfig requires PERIHELION_SOURCE_CHAIN_ID instead of defaulting", () => {
+  const { PERIHELION_SOURCE_CHAIN_ID: _omitted, ...env } = baseExecutorEnv();
+  assert.throws(
+    () => loadExecutorConfig(env),
+    /PERIHELION_SOURCE_CHAIN_ID is required/,
+  );
+});
+
+test("loadExecutorConfig accepts legacy variable names with a deprecation warning", () => {
+  const { PERIHELION_SOROBAN_RPC_URL: _rpc, PERIHELION_SETTLEMENT_CONTRACT_ID: _contract, ...env } =
+    baseExecutorEnv();
+  const warnings: string[] = [];
+  const config = loadExecutorConfig(
+    {
+      ...env,
+      PERIHELION_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+      PERIHELION_SETTLEMENT_CONTRACT: "0".repeat(64),
+    },
+    { warn: (message) => warnings.push(message) },
+  );
+  assert.equal(config.sorobanRpcUrl, "https://soroban-testnet.stellar.org");
+  assert.equal(config.settlementContractId, "0".repeat(64));
+  assert.ok(warnings.some((w) => w.includes("PERIHELION_STELLAR_RPC_URL")));
+  assert.ok(warnings.some((w) => w.includes("PERIHELION_SETTLEMENT_CONTRACT")));
+});
+
+test("loadExecutorConfig rejects a PERIHELION_SOLVER_ADDRESS that differs from the key-derived address", () => {
+  assert.throws(
+    () => loadExecutorConfig({ ...baseExecutorEnv(), PERIHELION_SOLVER_ADDRESS: VALID_SOLVER }),
+    /PERIHELION_SOLVER_ADDRESS does not match the address derived from PERIHELION_EVM_PRIVATE_KEY/,
+  );
+});
+
+test("loadExecutorConfig accepts a PERIHELION_SOLVER_ADDRESS that matches the key-derived address", () => {
+  const derived = privateKeyToAccount(`0x${"1".repeat(64)}`).address;
+  const config = loadExecutorConfig({ ...baseExecutorEnv(), PERIHELION_SOLVER_ADDRESS: derived });
+  assert.equal(config.solverAddress.toLowerCase(), derived.toLowerCase());
 });
 
 test("loadExecutorConfig rejects a missing STELLAR_NETWORK", () => {

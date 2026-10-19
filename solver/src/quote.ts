@@ -215,6 +215,13 @@ export function escrowSourceNativeCost(
 /**
  * Returns true when the intent is open to any solver or is reserved for
  * `solverAddress`. Uses viem helpers for checksum-insensitive comparison.
+ *
+ * `solverAddress` is `config.solverAddress` (`PERIHELION_SOLVER_ADDRESS`).
+ * When executor configuration is present, startup validates that this address
+ * equals the one derived from `PERIHELION_EVM_PRIVATE_KEY` (the identity the
+ * escrow sees as `msg.sender`), so reserved-intent matching here cannot
+ * diverge from the signing identity. In watch-only mode no key is present and
+ * the explicit address is used as-is.
  */
 export function isSolverEligible(
   preferredSolver: string,
