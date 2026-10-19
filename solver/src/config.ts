@@ -7,10 +7,21 @@ import { isAddress, type Address } from "viem";
 export interface SolverConfig {
   /** Base URL of the Perihelion mempool API to poll. */
   readonly mempoolUrl: string;
-  /** This solver's EVM address (used to claim `preferredSolver` intents). */
+  /**
+   * This solver's EVM address (used to claim `preferredSolver` intents).
+   *
+   * In watch-only mode (no `PERIHELION_EVM_PRIVATE_KEY`) this is the sole
+   * source of the solver identity. When executor configuration is present the
+   * address is derived from the private key instead, and a configured
+   * `PERIHELION_SOLVER_ADDRESS` that differs from it is a startup error.
+   */
   readonly solverAddress: Address;
   /** EVM chain ID the escrow is deployed on (required for signature verification). */
   readonly sourceChainId: number;
+  /** Soroban settlement contract ID (unified name; legacy alias accepted). */
+  readonly settlementContractId?: string;
+  /** Stellar/Soroban RPC URL (unified name; legacy alias accepted). */
+  readonly sorobanRpcUrl?: string;
   /** Address of the PerihelionEscrow contract (required for signature verification). */
   readonly escrowAddress: Address;
   /** Minimum profit, in basis points of source amount, required to fill. */
@@ -99,9 +110,45 @@ function parseNonNegativeBigInt(
 }
 
 /**
+ * Read a setting under its unified name, falling back to a legacy alias with
+ * a deprecation warning. If both are set and disagree, that is an error.
+ */
+function readUnified(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  legacyName: string,
+  errors: string[],
+): string | undefined {
+  const value = env[name];
+  const legacyValue = env[legacyName];
+  if (value !== undefined && value.trim() !== "") {
+    if (legacyValue !== undefined && legacyValue.trim() !== "" && legacyValue !== value) {
+      errors.push(
+        `${name} and deprecated ${legacyName} are both set with different values; ` +
+          `use only ${name}`,
+      );
+    }
+    return value;
+  }
+  if (legacyValue !== undefined && legacyValue.trim() !== "") {
+    console.warn(
+      `${legacyName} is deprecated; use ${name} instead. ` +
+        `The old name will be removed in a future release.`,
+    );
+    return legacyValue;
+  }
+  return undefined;
+}
+
+/**
  * Build config from `process.env`, applying sensible defaults.
  * Throws a descriptive error and exits if required vars are missing or
  * any value is malformed/NaN.
+ *
+ * `PERIHELION_SOLVER_ADDRESS` is only authoritative in watch-only mode; when
+ * executor configuration is present the address is derived from
+ * `PERIHELION_EVM_PRIVATE_KEY` and a mismatch fails startup (see
+ * `loadExecutorConfig`).
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): SolverConfig {
   const errors: string[] = [];
@@ -126,13 +173,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SolverConfig {
     );
   }
 
-  // --- Optional with sane defaults but must not be NaN/out-of-range if set ---
-  const sourceChainId = Number(env.PERIHELION_SOURCE_CHAIN_ID ?? 8453);
-  if (!Number.isInteger(sourceChainId) || sourceChainId <= 0) {
+  // --- Required: source chain id (no default; must match the escrow's chain) ---
+  const rawSourceChainId = env.PERIHELION_SOURCE_CHAIN_ID;
+  const sourceChainId = Number(rawSourceChainId);
+  if (rawSourceChainId === undefined || rawSourceChainId.trim() === "") {
+    errors.push("PERIHELION_SOURCE_CHAIN_ID is required");
+  } else if (!Number.isInteger(sourceChainId) || sourceChainId <= 0) {
     errors.push(
-      `PERIHELION_SOURCE_CHAIN_ID must be a positive integer, got: "${env.PERIHELION_SOURCE_CHAIN_ID}"`,
+      `PERIHELION_SOURCE_CHAIN_ID must be a positive integer, got: "${rawSourceChainId}"`,
     );
   }
+
+  // --- Unified names, with legacy aliases accepted for one release ---
+  const settlementContractId = readUnified(
+    env,
+    "PERIHELION_SETTLEMENT_CONTRACT",
+    "PERIHELION_SETTLEMENT_CONTRACT_ID",
+    errors,
+  );
+  const sorobanRpcUrl = readUnified(
+    env,
+    "PERIHELION_SOROBAN_RPC_URL",
+    "PERIHELION_STELLAR_RPC_URL",
+    errors,
+  );
 
   const minMarginBps = Number(env.PERIHELION_MIN_MARGIN_BPS ?? 15);
   if (!Number.isInteger(minMarginBps) || minMarginBps < 0 || minMarginBps > 10_000) {
@@ -247,6 +311,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SolverConfig {
     mempoolUrl,
     solverAddress: solverAddress as Address,
     sourceChainId,
+    settlementContractId,
+    sorobanRpcUrl,
     escrowAddress: escrowAddress as Address,
     minMarginBps,
     maxPlausibleProfitBps,

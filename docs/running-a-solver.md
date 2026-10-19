@@ -80,7 +80,8 @@ cp solver/.env.example solver/.env
 | Parameter | Example | Notes |
 |-----------|---------|-------|
 | `PERIHELION_MEMPOOL_URL` | `http://localhost:8080` | Mempool API endpoint (local or remote) |
-| `PERIHELION_SOLVER_ADDRESS` | `0x1234...` | Your EVM address (for preferredSolver reserves) |
+| `PERIHELION_SOLVER_MODE` | `live` | `live` (default) or `watch`. In `watch` mode the solver evaluates intents and logs decisions but never invokes the executor, so no executor variables are required. See [Watch-only mode](#watch-only-mode). |
+| `PERIHELION_SOLVER_ADDRESS` | `0x1234...` | Your EVM address (for preferredSolver reserves). In `live` mode this is **optional**: if set, it must match the address derived from `PERIHELION_EVM_PRIVATE_KEY` or the solver refuses to start. In `watch` mode it is the only way to declare an identity. |
 | `PERIHELION_MIN_MARGIN_BPS` | `15` | Minimum profit margin in basis points (15 bps = 0.15%) |
 | `PERIHELION_SOURCE_NATIVE_FEE_FLOOR` | `3000000000000000` | Minimum source-chain native balance, in **wei**, the solver must hold to accept a fill (gas for `lock` + its LayerZero fee). `0` (default) disables the check unless a live estimator is wired. See [Native balance](#native-balance). |
 | `PERIHELION_STELLAR_NATIVE_FEE_FLOOR` | `20000000` | Minimum XLM balance, in **stroops**, the solver must hold to accept a fill (`deliver_intent` + `dispatch_confirmation`, incl. `lz_fee`). `0` (default) disables the check. |
@@ -97,6 +98,43 @@ cp solver/.env.example solver/.env
 | `PERIHELION_METRICS_PORT` | `9090` | Port for the `/metrics` Prometheus endpoint |
 | `PERIHELION_METRICS_HOST` | `127.0.0.1` | Bind address for `/metrics` — see [Network exposure](#network-exposure) before widening |
 | `PERIHELION_METRICS_TOKEN` | — | If set, `/metrics` requires `Authorization: Bearer <token>` |
+
+### Executor configuration is mandatory in live mode
+
+The solver will not start in `live` mode unless the full executor configuration
+is present: `PERIHELION_EVM_RPC_URL`, `PERIHELION_SOROBAN_RPC_URL`,
+`PERIHELION_EVM_PRIVATE_KEY`, `PERIHELION_SOROBAN_SECRET_KEY`,
+`PERIHELION_ESCROW_ADDRESS`, `PERIHELION_SETTLEMENT_CONTRACT_ID`,
+`PERIHELION_SOURCE_CHAIN_ID` and `STELLAR_NETWORK`. If any is missing the CLI
+exits with a configuration error naming the missing variables rather than
+starting an executor that cannot sign anything. There is no silent fallback to
+an empty executor.
+
+### Watch-only mode
+
+Set `PERIHELION_SOLVER_MODE=watch` to run the solver as a dry run. In this mode
+the solver polls the mempool, evaluates every intent (pricing, margin, inventory
+and native-balance checks) and logs the resulting decision, but it never
+constructs or calls an executor, so no fills are attempted and no capital is
+committed. Executor variables are not required; `PERIHELION_SOLVER_ADDRESS` is
+used only to decide which reserved intents would be eligible for you.
+
+Watch mode is the right way to validate pricing, fee estimators and inventory
+readers against a live mempool before funding keys. The startup log states
+explicitly that the solver is running in watch-only mode.
+
+### Solver address must match the signing key
+
+In `live` mode the solver's EVM identity is derived from
+`PERIHELION_EVM_PRIVATE_KEY` (`privateKeyToAccount(...)`). The escrow enforces
+`preferredSolver == msg.sender`, so if `PERIHELION_SOLVER_ADDRESS` disagreed with
+the key, the solver would accept intents reserved for one address and pay gas
+for `lock` transactions that revert with `ReservedForSolver` (or skip intents
+reserved for its real address). To prevent this, at startup the solver derives
+the address from the private key and **refuses to start** if
+`PERIHELION_SOLVER_ADDRESS` is set and differs from it. The error message prints
+both addresses. Either unset `PERIHELION_SOLVER_ADDRESS` (recommended — the
+derived address is used) or correct it to the derived value.
 
 ### Split-fill dispatch deadline
 
@@ -151,6 +189,14 @@ same capacity is skipped as "insufficient inventory" instead of over-filling.
 The reservation is released in a `finally` block once the fill settles — whether
 it succeeds or fails — so a failed fill immediately frees its capacity for retry
 or for another intent.
+
+Failures are classified by whether capital could have moved. *Definite*
+failures — a failed `fill_intent` simulation, `sendTransaction` returning
+`ERROR`, a transaction result with status `FAILED`, or a `writeContract` revert
+before broadcast — are wrapped in `DefiniteFailureError`, and the reservation is
+released in the same tick. *Indefinite* failures — timeouts and unknown errors,
+where the transaction may still land — keep the reservation until the next
+refresh, so the solver never over-commits against a fill that might confirm.
 
 This tracker is in-memory only and resets on restart, so it protects a single
 solver process's polling loop; it is not a substitute for your `InventoryProvider`
@@ -289,6 +335,19 @@ npm install
 npm run build
 ```
 
+**Error: missing executor configuration**
+- The solver is in `live` mode (the default) but one or more executor
+  variables are unset. The error names them.
+- Either set the full executor configuration (see
+  [Executor configuration is mandatory in live mode](#executor-configuration-is-mandatory-in-live-mode)),
+  or run with `PERIHELION_SOLVER_MODE=watch` to evaluate intents without
+  filling them.
+
+**Error: solver address does not match the EVM private key**
+- `PERIHELION_SOLVER_ADDRESS` differs from the address derived from
+  `PERIHELION_EVM_PRIVATE_KEY`. Unset `PERIHELION_SOLVER_ADDRESS` or set it to
+  the derived address printed in the error.
+
 **Error: `ECONNREFUSED` (mempool/RPC)**
 - Verify `PERIHELION_MEMPOOL_URL`, `PERIHELION_EVM_RPC_URL`, `PERIHELION_SOROBAN_RPC_URL` are reachable
 - Check firewall, proxy, or VPN settings
@@ -311,7 +370,9 @@ npm run build
 1. Verify mempool is running and populated
    - Check `/intents` endpoint: `curl http://localhost:8080/intents`
 2. Check `PERIHELION_SOLVER_ADDRESS` — is it reserved by any intents?
-   - If solver address not set or wrong, only open intents will be visible
+   - In `live` mode the address is derived from `PERIHELION_EVM_PRIVATE_KEY`;
+     in `watch` mode it comes from `PERIHELION_SOLVER_ADDRESS`
+   - If the address is not set or wrong, only open intents will be visible
 3. Check deadline — intent must not be expired
    - Solver rejects intents with `deadline < now`
 

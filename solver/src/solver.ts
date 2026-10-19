@@ -675,8 +675,13 @@ export class Solver {
         this.inFlight.holdForRefresh(intent.destAsset, reserved);
       } else if (caughtErr instanceof DefiniteFailureError) {
         // Definite failure (on-chain revert / rejection): the transaction
-        // never landed so the capital was never spent.  Release immediately
-        // so the next intent can use the same balance.
+        // never landed so the capital was never spent.  Release the
+        // InFlightTracker reservation in the same tick so the next intent can
+        // use the same balance immediately, rather than holding it until the
+        // next refresh.  The executor is responsible for wrapping definite
+        // failures (simulation errors, sendTransaction ERROR, FAILED tx
+        // results, pre-broadcast reverts) in DefiniteFailureError; anything
+        // else (timeouts, unknown errors) is treated as indefinite below.
         this.inFlight.release(intent.destAsset, reserved);
       } else {
         // Indefinite failure (timeout, network error, etc.): the transaction

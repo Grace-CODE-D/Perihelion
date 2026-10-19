@@ -9,6 +9,8 @@
  */
 
 import {
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
   http,
@@ -54,6 +56,31 @@ export class DefiniteFailureError extends Error {
     super(message, options);
     this.name = "DefiniteFailureError";
   }
+}
+
+/**
+ * Derive the solver's EVM address from a configured private key.
+ *
+ * The escrow enforces `preferredSolver == msg.sender`, so the address the
+ * solver uses for eligibility decisions must be the one derived from the key
+ * it signs `lock` transactions with.  Exposed so the CLI/config can validate
+ * `PERIHELION_SOLVER_ADDRESS` against it at startup.
+ */
+export function deriveEvmAddress(privateKey: Hex): `0x${string}` {
+  return privateKeyToAccount(privateKey).address;
+}
+
+/**
+ * True when `err` (or any error in its `cause` chain) is a viem
+ * `ContractFunctionRevertedError` — i.e. the contract call reverted during
+ * simulation, before anything was broadcast.
+ */
+function isContractFunctionRevertedError(err: unknown): boolean {
+  if (err instanceof ContractFunctionRevertedError) return true;
+  if (err instanceof BaseError) {
+    return err.walk((e) => e instanceof ContractFunctionRevertedError) !== null;
+  }
+  return false;
 }
 
 /** Logger interface for structured logging. */
@@ -116,16 +143,24 @@ export class Executor {
   private readonly stellarNetwork: string;
   private readonly logger: Logger;
 
-  constructor(config?: ExecutorConfig, logger: Logger = console) {
-    this.evmRpcUrl = config?.evmRpcUrl ?? "";
-    this.sorobanRpcUrl = config?.sorobanRpcUrl ?? "";
-    this.evmPrivateKey = config?.evmPrivateKey ?? ("0x");
-    this.sorobanSecretKey = config?.sorobanSecretKey ?? "";
-    this.escrowAddress = config?.escrowAddress ?? ("0x");
-    this.settlementContractId = config?.settlementContractId ?? "";
-    this.sourceChainId = config?.sourceChainId ?? 0;
-    this.stellarNetwork = config?.stellarNetwork ?? "";
+  constructor(config: ExecutorConfig, logger: Logger = console) {
+    if (!config) {
+      throw new Error("Executor requires an ExecutorConfig");
+    }
+    this.evmRpcUrl = config.evmRpcUrl;
+    this.sorobanRpcUrl = config.sorobanRpcUrl;
+    this.evmPrivateKey = config.evmPrivateKey;
+    this.sorobanSecretKey = config.sorobanSecretKey;
+    this.escrowAddress = config.escrowAddress;
+    this.settlementContractId = config.settlementContractId;
+    this.sourceChainId = config.sourceChainId;
+    this.stellarNetwork = config.stellarNetwork;
     this.logger = logger;
+  }
+
+  /** The solver's EVM address, derived from the configured private key. */
+  get address(): `0x${string}` {
+    return deriveEvmAddress(this.evmPrivateKey);
   }
 
   /**
@@ -277,15 +312,25 @@ export class Executor {
       args: [contractIntent, account.address],
     }) as bigint;
 
-    const txHash = await walletClient.writeContract({
-      account,
-      chain: null, // chain is resolved from the RPC endpoint
-      address: this.escrowAddress,
-      abi: ESCROW_ABI,
-      functionName: "lock",
-      args: [contractIntent, signature],
-      value: nativeFee,
-    });
+    let txHash: Hex;
+    try {
+      txHash = await walletClient.writeContract({
+        account,
+        chain: null, // chain is resolved from the RPC endpoint
+        address: this.escrowAddress,
+        abi: ESCROW_ABI,
+        functionName: "lock",
+        args: [contractIntent, signature],
+        value: nativeFee,
+      });
+    } catch (err) {
+      // A revert surfaced by writeContract happens during simulation, before
+      // broadcast: no capital moved, so the reservation can be released.
+      if (isContractFunctionRevertedError(err)) {
+        throw new DefiniteFailureError("escrow lock reverted", { cause: err });
+      }
+      throw err;
+    }
 
     // Wait for the transaction to be included in a block.
     const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
@@ -349,7 +394,10 @@ export class Executor {
     // Simulate to obtain the resource fee and prepared transaction.
     const simulated = await rpc.simulateTransaction(tx);
     if (!SorobanRpc.Api.isSimulationSuccess(simulated)) {
-      throw new Error(`fill_intent simulation failed: ${String((simulated).error)}`);
+      // Simulation failure: the transaction was never submitted.
+      throw new DefiniteFailureError(
+        `fill_intent simulation failed: ${String((simulated).error)}`,
+      );
     }
 
     const prepared = SorobanRpc.assembleTransaction(tx, simulated).build();
