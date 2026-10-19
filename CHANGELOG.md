@@ -14,8 +14,18 @@ versioned independently.
 
 ### Added
 
-- Nothing yet — see [CONTRIBUTING.md](./CONTRIBUTING.md#release-process) for
-  what belongs here.
+- `make sdk-abi` / `make sdk-abi-check`: `sdk/src/escrow-abi.ts` is now
+  generated from the PerihelionEscrow Foundry build artefact, and CI fails if
+  the committed file is stale.
+
+### Fixed
+
+- **sdk**: `ESCROW_ABI` had drifted from `PerihelionEscrow.sol` — it declared a
+  non-existent `getLock` function and a `PausedError` error.
+  `PerihelionEscrowClient.getLock` now reads the contract's `locks(bytes32)`
+  mapping getter (previously every call reverted) and returns the full record,
+  including the new `minDestAmount` field. Pause reverts now decode as
+  `EnforcedPause`.
 
 ## [0.1.0] - 2026-07-28
 

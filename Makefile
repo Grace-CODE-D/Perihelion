@@ -22,7 +22,7 @@
         coverage coverage-ts coverage-evm      \
         gas                                    \
         audit audit-ts audit-evm audit-rust    \
-        bytecode-check                         \
+        bytecode-check sdk-abi sdk-abi-check   \
         clean                                  \
         fuzz fuzz-bounded fuzz-extended fuzz-nightly \
         fuzz-evm fuzz-rust fuzz-cross          \
@@ -244,6 +244,16 @@ bytecode-check: ## Verify the EVM build matches contracts/evm/.pinned-bytecode/ 
 	else \
 		echo "⏭ skipping bytecode-check — forge not installed (install: https://getfoundry.sh)"; \
 	fi
+
+sdk-abi: ## Regenerate sdk/src/escrow-abi.ts from the PerihelionEscrow build artefact
+	@echo "▶ sdk-abi"
+	cd contracts/evm && forge build --skip test --skip script
+	node scripts/gen-escrow-abi.mjs
+
+sdk-abi-check: ## Fail if sdk/src/escrow-abi.ts differs from the PerihelionEscrow build artefact
+	@echo "▶ sdk-abi-check"
+	cd contracts/evm && forge build --skip test --skip script
+	node scripts/gen-escrow-abi.mjs --check
 
 audit-rust: ## cargo-deny policy check for the Soroban workspace (advisories, licences, bans, sources)
 	@echo "▶ audit-rust"
