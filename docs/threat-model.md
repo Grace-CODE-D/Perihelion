@@ -15,14 +15,14 @@ and with [deployment.md](./deployment.md) for operational roles.
 |---|---|---|---|---|
 | **User** | Picks `minDestAmount` and `deadline` correctly, protects their signing key | Poor choice → fill below market or expired; lost key → cannot refund | Grief (user loses opportunity cost, not principal) | I1: always refunded if not filled; I2: single settlement |
 | **Solver** | Fronts honest liquidity; does not fill invalid intents | Fills an intent not backed by a lock (unprofitable; no risk to user) | Grief (solver loses gas) | I3: solver fronts liquidity, repaid only against verified lock |
-| **Relayer** | Forwards messages promptly; cannot forge | Censors or delays delivery; cannot forge a valid message | Censor/delay (temporary liveness loss for FillInstruction, CancelIntent, FillConfirmed) | Permissionless: anyone can relay; LZ endpoint enforces message authenticity and replay guard |
+| **Relayer** | Forwards messages promptly; cannot forge | Censors or delays delivery; cannot forge a valid message | Censor/delay (temporary liveness loss for FillInstruction, CancelIntent, FillConfirmed) | Permissionless: anyone can relay; LZ endpoint enforces message authenticity and replay guard. **Caveat:** the reference relayer in `relayer/` is a *development-only* stand-in for the LayerZero executor — see [T21](#t21--reference-relayer-impersonates-the-trusted-endpoint) |
 | **LayerZero endpoint** | Enforces the OApp's DVN/ULN config; calls `lzReceive` only for verified messages | Accepts unverified messages (bypasses DVN set) | **Steal** (forge a FillConfirmed → release solver funds without a Stellar fill) | `msg.sender == address(endpoint)` guard in `lzReceive`; endpoint trust is the strongest assumption |
 | **DVN set** (LayerZero verifiers) | ≥ threshold DVNs attest the same source event honestly | A colluding DVN set attests a fake source event | **Steal** (forge a FillConfirmed or CancelIntent) | Multi-DVN with 2 required + 1 optional (≥3 distinct verifiers on common path); OApp admin can rotate set |
 | **Stellar validators** | Produce canonical ledger state with economic finality | A cartel finalizes a fraudulent Stellar ledger | **Steal** (forge a fill on Stellar that the Solver never actually funded); destroy the bridge's Stellar-side correctness | Stellar's consensus (Stellar Consensus Protocol); Perihelion inherits Stellar's finality guarantees |
 | **Admin / timelock owner set** (EVM) | Only executes governance actions the M-of-N honestly agreed to | Threshold of owners collude to rotate peer, or call `skim` to extract surplus balances | **Surplus extraction** — `skim` is bounded on-chain by `totalLocked[token]` accounting (`balanceOf(this) - totalLocked[token]`), preventing extraction of active locked deposits ([T17](#t17--governance-extractable-escrow-balance)) | M-of-N timelock with delay: any config change (including peer/guardian rotation) is public for `delay` seconds before it executes — a single owner can also unilaterally `cancel` a *legitimate recovery* action ([T20](#t20--governance-liveness)) |
 | **Admin** (Soroban) | Configures endpoint, peer, and pause correctly | Sets a malicious endpoint/peer → steals Stellar-side funds | **Steal** (redirect settlement messages) | `set_peer` requires a 1-day propose/confirm delay; **`set_endpoint` does not — it takes effect instantly** ([T18](#t18--instant-endpoint-rotation-on-soroban)). Single-key admin on Soroban (future: migrate to multisig); refund liveness (`cancel_expired_intent`) is itself pausable ([T19](#t19--refund-denial-via-pause)) |
 | **Guardian** (EVM) | Only pauses in genuine emergencies | Pauses repeatedly, denying new locks | Censor (denial of new locks for up to 72 h per 144 h cycle; local refunds remain unpaused) | Auto-expiry (GUARDIAN_PAUSE_TTL) + cooldown; cannot unpause, move funds, or change config |
-| **Executor** (LayerZero delivery) | Delivers committed messages | Drops execution, censors delivery | Censor/delay | Permissionless: anyone can call `lzReceive` for a committed message; executor is replaceable |
+| **Executor** (LayerZero delivery) | Delivers committed messages | Drops execution, censors delivery | Censor/delay | Permissionless: anyone can call `lzReceive` for a committed message; executor is replaceable. **Caveat:** the reference relayer is not a real executor — see [T21](#t21--reference-relayer-impersonates-the-trusted-endpoint) |
 
 ### Key explicit assumptions
 
@@ -54,7 +54,7 @@ and with [deployment.md](./deployment.md) for operational roles.
 | **Solver fronts liquidity** (I3) | The solver delivers destination assets from its own inventory before being repaid. No unbacked payout. |
 | **Permissionless liveness** (I4) | Refund/cancel paths are callable by anyone — users, keepers, or other solvers. No privileged actor can strand funds. |
 | **Guardian cannot steal** | `pause()` is the only guardian-callable state change. No funds move, no config changes. |
-| **Relayer cannot forge** | The endpoint's `msg.sender` check and `stellarPeer` authentication prevent relayers from injecting unauthenticated messages. |
+| **Relayer cannot forge** | The endpoint's `msg.sender` check and `stellarPeer` authentication prevent relayers from injecting unauthenticated messages — *provided the endpoint is a real LayerZero endpoint*. The reference relayer in dev mode is itself configured as the endpoint, so this guarantee does not hold for it ([T21](#t21--reference-relayer-impersonates-the-trusted-endpoint)). |
 
 ### Replay and ordering
 
@@ -844,6 +844,79 @@ of their attack window, not just the guardian's 72-hour cycle.
   duty-cycle bound), [T15](#t15--front-running-of-pause-bypass--telegraphed-timelock-actions)
   ("pause excludes releases" — the design precedent this fix would extend to
   refunds).
+
+---
+
+## T21 — Reference relayer impersonates the trusted endpoint
+
+### Threat
+
+**Vector:** The settlement contract authenticates inbound messages with
+`require_endpoint(env)?.require_auth()` followed by a peer check
+(`contracts/soroban/settlement/src/lib.rs`, `authorize_inbound`). The reference
+relayer (`relayer/src/soroban-delivery.ts`) calls `lz_receive` directly in a
+transaction signed by `SIGNER_SECRET`. For delivery to succeed, the relayer's
+own Stellar account must therefore be configured as the contract's `Endpoint`.
+The relayer also sets `Origin.sender` by reading the contract's own
+`get_peer(srcEid)` and echoing it back, which makes the peer check
+self-fulfilling.
+
+**Consequence:** In this mode the relayer key *is* the trusted endpoint. Whoever
+holds `SIGNER_SECRET` can register any intent with any recipient, amount and
+deadline, and can inject cancellations. No DVN verifies anything; the
+"independent multi-DVN verifier set" described in the README and in
+[§0](#0-consolidated-trust-model) is not in the path at all. The relayer key is
+an ordinary environment variable, not a hardware-backed or multisig key.
+
+### Mitigation status
+
+**Partially mitigated — labelled and gated, not removed.**
+
+- **Labelled:** The README, this document, and `relayer/README.md` state
+  explicitly that the reference relayer is a development-only stand-in for the
+  LayerZero executor and that production must use a real LayerZero
+  endpoint/adapter on Stellar.
+- **Gated:** The relayer CLI requires an explicit `PERIHELION_RELAYER_MODE=dev`
+  to run in endpoint-impersonation mode and refuses to start against Pubnet
+  otherwise. This prevents accidental production use; it does not make the mode
+  safe.
+- **Not removed:** The endpoint-impersonation code path still exists for local
+  development and testnet use.
+
+### Trade-offs considered
+
+| Approach | Chosen? | Rationale |
+|----------|---------|-----------|
+| Document + gate behind `PERIHELION_RELAYER_MODE=dev`, refuse Pubnet | **Yes** | Smallest change that makes the implemented trust model honest and prevents accidental production deployment |
+| Remove the direct `lz_receive` path entirely | No (for now) | It is the only working delivery path for local dev and testnet until a real Stellar LayerZero endpoint/adapter is integrated |
+| Treat the relayer key as a production trust anchor | No | Collapses the LayerZero/DVN trust model into a single hot key; unacceptable for mainnet |
+
+### Production design (required before mainnet)
+
+The relayer must act **only as a permissionless executor**: it calls the real
+LayerZero endpoint's delivery function with a verified packet, and the endpoint
+(not the relayer) authenticates the message against its DVN/ULN configuration.
+In that design the relayer key carries no authority — anyone can submit the
+same packet, and a compromised relayer key can at most censor or delay
+delivery, matching the "Relayer" row in [§0](#0-consolidated-trust-model).
+
+### Residual risk
+
+**High for any deployment that runs the reference relayer in
+endpoint-impersonation mode against a network holding real value.** The
+`PERIHELION_RELAYER_MODE=dev` gate and Pubnet refusal reduce the chance of
+accidental deployment, but operators must not treat the reference relayer as a
+production component. Until a real LayerZero endpoint/adapter is deployed on
+Stellar, the bridge's cross-chain authenticity guarantee does not exist on the
+Stellar side.
+
+### Implementation notes
+
+- **Docs:** `README.md`, `docs/threat-model.md` (this section), and
+  `relayer/README.md` describe the dev-only status and the production design.
+- **Gate:** `relayer/` CLI requires `PERIHELION_RELAYER_MODE=dev` and refuses
+  Pubnet in endpoint-impersonation mode.
+- **Tracking:** [issue #938](https://github.com/Perihelion-Protocol/Perihelion/issues/938).
 
 ---
 

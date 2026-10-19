@@ -630,6 +630,54 @@ export class EVMSourceWatcher implements SourceWatcher {
       srcBlock: Number(log.blockNumber),
     };
   }
+
+  /**
+   * Decode a single `CancelIntent` event log into a `PendingMessage`.
+   *
+   * The cancellation `reason` code is decoded from the non-indexed event data
+   * and carried on the `BridgeMessage` so delivery records the true cause
+   * rather than a hard-coded default.
+   */
+  decodeCancelIntentLog(log: Log): PendingMessage | null {
+    if (!log.blockNumber) return null;
+
+    // topics[0] = event sig, [1] = intentHash, [2] = solver, [3] = user
+    const topics = log.topics as Hex[];
+    if (!topics || topics.length < 4) return null;
+
+    const intentHash = topics[1] as Hex; // bytes32
+    const solver     = ("0x" + topics[2]?.slice(26)) as Hex; // address from 32-byte word
+
+    let reason: number;
+    try {
+      const [reasonValue] = decodeAbiParameters(CANCEL_INTENT_DATA_PARAMS, log.data);
+      reason = Number(reasonValue);
+    } catch {
+      return null;
+    }
+
+    const nonce = Number(log.logIndex ?? 0);
+
+    const message: BridgeMessage = {
+      srcEid: this.config.sourceEid,
+      dstEid: this.config.stellarEid,
+      intentHash: intentHash,
+      messageType: "CancelInstruction",
+      solver: solver,
+      recipient: "",
+      destAsset: "",
+      amount: "0",
+      nonce,
+      reason,
+      rawPayload: "0x",
+    };
+
+    return {
+      message,
+      srcTxHash: log.transactionHash ?? "",
+      srcBlock: Number(log.blockNumber),
+    };
+  }
 }
 
 /**

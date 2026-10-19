@@ -112,8 +112,11 @@ which a user loses funds mid-bridge.
   instead of a single privileged operator.
 - 🔓 **Permissionless** — anyone can run a solver, a relayer, or a keeper. No
   allowlist gates liveness, and the refund path needs no privileged actor.
-- 🛰️ **LayerZero-secured messaging** — verified cross-chain delivery with a
-  multi-DVN trust model, plus a roadmap to ZK state proofs (Protocol 24).
+- 🛰️ **LayerZero-secured messaging** — the production design uses verified
+  cross-chain delivery with a multi-DVN trust model, plus a roadmap to ZK state
+  proofs (Protocol 24). The bundled reference relayer is a **development-only
+  stand-in** for the LayerZero executor and does not provide these guarantees
+  (see [Trust Assumptions](#trust-assumptions)).
 - 🪙 **Canonical assets** — users receive real Stellar assets sourced from solver
   liquidity, never a synthetic wrapper.
 - 🧱 **Built for contributors** — a clean monorepo with scoped, skill-tagged
@@ -133,10 +136,20 @@ Perihelion uses an **intent + solver** architecture:
    against a cryptographic commitment; the solver fronts liquidity on Stellar;
    the escrow releases the locked funds to the solver once settlement is verified
    over LayerZero. If the deadline passes without a fill, the user is refunded.
-4. **Trust-minimized messaging.** Cross-chain messages are carried by
-   [LayerZero](https://layerzero.network) with an independent multi-DVN verifier
-   set, and — on the roadmap — Stellar's native ZK proof support (Protocol 24)
-   for the most sensitive path.
+4. **Trust-minimized messaging.** In the production design, cross-chain messages
+   are carried by [LayerZero](https://layerzero.network) with an independent
+   multi-DVN verifier set, and — on the roadmap — Stellar's native ZK proof
+   support (Protocol 24) for the most sensitive path.
+
+> ⚠️ **The reference relayer in this repository is not that production
+> messenger.** It is a development-only shim that calls `lz_receive` directly
+> from a single hot key configured as the settlement contract's `Endpoint`
+> (endpoint-impersonation mode). In that mode there is no DVN verification: the
+> holder of the relayer secret can submit arbitrary fills and cancellations. The
+> relayer refuses to run in this mode against a public network unless
+> `PERIHELION_RELAYER_MODE=dev` is set explicitly. Production deployments must
+> use a real LayerZero endpoint/adapter on Stellar, with the relayer acting only
+> as a permissionless executor that delivers verified packets.
 
 ## Architecture
 
@@ -189,7 +202,7 @@ phased rollout — is in the
 | `contracts/` | Soroban (Rust) settlement contract + EVM (Solidity) escrow contract |
 | `sdk/`       | TypeScript SDK for intent construction, signing, and submission     |
 | `solver/`    | Reference solver node — monitors the mempool and fills intents      |
-| `relayer/`   | LayerZero message relayer for the Stellar ↔ EVM path                |
+| `relayer/`   | Reference relayer for the Stellar ↔ EVM path — **development-only** stand-in for the LayerZero executor (see [Trust Assumptions](#trust-assumptions)) |
 | `docs/`      | Protocol specifications and integration guides                      |
 
 This is an [npm workspaces](https://docs.npmjs.com/cli/using-npm/workspaces)
@@ -391,13 +404,24 @@ Scoped honestly, per role:
 | Role | Can do | Cannot do | Bounding mechanism |
 |---|---|---|---|
 | **Solver / Relayer / Keeper** | Delay or decline to act | Steal funds, forge a fill, censor permanently (anyone can take over) | Permissionless; wire-format and signature checks |
-| **LayerZero DVN set** | — | — | Root of message authenticity; a colluding DVN set can forge a fill (see [T16](./docs/threat-model.md#t16--layerzero-endpoint-compromise--malicious-origin-spoofing)) |
+| **Reference relayer (dev mode only)** | Submit arbitrary fills and cancellations for any intent, with any recipient, amount and deadline | — | **None.** In endpoint-impersonation mode the relayer key *is* the contract's `Endpoint`, so it carries full authority over inbound messages. This is a development shim, not a production trust model ([#938](https://github.com/Perihelion-Protocol/Perihelion/issues/938)); it is gated behind `PERIHELION_RELAYER_MODE=dev` and refuses to run against a public network otherwise |
+| **LayerZero DVN set** | — | — | Root of message authenticity **in the production design**, where a real LayerZero endpoint/adapter on Stellar verifies packets and the relayer is only a permissionless executor. A colluding DVN set can forge a fill (see [T16](./docs/threat-model.md#t16--layerzero-endpoint-compromise--malicious-origin-spoofing)) |
 | **Guardian (EVM)** | Pause new locks, for up to 72h per 144h cycle | Move funds, change config, unpause, block local refunds | Auto-expiry + cooldown ([T11](./docs/threat-model.md#t11--guardian-key-dos-via-repeated-instant-pause)) |
 | **EVM timelock owner set** | Rotate the peer, guardian, or grace period; withdraw genuine surplus token balance via `skim`; manage asset allowlist via `setAssetAllowed` | Withdraw locked user deposits; bypass the timelock delay for peer/grace/guardian changes | M-of-N confirmation + public delay for config changes; `skim` is bounded on-chain by `totalLocked[token]` accounting (`balanceOf(this) - totalLocked[token]`) ([T17](./docs/threat-model.md#t17--governance-extractable-escrow-balance)); asset allowlist is enforced in `lock` |
 | **A single EVM timelock owner** | Cancel any pending operation, including a legitimate unpause or guardian rotation | Execute an operation alone | None at present — this is a liveness single point of failure ([T20](./docs/threat-model.md#t20--governance-liveness)) |
 | **Soroban admin** | Rotate the LayerZero endpoint **instantly, with no delay** | — | `propose_peer`/`confirm_peer` have a 1-day delay; `set_endpoint` does not ([T18](./docs/threat-model.md#t18--instant-endpoint-rotation-on-soroban)) |
 
 **The practical implication:** `skim` is bounded on-chain by per-token liability accounting (`totalLocked`), preventing the owner set from extracting active user deposits. The residual governance risk is that the owner can withdraw genuine surplus (e.g. fee-on-transfer residue, accidentally sent / donated tokens, or upward rebase surplus), while single-owner cancellation remains a liveness single point of failure ([T20](./docs/threat-model.md#t20--governance-liveness)) and Soroban endpoint rotation is instant ([T18](./docs/threat-model.md#t18--instant-endpoint-rotation-on-soroban)) — see [`docs/threat-model.md`](./docs/threat-model.md) §0 and T17–T20 for the full trust model, likelihood/impact assessment, and tracked mitigation issues.
+
+**The messaging trust model is not yet implemented end to end.** The multi-DVN
+row above describes the production design. The reference relayer shipped in this
+repository does not use it: it signs `lz_receive` itself as the contract's
+`Endpoint`, so the relayer key carries the authority that a DVN set is supposed
+to hold. Treat the relayer as a development tool only, and do not run it against
+Pubnet or any other public network in endpoint-impersonation mode. See the
+[Relayer Runbook](./docs/relayer-runbook.md) and
+[`relayer/README.md`](./relayer/README.md) for the gating flag and the
+production design.
 
 ## Security
 
@@ -481,3 +505,6 @@ blockchain universe._
 
 <!-- handsoff-issue-691 -->
 - #691: sdk: two `buildIntent` V_min warning tests fail because the warning now requires `sourceDecimals`
+
+<!-- handsoff-issue-938 -->
+- #938: relayer: the reference relayer signs `lz_receive` as the trusted endpoint, collapsing the LayerZero/DVN trust model into a single hot key

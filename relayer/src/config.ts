@@ -53,7 +53,31 @@ export interface RelayerConfig {
   readonly readinessStaleMs: number;
   /** Maximum cursor lag, in blocks, before `/readyz` fails. Defaults to 500. */
   readonly maxLagBlocks: number;
+  /**
+   * Relayer operating mode.  `"dev"` (the default) runs the development-only
+   * stand-in for the LayerZero executor, which signs `lz_receive` directly as
+   * the settlement contract's configured `Endpoint`.  `"executor"` is reserved
+   * for the production design, where the relayer is a permissionless executor
+   * calling a real LayerZero endpoint/adapter and its key carries no authority.
+   */
+  readonly relayerMode: RelayerMode;
+  /**
+   * Explicit override that permits endpoint-impersonation mode (`"dev"`)
+   * against a public network (Pubnet).  Without it, the relayer refuses to
+   * start in `"dev"` mode when {@link stellarNetwork} is Pubnet.
+   */
+  readonly allowEndpointImpersonation: boolean;
 }
+
+/** Supported relayer operating modes. */
+export type RelayerMode = "dev" | "executor";
+
+/** Stellar Pubnet network passphrase. */
+export const PUBNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+
+/** Accepted truthy values for boolean environment flags. */
+const TRUTHY_RE = /^(1|true|yes|on)$/i;
+=======
 
 /** 0x-prefixed 20-byte EVM address. */
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
@@ -236,6 +260,36 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
     );
   }
 
+  // --- Relayer mode (defaults to the development-only stand-in) ---
+  const rawRelayerMode = (env.PERIHELION_RELAYER_MODE ?? "dev").trim().toLowerCase();
+  let relayerMode: RelayerMode = "dev";
+  if (rawRelayerMode === "dev" || rawRelayerMode === "executor") {
+    relayerMode = rawRelayerMode;
+  } else {
+    errors.push(
+      `PERIHELION_RELAYER_MODE must be "dev" or "executor", got: "${env.PERIHELION_RELAYER_MODE}"`,
+    );
+  }
+
+  // --- Explicit override for endpoint impersonation on a public network ---
+  const allowEndpointImpersonation = TRUTHY_RE.test(
+    (env.PERIHELION_ALLOW_ENDPOINT_IMPERSONATION ?? "").trim(),
+  );
+
+  // --- Network gate: refuse endpoint impersonation against Pubnet ---
+  if (
+    relayerMode === "dev" &&
+    stellarNetwork === PUBNET_PASSPHRASE &&
+    !allowEndpointImpersonation
+  ) {
+    errors.push(
+      "PERIHELION_RELAYER_MODE=dev impersonates the settlement contract's Endpoint and is " +
+        "development-only; refusing to start against Pubnet. Set " +
+        "PERIHELION_ALLOW_ENDPOINT_IMPERSONATION=true to override (unsafe), or use a real " +
+        "LayerZero endpoint/adapter (PERIHELION_RELAYER_MODE=executor).",
+    );
+  }
+
   if (errors.length > 0) {
     throw new Error(
       `Relayer configuration error — fix the following before starting:\n  • ${errors.join("\n  • ")}`,
@@ -268,5 +322,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
     metricsToken,
     readinessStaleMs,
     maxLagBlocks,
+    relayerMode,
+    allowEndpointImpersonation,
   };
 }

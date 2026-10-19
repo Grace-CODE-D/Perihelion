@@ -363,6 +363,7 @@ export class SorobanDestinationDelivery implements DestinationDelivery {
     if (!senderBytes) {
       throw new FatalError(`No trusted peer configured for source eid ${srcEid}`);
     }
+    const reason = message.reason ?? 0;
     const originScVal = xdr.ScVal.scvMap([
       new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("nonce"), val: nativeToScVal(BigInt(nonce), { type: "u64" }) }),
       new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("sender"), val: xdr.ScVal.scvBytes(senderBytes) }),
@@ -376,6 +377,17 @@ export class SorobanDestinationDelivery implements DestinationDelivery {
       nativeToScVal(Buffer.from(rawPayload.slice(2), "hex"), { type: "bytes" }),
     ));
     return builder;
+  }
+
+  private cancelReasonScVal(reason: number): xdr.ScVal {
+    return nativeToScVal(reason, { type: "u32" });
+  }
+
+  private escrowSenderBytes(): Buffer {
+    if (!this.config.escrowAddress) {
+      throw new FatalError("No escrow address configured for peer fallback");
+    }
+    return evmAddressToBytes32(this.config.escrowAddress);
   }
 
   private intentHashScVal(intentHash: string) {

@@ -24,6 +24,27 @@ import { PerihelionValidationError } from "./errors.js";
 /** Upper bound on `decimals`, generous for any real asset but small enough to rule out unbounded BigInt exponentiation. */
 const MAX_DECIMALS = 36;
 
+/**
+ * Encode a 20-byte EVM address as a 32-byte, left-padded hex string.
+ *
+ * Matches Solidity's `bytes32(uint256(uint160(addr)))` encoding used by
+ * LayerZero for `Origin.sender`: the 20 address bytes occupy offsets 12-31
+ * of the 32-byte word, with 12 leading zero bytes.
+ *
+ * @param address `0x`-prefixed 20-byte hex address, e.g. `"0x0000000000000000000000000000000000000001"`.
+ * @returns `0x`-prefixed 32-byte hex string, e.g. `"0x0000000000000000000000000000000000000000000000000000000000000001"`.
+ * @throws {PerihelionValidationError} If `address` is missing or not a valid `0x`-prefixed 20-byte hex address.
+ */
+export function evmAddressToBytes32(address: string): string {
+  if (typeof address !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new PerihelionValidationError(
+      `evmAddressToBytes32: invalid EVM address "${String(address)}"`,
+      "address",
+    );
+  }
+  return `0x${address.slice(2).toLowerCase().padStart(64, "0")}`;
+}
+
 /** Reject a `decimals` argument that is not a small non-negative integer. */
 function assertValidDecimals(decimals: number, fn: string): void {
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > MAX_DECIMALS) {

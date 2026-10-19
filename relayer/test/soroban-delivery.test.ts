@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { nativeToScVal, scValToNative, scvU32, scvVoid } from "@stellar/stellar-sdk";
 import { FatalError } from "../src/relayer.js";
 import { SorobanDestinationDelivery } from "../src/soroban-delivery.js";
+import type { BridgeMessage } from "../src/types.js";
 
 const SIGNER_SECRET = "SATIFRDTRKIU6OIU3FURVUO2NIVO5KVH6GQIAGBFPMV4UE4WOXYK5PBW";
 const CONTRACT_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
@@ -96,4 +97,69 @@ test("Soroban delivery preserves the cause of ordinary errors", async () => {
     () => delivery.deliver({} as never),
     (error: unknown) => error instanceof Error && error.cause === original,
   );
+});
+
+function makeCancelMessage(reason: number): BridgeMessage {
+  return {
+    intentHash: INTENT_HASH,
+    kind: "cancel",
+    reason,
+  } as unknown as BridgeMessage;
+}
+
+function cancelInstructionArgs(delivery: SorobanDestinationDelivery, message: BridgeMessage): xdr.ScVal[] {
+  return (delivery as unknown as { buildCancelInstruction(message: BridgeMessage): xdr.ScVal[] })
+    .buildCancelInstruction(message);
+}
+
+function mapEntryValue(entries: xdr.ScVal[], key: string): unknown {
+  const map = entries[0];
+  const scMap = map.map() ?? [];
+  const entry = scMap.find((e) => e.key().sym().toString() === key);
+  assert.ok(entry, `missing map entry ${key}`);
+  return scValToNative(entry.val());
+}
+
+test("Soroban delivery encodes the CancelIntent reason for each code", () => {
+  const delivery = makeDelivery();
+  const cases: Array<[number, number]> = [
+    [0, 0], // EXPIRED
+    [1, 1], // ADMIN
+    [2, 2], // INVALID
+  ];
+
+  for (const [reason, expected] of cases) {
+    const args = cancelInstructionArgs(delivery, makeCancelMessage(reason));
+    assert.equal(mapEntryValue(args, "reason"), expected, `reason ${reason} must be preserved`);
+  }
+});
+
+test("Soroban delivery rejects a CancelIntent with an unknown reason", () => {
+  const delivery = makeDelivery();
+  assert.throws(() => cancelInstructionArgs(delivery, makeCancelMessage(3)), FatalError);
+});
+
+test("Soroban delivery fails when the peer lookup fails instead of guessing Origin.sender", async () => {
+  const delivery = makeDelivery();
+  const lookupError = new Error("peer lookup failed");
+  (delivery as unknown as { getPeer(): Promise<unknown> }).getPeer = async () => {
+    throw lookupError;
+  };
+  const append = (delivery as unknown as {
+    appendLzReceiveCall(args: unknown[], message: BridgeMessage): Promise<void>;
+  }).appendLzReceiveCall.bind(delivery);
+
+  await assert.rejects(
+    () => append([], { intentHash: INTENT_HASH, kind: "lzReceive" } as unknown as BridgeMessage),
+    (error: unknown) => error instanceof Error,
+  );
+});
+
+test("Soroban delivery encodes EVM addresses left-padded in Origin.sender", () => {
+  const delivery = makeDelivery();
+  const encoded = (delivery as unknown as { evmAddressToBytes32(address?: string): Buffer })
+    .evmAddressToBytes32("0x0000000000000000000000000000000000000001");
+  const expected = Buffer.alloc(32);
+  expected[31] = 0x01;
+  assert.deepEqual(encoded, expected);
 });

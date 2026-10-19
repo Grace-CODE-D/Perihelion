@@ -59,6 +59,41 @@ test("loadConfig reads health, readiness and state-file overrides", () => {
   assert.equal(config.deadLetterFile, "/var/lib/perihelion/dead-letter.json");
 });
 
+test("loadConfig defaults the relayer mode to dev", () => {
+  const config = loadConfig(validConfigEnv());
+  assert.equal(config.relayerMode, "dev");
+});
+
+test("loadConfig rejects dev mode against Pubnet without an explicit override", () => {
+  assert.throws(
+    () =>
+      loadConfig({
+        ...validConfigEnv(),
+        PERIHELION_NETWORK: "pubnet",
+      }),
+    /PERIHELION_RELAYER_MODE/,
+  );
+  assert.throws(
+    () =>
+      loadConfig({
+        ...validConfigEnv(),
+        PERIHELION_NETWORK: "pubnet",
+        PERIHELION_RELAYER_MODE: "dev",
+      }),
+    /PERIHELION_RELAYER_MODE/,
+  );
+});
+
+test("loadConfig permits dev mode against Pubnet with the explicit override", () => {
+  const config = loadConfig({
+    ...validConfigEnv(),
+    PERIHELION_NETWORK: "pubnet",
+    PERIHELION_RELAYER_MODE: "dev",
+    PERIHELION_ALLOW_DEV_RELAYER_ON_PUBNET: "true",
+  });
+  assert.equal(config.relayerMode, "dev");
+});
+
 test("loadConfig rejects malformed health and readiness settings, naming each variable", () => {
   const cases: Array<[string, string]> = [
     ["PERIHELION_HEALTH_PORT", "abc"],
