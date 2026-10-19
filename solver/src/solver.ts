@@ -649,11 +649,16 @@ export class Solver {
       // Terminal: filled successfully.
       this.seen.add(hash, deadlineMs);
       this.retryState.delete(hash);
-      // Best-effort: report "settled" to the mempool so the record leaves
+      // Best-effort: report "filled" to the mempool so the record leaves
       // "pending" immediately rather than waiting for deadline eviction.
+      // "filled" is deliberately *not* terminal: at this point we have only
+      // delivered on Stellar — the source-chain escrow has not released yet,
+      // and the LayerZero message may still be in flight, be rejected, or
+      // lose the race with cancelExpired. A separate watcher that observes
+      // the EVM `Released` event promotes the record to "settled".
       // A failed report must never fail or retry the fill — the on-chain
       // settlement already succeeded.
-      await this.reportSettled(hash);
+      await this.reportFilled(hash);
     } catch (err) {
       caughtErr = err;
       if (err instanceof FatalError) throw err;
@@ -689,23 +694,29 @@ export class Solver {
   }
 
   /**
-   * Best-effort: report `"settled"` to the mempool after a successful fill.
+   * Best-effort: report `"filled"` to the mempool after a successful fill.
    * Errors are logged and swallowed — a failed status report must never
    * affect the on-chain outcome or retry logic.
+   *
+   * `"filled"` is an intermediate, non-terminal status: it means the solver
+   * has delivered on Stellar but the source-chain escrow has not released
+   * yet. Only a component that observes the EVM `Released` event may report
+   * `"settled"`, so a user whose release fails is not shown a completed
+   * bridge and is not steered away from the refund path.
    *
    * Only called when {@link SolverConfig.mempoolStatusToken} is configured.
    * Without a token the PATCH endpoint requires no auth in local/dev setups,
    * but we skip reporting entirely when the operator has not provided one to
    * avoid noisy 401s in production environments that do require auth.
    */
-  private async reportSettled(hash: Hex): Promise<void> {
+  private async reportFilled(hash: Hex): Promise<void> {
     const token = this.config.mempoolStatusToken;
     if (!token) return;
     try {
-      await this.client.reportStatus(hash, "settled" satisfies MempoolIntentStatus, token);
-      this.log.info("reported settled to mempool", { hash });
+      await this.client.reportStatus(hash, "filled" satisfies MempoolIntentStatus, token);
+      this.log.info("reported filled to mempool", { hash });
     } catch (err) {
-      this.log.warn("failed to report settled to mempool (non-fatal)", {
+      this.log.warn("failed to report filled to mempool (non-fatal)", {
         hash,
         err: String(err),
       });

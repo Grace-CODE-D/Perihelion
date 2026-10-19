@@ -14,12 +14,12 @@ info:
     ## Intent lifecycle
 
     The full cross-chain intent lifecycle (as modeled by the SDK and the
-    on-chain contracts) has six states:
+    on-chain contracts) has seven states:
 
     ```
-    pending → claimed → settling → settled
-           ↘                    ↘
-            expired              refunded
+    pending → claimed → settling → filled → settled
+           ↘                             ↘
+            expired                       refunded
     ```
 
     | Status     | Meaning                                                      |
@@ -27,15 +27,24 @@ info:
     | `pending`  | Signed, in the mempool, unclaimed by any solver              |
     | `claimed`  | A solver has locked the source-chain funds                   |
     | `settling` | Cross-chain LayerZero message is in flight                   |
-    | `settled`  | Assets released on Stellar; bridge complete                  |
+    | `filled`   | Delivered on Stellar; awaiting source-chain `Released`       |
+    | `settled`  | Source chain emitted `Released`; bridge complete             |
     | `refunded` | Solver-initiated refund after a failed or cancelled fill     |
     | `expired`  | Deadline passed before any solver claimed the intent         |
 
-    **This mempool's `IntentStatus` only covers four of those six states:**
-    `pending`, `settled`, `refunded`, `expired`. `claimed` and `settling` are
-    part of the broader on-chain/SDK lifecycle but are never assigned by this
-    reference implementation — solvers and the relayer currently track those
-    intermediate states out-of-band.
+    **This mempool's `IntentStatus` only covers five of those seven states:**
+    `pending`, `filled`, `settled`, `refunded`, `expired`. `claimed` and
+    `settling` are part of the broader on-chain/SDK lifecycle but are never
+    assigned by this reference implementation — solvers and the relayer
+    currently track those intermediate states out-of-band.
+
+    `filled` is an intermediate, non-terminal state: the solver has delivered
+    the assets on Stellar, but the source-chain escrow has not yet released
+    the funds. A record becomes `settled` only after the source chain has
+    emitted `Released` for the intent; `settled` is reported by the component
+    that observes that event, not by the solver at fill time. Clients must
+    treat `filled` as distinct from `settled` — in particular, a `filled`
+    intent whose release fails can still be refunded.
 
     ## Status ownership
 
@@ -345,7 +354,7 @@ paths:
                 $ref: '#/components/schemas/IntentRecord'
         '400':
           description: |
-            Invalid hash, or a status that is not one of the four states this
+            Invalid hash, or a status that is not one of the five states this
             mempool assigns.
           content:
             application/json:
@@ -400,12 +409,18 @@ components:
     IntentStatus:
       type: string
       description: |
-        The four statuses this mempool assigns. `claimed` and `settling` are
+        The five statuses this mempool assigns. `claimed` and `settling` are
         part of the broader on-chain/SDK lifecycle but are never assigned by
         this reference implementation.
+
+        `filled` is intermediate: the solver has delivered on Stellar but the
+        source chain has not yet released. `settled` is terminal and is only
+        reported after the source chain emits `Released` for the intent.
       enum:
         - pending
+        - filled
         - settled
+        - cancelling
         - refunded
         - expired
 

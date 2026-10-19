@@ -614,6 +614,89 @@ contract PerihelionTimelockTest is Test {
         t2.execute(address(t2), 0, data, SALT);
     }
 
+    // --- Removed-owner confirmations (issue #934) ---------------------------
+
+    /// @notice AC (#934): a confirmation from an owner who has since been
+    ///         removed must not count towards the execution threshold.
+    function test_RemovedOwnerConfirmation_DoesNotCountTowardsThreshold() public {
+        // 3-of-4 timelock so removing one owner keeps the threshold reachable.
+        address d = address(0xD4);
+        address[] memory owners = new address[](4);
+        owners[0] = a;
+        owners[1] = b;
+        owners[2] = c;
+        owners[3] = d;
+        PerihelionTimelock t4 = new PerihelionTimelock(owners, 3, DELAY);
+
+        // Pending operation confirmed by a, b and c (threshold reached).
+        bytes memory data = _setValueData(77);
+        bytes32 id = t4.hashOperation(address(target), 0, data, SALT);
+        vm.prank(a);
+        t4.propose(address(target), 0, data, SALT);
+        vm.prank(b);
+        t4.confirm(id);
+        vm.prank(c);
+        t4.confirm(id);
+
+        // Remove c through governance (a, b, d confirm the removal).
+        bytes memory removeData = abi.encodeWithSelector(PerihelionTimelock.removeOwner.selector, c);
+        bytes32 removeId = t4.hashOperation(address(t4), 0, removeData, SALT);
+        vm.prank(a);
+        t4.propose(address(t4), 0, removeData, SALT);
+        vm.prank(b);
+        t4.confirm(removeId);
+        vm.prank(d);
+        t4.confirm(removeId);
+        vm.warp(block.timestamp + DELAY);
+        vm.prank(a);
+        t4.execute(address(t4), 0, removeData, SALT);
+        assertFalse(t4.isOwner(c), "c must be removed");
+
+        // Only a and b are still owners: the removed owner's confirmation is
+        // no longer counted, so execution fails for lack of confirmations.
+        vm.prank(a);
+        vm.expectRevert(PerihelionTimelock.NotEnoughConfirmations.selector);
+        t4.execute(address(target), 0, data, SALT);
+    }
+
+    // --- Cancel then re-propose (issue #935) --------------------------------
+
+    /// @notice AC (#935): an operation can be cancelled and re-proposed with
+    ///         identical parameters, confirmed by the same owners, and executed.
+    function test_CancelThenReproposeIdenticalOperation_Executes() public {
+        bytes memory data = _setValueData(99);
+        bytes32 id = tl.hashOperation(address(target), 0, data, SALT);
+
+        // First proposal: a confirms, then a and b cancel it (threshold = 2).
+        vm.prank(a);
+        tl.propose(address(target), 0, data, SALT);
+        vm.prank(a);
+        tl.cancel(id);
+        vm.prank(b);
+        tl.cancel(id);
+        (,,, bool exists) = tl.operations(id);
+        assertFalse(exists, "operation must be cancelled");
+
+        // Per-owner flags for the cancelled id are cleared.
+        assertFalse(tl.confirmedBy(id, a), "confirmedBy must be cleared on cancel");
+        assertFalse(tl.cancelConfirmedBy(id, a), "cancelConfirmedBy must be cleared on cancel");
+        assertFalse(tl.cancelConfirmedBy(id, b), "cancelConfirmedBy must be cleared on cancel");
+
+        // Re-propose the identical operation: the proposer's confirmation must
+        // not hit AlreadyConfirmed.
+        vm.prank(a);
+        bytes32 id2 = tl.propose(address(target), 0, data, SALT);
+        assertEq(id2, id, "identical parameters yield the same id");
+
+        // The same owners confirm again and the operation executes.
+        vm.prank(b);
+        tl.confirm(id);
+        vm.warp(block.timestamp + DELAY);
+        vm.prank(a);
+        tl.execute(address(target), 0, data, SALT);
+        assertEq(target.value(), 99);
+    }
+
     // --- End-to-end: timelock owns the escrow --------------------------------
 
     function test_TimelockOwnsAndGovernsEscrow() public {
