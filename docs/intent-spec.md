@@ -61,15 +61,17 @@ is paid for an intent that the Soroban contract will never register.
 The 7-day window covers any realistic cross-chain settlement cycle while
 bounding the per-intent storage TTL on Stellar.
 
-### preferredSolver Limitation
+### Solver-lock exclusivity
 
-**`preferredSolver` controls solver reservation on the EVM source chain only.**
-When an intent bridges to Stellar, the solver reservation does not carry over —
-the Soroban settlement contract cannot represent an EVM address as a Stellar
-address, so any `preferredSolver` value is silently dropped on Stellar. Users who
-set `preferredSolver` on the EVM side get no reservation protection if the intent
-settles through cross-chain settlement. Cross-chain solver identity and
-reservation is tracked as a follow-up to issue #271.
+The canonical FillInstruction solver word is the EVM address that called `lock`,
+not `preferredSolver` and not an arbitrary payout address. Soroban stores that
+32-byte identity and requires `solver_evm` supplied by the delivering solver to
+match it while `reservation_window` is active. The EVM escrow applies the same
+window when consuming FillConfirmed. Once the window reaches the intent deadline,
+the fill is permissionless until the source-chain confirmation grace period lets
+`cancelExpired` win the refund race; a post-expiry solver's own EVM address is then
+the payout recipient. The canonical identity is never substituted during the
+exclusive window.
 
 ## Amount Field Specification
 

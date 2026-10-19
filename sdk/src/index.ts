@@ -39,3 +39,9 @@ export * from "./validate.js";
 export * from "./escrow-abi.js";
 export * from "./escrow-client.js";
 export * from "./deployments.js";
+
+// Explicit re-export of the shared EVM address encoder so the solver and
+// relayer can import it directly from the package entrypoint. The helper
+// left-pads the 20-byte address (bytes 12–31), matching the EVM decoder's
+// expectation of `bytes32(uint256(uint160(addr)))`.
+export { evmAddressToBytes32 } from "./units.js";

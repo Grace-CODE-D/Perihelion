@@ -1,42 +1,61 @@
 // SPDX-License-Identifier: MIT
 
+import { Address } from "viem";
+
 /**
- * PerihelionEscrow deployment addresses by chain ID.
+ * Deployed Perihelion escrow addresses by chain ID.
  *
- * Perihelion is pre-deployment: no chain has a live escrow yet, so this map
- * is intentionally empty. There is no automated sync — an entry is added by
- * hand, in the same PR that records the address in `docs/deployment.md`
- * (§4.4), once a chain's escrow is deployed.
+ * This map is the source of truth for escrow addresses across deployed chains.
+ * See `docs/deployment.md` for the deployment procedure and address registration.
  *
- * Format: chainId → escrow address (0x-prefixed, checksummed).
+ * Currently no chains are deployed. Use `getEscrowAddress` or `tryGetEscrowAddress`
+ * to query this map with proper error handling.
  */
-
-import type { Address } from "./types.js";
-import { PerihelionValidationError } from "./errors.js";
-
-export const DEPLOYMENTS: Readonly<Record<number, Address>> = {
-  // 1: "0x..." as Address,  // Ethereum mainnet
-  // 8453: "0x..." as Address,  // Base mainnet
-  // 42161: "0x..." as Address,  // Arbitrum One
-};
+export const DEPLOYMENTS: Readonly<Record<number, Address>> = Object.freeze({
+  // Deployments will be added here as chains go live.
+  // See docs/deployment.md for the deployment procedure.
+});
 
 /**
- * Get the escrow address for a given chain ID.
+ * Get the escrow address for a chain, throwing if not deployed.
  *
- * @param chainId The EVM chain ID.
- * @returns The escrow address.
- * @throws {@link PerihelionValidationError} if no escrow is recorded for `chainId`
- *   — either the chain has no deployment yet, or `DEPLOYMENTS` hasn't been
- *   updated for it. Callers must not treat an unknown chain as a silent default.
+ * @param chainId - The EVM chain ID
+ * @returns The escrow contract address
+ * @throws UndeployedChainError if the chain is not deployed
+ *
+ * @example
+ * ```ts
+ * const escrowAddr = getEscrowAddress(8453); // Base mainnet
+ * ```
  */
 export function getEscrowAddress(chainId: number): Address {
   const address = DEPLOYMENTS[chainId];
   if (!address) {
-    throw new PerihelionValidationError(
-      `[Perihelion] No escrow deployment recorded for chain id ${chainId}. ` +
-        `DEPLOYMENTS is populated manually as chains go live; see docs/deployment.md.`,
-      "chainId",
+    const error = new Error(
+      `Chain ${chainId} is not deployed. See docs/deployment.md for deployment procedure and supported chains.`
     );
+    error.name = "UndeployedChainError";
+    throw error;
   }
   return address;
+}
+
+/**
+ * Try to get the escrow address for a chain, returning undefined if not deployed.
+ *
+ * Use this when you need to distinguish "not deployed" from "configured but no address".
+ *
+ * @param chainId - The EVM chain ID
+ * @returns The escrow contract address, or undefined if not deployed
+ *
+ * @example
+ * ```ts
+ * const escrowAddr = tryGetEscrowAddress(8453);
+ * if (!escrowAddr) {
+ *   console.log("Chain not deployed yet");
+ * }
+ * ```
+ */
+export function tryGetEscrowAddress(chainId: number): Address | undefined {
+  return DEPLOYMENTS[chainId];
 }

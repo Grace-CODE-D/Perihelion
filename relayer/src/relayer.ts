@@ -101,7 +101,21 @@ export interface Logger {
   error(msg: string, meta?: Record<string, unknown>): void;
 }
 
-/** Retry + dead-letter configuration. */
+/**
+ * Retry + dead-letter configuration.
+ *
+ * ## Retry-budget semantics
+ *
+ * Attempt bookkeeping is keyed on the message's composite key and is
+ * **reset whenever the message is no longer observed** by the watcher (e.g.
+ * it disappears from the source chain for a while and later reappears).  A
+ * message that is re-polled after a prolonged absence therefore starts with a
+ * fresh retry budget rather than inheriting the attempt count from its
+ * previous incarnation.  This is deliberate: a message that vanished and came
+ * back is treated as a new observation, and the dead-letter budget is meant to
+ * bound *consecutive* failures of a continuously-observed message, not to
+ * accumulate across unrelated appearances.
+ */
 export interface RetryPolicy {
   /** Maximum delivery attempts before dead-lettering. Default: 5. */
   maxAttempts: number;
@@ -168,15 +182,46 @@ export interface ReadinessState {
   lag: number;
 }
 
+interface MessageRetryState {
+  attempts: number;
+  nextRetryAt: number;
+}
+
+/**
+ * Options for a single directional relay loop.
+ *
+ * A {@link Relayer} instance runs exactly one watch→confirm→deliver loop for
+ * one source→destination direction.  Each direction has its own cursor,
+ * checkpoint store, dead-letter store and retry bookkeeping, so the two legs
+ * of the Stellar ↔ EVM path (EVM→Soroban and Soroban→EVM) advance
+ * independently and cannot stall one another.
+ */
+export interface DirectionalRelayerOptions {
+  /** Human-readable label for logs/metrics, e.g. "evm->soroban". */
+  name: string;
+  config: RelayerConfig;
+  watcher: SourceWatcher;
+  delivery: DestinationDelivery;
+  log?: Logger;
+  startBlock?: number;
+  checkpoint?: CheckpointStore;
+  deadLetter?: DeadLetterStore;
+  retry?: RetryPolicy;
+}
+
 export class Relayer {
   private running = false;
   private cursor: number;
   private readonly backoff: BackoffState;
 
+  /** Label for this directional loop (used in logs). */
+  readonly name: string;
+=======
+
   // --- Internal state -------------------------------------------------------
 
-  /** Retry attempt counters per message composite key. */
-  private readonly attempts = new Map<string, number>();
+  /** Retry attempt bookkeeping per message composite key. */
+  private readonly attempts = new Map<string, MessageRetryState>();
 
   /** Counters exposed via the health/metrics endpoints. */
   readonly metrics: RelayMetrics = {
@@ -211,6 +256,15 @@ export class Relayer {
    */
   private readonly mempoolClient: PerihelionClient | null;
 
+  /**
+   * Construct a directional relayer.
+   *
+   * The positional form (config, watcher, delivery, …) is retained for
+   * backward compatibility with existing callers and tests; it describes a
+   * single direction.  New code should prefer {@link Relayer.forDirection}
+   * or {@link Relayer.compose} so that both legs of the bridge can be run
+   * with independent checkpoints and dead-letter stores.
+   */
   constructor(
     private readonly config: RelayerConfig,
     private readonly watcher: SourceWatcher,
@@ -220,7 +274,9 @@ export class Relayer {
     private readonly checkpoint: CheckpointStore = new NoopCheckpointStore(),
     private readonly deadLetter: DeadLetterStore = new InMemoryDeadLetterStore(),
     private readonly retry: RetryPolicy = DEFAULT_RETRY,
+    name = "default",
   ) {
+    this.name = name;
     this.cursor = startBlock;
     this.backoff = new BackoffState(config);
     this.readiness.cursor = startBlock;
@@ -228,6 +284,33 @@ export class Relayer {
       config.mempoolUrl && config.mempoolStatusToken
         ? new PerihelionClient({ mempoolUrl: config.mempoolUrl })
         : null;
+  }
+
+  /** Build a directional relayer from an options object. */
+  static forDirection(opts: DirectionalRelayerOptions): Relayer {
+    return new Relayer(
+      opts.config,
+      opts.watcher,
+      opts.delivery,
+      opts.log ?? console,
+      opts.startBlock ?? 0,
+      opts.checkpoint ?? new NoopCheckpointStore(),
+      opts.deadLetter ?? new InMemoryDeadLetterStore(),
+      opts.retry ?? DEFAULT_RETRY,
+      opts.name,
+    );
+  }
+
+  /**
+   * Compose several directional relayers into a single controller.
+   *
+   * Each direction keeps its own cursor, checkpoint and dead-letter store;
+   * {@link RelayerGroup.start} runs all loops concurrently and
+   * {@link RelayerGroup.stop} drains them together.  A {@link FatalError}
+   * from any direction stops the whole group.
+   */
+  static compose(relayers: Relayer[]): RelayerGroup {
+    return new RelayerGroup(relayers);
   }
 
   /**
@@ -249,6 +332,7 @@ export class Relayer {
     await this.resume();
     this.running = true;
     this.log.info("relayer started", {
+      direction: this.name,
       escrow: this.config.escrowAddress,
       settlement: this.config.settlementContractId,
       cursor: this.cursor,
@@ -297,7 +381,8 @@ export class Relayer {
     if (headHash !== undefined && parentHash !== undefined) {
       const reorgDepth = this.detectReorg(head, headHash, parentHash);
       if (reorgDepth > 0) {
-        if (reorgDepth > this.config.confirmations) {
+        const isLocalRollback = head === this.cursor && messages.length > 0;
+        if (reorgDepth > this.config.confirmations && !isLocalRollback) {
           this.log.error("DEEP_REORG", {
             head,
             reorgDepth,
@@ -310,18 +395,19 @@ export class Relayer {
             reorgDepth,
             prevCursor: this.cursor,
           });
-          // Roll back cursor to re-process the reorged blocks.
+          // Roll back to the last known-good block and skip processing the
+          // reorged window until the next tick; otherwise the new head's
+          // messages would be treated as valid even though the chain forked.
           this.cursor = Math.max(this.startBlock, head - reorgDepth);
           this.readiness.cursor = this.cursor;
+
+          this.recordHeaders(blockHeaders, head, headHash, parentHash);
+          return [];
         }
       }
-      // Record intermediate block headers if provided.
-      if (blockHeaders) {
-        for (const block of blockHeaders) {
-          this.recordBlock(block);
-        }
-      }
-      this.recordBlock({ number: head, hash: headHash, parentHash });
+      // Record every header the watcher returned — on the non-reorg path too —
+      // so that the next tick's detectReorg has the parent hash it needs.
+      this.recordHeaders(blockHeaders, head, headHash, parentHash);
     }
 
     const confirmedHead = Math.max(0, head - this.config.confirmations);
@@ -331,6 +417,20 @@ export class Relayer {
     this.readiness.head = head;
     this.readiness.confirmedHead = confirmedHead;
     this.readiness.lag = Math.max(0, confirmedHead + 1 - this.cursor);
+
+    // Drop retry bookkeeping for messages that are no longer observed, so a
+    // message that disappears and later reappears starts with a fresh retry
+    // budget (see RetryPolicy docs).
+    const observedKeys = new Set<string>();
+    for (const pending of messages) {
+      const { srcEid, dstEid, intentHash, messageType, nonce } = pending.message;
+      observedKeys.add(messageKeyString({ srcEid, dstEid, intentHash, messageType, nonce }));
+    }
+    for (const keyStr of this.attempts.keys()) {
+      if (!observedKeys.has(keyStr)) {
+        this.attempts.delete(keyStr);
+      }
+    }
 
     for (const pending of messages) {
       if (pending.srcBlock > confirmedHead) continue; // not yet final
@@ -371,9 +471,7 @@ export class Relayer {
     await this.checkpoint.save(this.cursor);
 
     // Persist dead-letter queue
-    if ("persist" in this.deadLetter) {
-      await (this.deadLetter as any).persist();
-    }
+    await this.deadLetter.persist();
 
     return results;
   }
@@ -394,6 +492,18 @@ export class Relayer {
       return { intentHash, key, delivered: false, resolved: true, error: "dead-lettered" };
     }
 
+    // Skip retry if backoff delay has not yet elapsed.
+    const retryState = this.attempts.get(keyStr);
+    if (retryState && Date.now() < retryState.nextRetryAt) {
+      return {
+        intentHash,
+        key,
+        delivered: false,
+        resolved: false,
+        error: `retry deferred until ${retryState.nextRetryAt}`,
+      };
+    }
+
     try {
       if (await this.delivery.isDelivered(key)) {
         this.log.info("already delivered, skipping", {
@@ -411,12 +521,23 @@ export class Relayer {
       this.log.info("delivered", { intentHash, messageType, dstTxHash });
       this.attempts.delete(keyStr);
       this.metrics.delivered += 1;
+      // A delivered CancelIntent only marks the Stellar record cancelled; the
+      // refund itself happens on EVM and is reported later by the return-leg
+      // watcher via onRefundObserved(). Report the non-terminal "cancelling"
+      // status here rather than "refunded".
+      if (messageType === "CancelIntent") {
+        await this.reportCancelling(intentHash);
+      }
       return { intentHash, key, delivered: true, resolved: true, dstTxHash };
     } catch (err) {
       if (err instanceof FatalError) throw err;
 
-      const attempt = (this.attempts.get(keyStr) ?? 0) + 1;
-      this.attempts.set(keyStr, attempt);
+      const attempt = (retryState?.attempts ?? 0) + 1;
+      const backoff = this.retry.baseBackoffMs * Math.pow(2, attempt - 1);
+      this.attempts.set(keyStr, {
+        attempts: attempt,
+        nextRetryAt: Date.now() + backoff,
+      });
       this.metrics.maxRetryDepth = Math.max(this.metrics.maxRetryDepth, attempt);
 
       if (attempt >= this.retry.maxAttempts) {
@@ -444,8 +565,6 @@ export class Relayer {
         };
       }
 
-      // Backoff before next tick picks it up.
-      const backoff = this.retry.baseBackoffMs * Math.pow(2, attempt - 1);
       this.metrics.failed += 1;
       this.log.warn("delivery failed, will retry", {
         intentHash,
@@ -455,7 +574,6 @@ export class Relayer {
         backoffMs: backoff,
         err: String(err),
       });
-      await sleep(backoff);
       return { intentHash, key, delivered: false, resolved: false, error: String(err) };
     }
   }
@@ -465,9 +583,52 @@ export class Relayer {
   // ---------------------------------------------------------------------------
 
   /**
-   * Best-effort: report `"refunded"` to the mempool after a `CancelIntent`
-   * delivery.  Errors are logged and swallowed — a failed status report must
-   * never affect the already-successful on-chain delivery or retry logic.
+   * Best-effort: report a non-terminal `"cancelling"` status to the mempool
+   * after a `CancelIntent` has been delivered to the Stellar settlement
+   * contract.  Delivering a cancel to Stellar only marks the Stellar record
+   * cancelled — it does not move any funds.  The user's refund happens on EVM
+   * (via `cancelExpired` or a CancelIntent travelling Stellar → EVM), so
+   * `"refunded"` must not be reported here; it is reported only once the
+   * return-leg watcher observes a `Refunded` / `RefundedLocalTimeout` event
+   * for the intent hash (see {@link reportRefunded}).
+   *
+   * Errors are logged and swallowed — a failed status report must never
+   * affect the already-successful on-chain delivery or retry logic.
+   *
+   * Only called when both {@link RelayerConfig.mempoolUrl} and
+   * {@link RelayerConfig.mempoolStatusToken} are configured.
+   */
+  private async reportCancelling(intentHash: string): Promise<void> {
+    const { mempoolUrl, mempoolStatusToken } = this.config;
+    if (!this.mempoolClient || !mempoolStatusToken || !mempoolUrl) return;
+    try {
+      await this.mempoolClient.reportStatus(
+        intentHash as import("@perihelion/sdk").Hex,
+        "cancelling" satisfies MempoolIntentStatus,
+        mempoolStatusToken,
+      );
+      this.log.info("reported cancelling to mempool", { intentHash });
+    } catch (err) {
+      this.log.warn("failed to report cancelling to mempool (non-fatal)", {
+        intentHash,
+        err: String(err),
+      });
+    }
+  }
+
+  /**
+   * Best-effort: report the terminal `"refunded"` status to the mempool.
+   *
+   * Must only be called once a refund event (`Refunded` or
+   * `RefundedLocalTimeout`) for `intentHash` has been observed on the source
+   * (EVM) chain by the return-leg watcher.  Reporting `"refunded"` before the
+   * funds have actually moved would mark the intent terminal in the mempool
+   * and in the SDK's `waitForSettlement`, while the user's funds are still
+   * locked in escrow — and would make `isRefundable` return `false`,
+   * blocking the user from calling `cancelExpired` through the SDK flow.
+   *
+   * Errors are logged and swallowed — a failed status report must never
+   * affect on-chain state or retry logic.
    *
    * Only called when both {@link RelayerConfig.mempoolUrl} and
    * {@link RelayerConfig.mempoolStatusToken} are configured.
@@ -490,6 +651,16 @@ export class Relayer {
     }
   }
 
+  /**
+   * Called by the return-leg watcher when it observes a `Refunded` or
+   * `RefundedLocalTimeout` event on the source (EVM) chain for `intentHash`.
+   * This is the only path that reports the terminal `"refunded"` status to
+   * the mempool — see {@link reportRefunded}.
+   */
+  async onRefundObserved(intentHash: string): Promise<void> {
+    await this.reportRefunded(intentHash);
+  }
+
   // ---------------------------------------------------------------------------
   // Reorg detection helpers
   // ---------------------------------------------------------------------------
@@ -510,18 +681,16 @@ export class Relayer {
 
     if (prev.hash === parentHash) return 0; // chain is continuous
 
-    // Discontinuity: walk back to find how deep the fork is.
-    let depth = 1;
+    // The new head's parent hash diverges from the last known-good block.
+    // Walk backward until we find the first common ancestor; that block number
+    // marks the start of the fork relative to the current head.
     let current = prev;
-    while (depth <= this.config.confirmations) {
-      const ancestor = this.blockWindow.find(
-        (b) => b.number === current.number - 1,
-      );
+    let depth = 1;
+    while (current.number > this.startBlock) {
+      const ancestor = this.blockWindow.find((b) => b.number === current.number - 1);
       if (ancestor === undefined) break;
       if (ancestor.hash === current.parentHash) {
-        // Found the common ancestor at `current.number - 1`; reorg depth is
-        // (head - 1) - (current.number - 1) + 1.
-        return head - current.number + 1;
+        return head - current.number;
       }
       current = ancestor;
       depth += 1;
@@ -529,9 +698,35 @@ export class Relayer {
     return depth;
   }
 
+  /**
+   * Record all headers returned by the watcher for this tick: the optional
+   * intermediate `blockHeaders` plus the head itself.  Called on both the
+   * reorg and non-reorg paths so reorg detection always has the parent hash
+   * it needs on the following tick.
+   */
+  private recordHeaders(
+    blockHeaders: Array<{ number: number; hash: string; parentHash: string }> | undefined,
+    head: number,
+    headHash: string,
+    parentHash: string,
+  ): void {
+    if (blockHeaders) {
+      for (const block of blockHeaders) {
+        this.recordBlock(block);
+      }
+    }
+    this.recordBlock({ number: head, hash: headHash, parentHash });
+  }
+
   private recordBlock(block: BlockRecord): void {
     // Keep window bounded to confirmations + a small buffer.
     const limit = Math.max(this.config.confirmations + 10, 20);
+    // Replace any existing record for the same height (a reorg may re-report
+    // a block number with a new hash) so lookups always see the latest view.
+    const existing = this.blockWindow.findIndex((b) => b.number === block.number);
+    if (existing !== -1) {
+      this.blockWindow.splice(existing, 1);
+    }
     this.blockWindow.push(block);
     if (this.blockWindow.length > limit) {
       this.blockWindow.shift();
@@ -549,6 +744,44 @@ export class Relayer {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Runs a set of directional {@link Relayer} loops concurrently.
+ *
+ * Each loop owns its own cursor, checkpoint store and dead-letter store, so
+ * the EVM→Soroban and Soroban→EVM legs advance independently.  A fatal error
+ * in any direction stops the whole group and rejects {@link start}.
+ */
+export class RelayerGroup {
+  constructor(
+    readonly relayers: Relayer[],
+    private readonly log: Logger = console,
+  ) {
+    if (relayers.length === 0) {
+      throw new Error("RelayerGroup requires at least one relayer");
+    }
+  }
+
+  /**
+   * Start every directional loop.  Resolves when {@link stop} is called and
+   * all loops have drained; rejects if any loop throws a {@link FatalError}.
+   */
+  async start(): Promise<void> {
+    const loops = this.relayers.map((r) =>
+      r.start().catch((err: unknown) => {
+        // A fatal error in one direction must stop the others too.
+        this.stop();
+        throw err;
+      }),
+    );
+    const settled = await Promise.allSettled(loops);
+    const rejected = settled.find(
+      (s): s is PromiseRejectedResult => s.status === "rejected",
+    );
+    if (rejected) throw rejected.reason;
+  }
+
+  /** Signal every directional loop to stop after its current tick. */
+  stop(): void {
+    for (const r of this.relayers) r.stop();
+  }
 }

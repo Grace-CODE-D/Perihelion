@@ -2,8 +2,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { privateKeyToAccount } from "viem/accounts";
 import { loadConfig } from "../src/config.js";
-import { loadExecutorConfig } from "../src/executor-config.js";
+import { hasExecutorConfig, loadExecutorConfig } from "../src/executor-config.js";
 
 const VALID_SOLVER = "0x1111111111111111111111111111111111111111";
 const VALID_ESCROW = "0x2222222222222222222222222222222222222222";
@@ -135,8 +136,19 @@ function baseExecutorEnv() {
     PERIHELION_ESCROW_ADDRESS: VALID_ESCROW,
     PERIHELION_SETTLEMENT_CONTRACT_ID: "0".repeat(64),
     PERIHELION_SOURCE_CHAIN_ID: "8453",
+    STELLAR_NETWORK: "testnet",
   };
 }
+
+test("hasExecutorConfig returns false when no executor secrets or endpoints are configured", () => {
+  assert.equal(hasExecutorConfig({}), false);
+  assert.equal(hasExecutorConfig({ PERIHELION_SOLVER_ADDRESS: VALID_SOLVER }), false);
+});
+
+test("hasExecutorConfig returns true when executor settings are present", () => {
+  assert.equal(hasExecutorConfig({ PERIHELION_EVM_PRIVATE_KEY: `0x${"1".repeat(64)}` }), true);
+  assert.equal(hasExecutorConfig(baseExecutorEnv()), true);
+});
 
 test("loadExecutorConfig throws a single consolidated error when required vars are missing", () => {
   assert.throws(
@@ -157,6 +169,53 @@ test("loadExecutorConfig rejects a non-positive source chain id", () => {
   assert.throws(
     () => loadExecutorConfig({ ...baseExecutorEnv(), PERIHELION_SOURCE_CHAIN_ID: "-1" }),
     /PERIHELION_SOURCE_CHAIN_ID must be a positive integer/,
+  );
+});
+
+test("loadExecutorConfig requires PERIHELION_SOURCE_CHAIN_ID instead of defaulting", () => {
+  const { PERIHELION_SOURCE_CHAIN_ID: _omitted, ...env } = baseExecutorEnv();
+  assert.throws(
+    () => loadExecutorConfig(env),
+    /PERIHELION_SOURCE_CHAIN_ID is required/,
+  );
+});
+
+test("loadExecutorConfig accepts legacy variable names with a deprecation warning", () => {
+  const { PERIHELION_SOROBAN_RPC_URL: _rpc, PERIHELION_SETTLEMENT_CONTRACT_ID: _contract, ...env } =
+    baseExecutorEnv();
+  const warnings: string[] = [];
+  const config = loadExecutorConfig(
+    {
+      ...env,
+      PERIHELION_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+      PERIHELION_SETTLEMENT_CONTRACT: "0".repeat(64),
+    },
+    { warn: (message) => warnings.push(message) },
+  );
+  assert.equal(config.sorobanRpcUrl, "https://soroban-testnet.stellar.org");
+  assert.equal(config.settlementContractId, "0".repeat(64));
+  assert.ok(warnings.some((w) => w.includes("PERIHELION_STELLAR_RPC_URL")));
+  assert.ok(warnings.some((w) => w.includes("PERIHELION_SETTLEMENT_CONTRACT")));
+});
+
+test("loadExecutorConfig rejects a PERIHELION_SOLVER_ADDRESS that differs from the key-derived address", () => {
+  assert.throws(
+    () => loadExecutorConfig({ ...baseExecutorEnv(), PERIHELION_SOLVER_ADDRESS: VALID_SOLVER }),
+    /PERIHELION_SOLVER_ADDRESS does not match the address derived from PERIHELION_EVM_PRIVATE_KEY/,
+  );
+});
+
+test("loadExecutorConfig accepts a PERIHELION_SOLVER_ADDRESS that matches the key-derived address", () => {
+  const derived = privateKeyToAccount(`0x${"1".repeat(64)}`).address;
+  const config = loadExecutorConfig({ ...baseExecutorEnv(), PERIHELION_SOLVER_ADDRESS: derived });
+  assert.equal(config.solverAddress.toLowerCase(), derived.toLowerCase());
+});
+
+test("loadExecutorConfig rejects a missing STELLAR_NETWORK", () => {
+  const { STELLAR_NETWORK: _omitted, ...env } = baseExecutorEnv();
+  assert.throws(
+    () => loadExecutorConfig(env),
+    /STELLAR_NETWORK is required/,
   );
 });
 

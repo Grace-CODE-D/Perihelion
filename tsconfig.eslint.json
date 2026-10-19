@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": [
+    "sdk/src/**/*",
+    "sdk/test/**/*",
+    "relayer/src/**/*",
+    "relayer/test/**/*",
+    "solver/src/**/*",
+    "solver/test/**/*",
+    "mempool/src/**/*",
+    "mempool/test/**/*",
+    "test/**/*",
+    "scripts/**/*",
+    "docker/**/*"
+  ]
+}

@@ -23,7 +23,7 @@ import type {
   Hex,
   Intent,
   IntentRecord,
-  IntentStatus,
+  MempoolIntentStatus,
   SignedIntent,
 } from "./types.js";
 
@@ -74,7 +74,9 @@ export interface ListPendingPageResult {
  *   (network connection errors and 5xx HTTP responses) up to `maxRetries` times with exponential backoff.
  *   Timeouts and caller-initiated aborts are never retried.
  * - **Polling ({@link waitForSettlement})**: Repeatedly calls {@link getIntent} until a terminal status
- *   (`settled`, `refunded`, `expired`) is reached or `timeoutMs` elapses.
+ *   (`settled`, `refunded`, `expired`) is reached or `timeoutMs` elapses. The intermediate
+ *   `filled` status (delivered on the destination chain, awaiting source-chain release) is
+ *   **not** terminal, so polling continues through it.
  */
 export class PerihelionClient {
   private readonly base: string;
@@ -217,7 +219,7 @@ export class PerihelionClient {
    * @throws {@link PerihelionTimeoutError} if the request exceeds `requestTimeoutMs`.
    * @throws {@link PerihelionNetworkError} on network / transport failure.
    */
-  async reportStatus(hash: Hex, status: IntentStatus, statusToken: string): Promise<void> {
+  async reportStatus(hash: Hex, status: MempoolIntentStatus, statusToken: string): Promise<void> {
     let res: Response;
     try {
       res = await this.fetchWithTimeout(`${this.base}/intents/${hash}/status`, {
@@ -289,7 +291,7 @@ export class PerihelionClient {
    * @throws {@link PerihelionNetworkError} on non-retryable network failure.
    */
   async listPendingPage(
-    status: IntentStatus = "pending",
+    status: MempoolIntentStatus = "pending",
     cursor?: string,
     limit?: number,
   ): Promise<ListPendingPageResult> {
@@ -326,7 +328,7 @@ export class PerihelionClient {
    * **Retry policy**: Each page request retries transient failures up to `maxRetries` times.
    */
   async *listPendingPages(
-    status: IntentStatus = "pending",
+    status: MempoolIntentStatus = "pending",
     limit?: number,
   ): AsyncGenerator<IntentRecord[], void, unknown> {
     let cursor: string | undefined;
@@ -359,7 +361,7 @@ export class PerihelionClient {
    * server's own default, so page size stays bounded end-to-end (issue #532).
    */
   async listPending(
-    status: IntentStatus = "pending",
+    status: MempoolIntentStatus = "pending",
     maxPages = 100,
     limit: number = DEFAULT_LIST_LIMIT,
   ): Promise<IntentRecord[]> {
@@ -380,6 +382,12 @@ export class PerihelionClient {
   /**
    * Poll until the intent reaches a terminal state (`settled`, `refunded`, or
    * `expired`) or the timeout elapses.
+   *
+   * The intermediate `filled` status is **not** terminal: it means the intent
+   * has been delivered on the destination chain but the source chain has not
+   * yet released the escrowed funds. Polling continues through `filled` until
+   * the record becomes `settled` (source-chain `Released` observed) or another
+   * terminal state is reached.
    *
    * **Retry policy**: Repeatedly polls {@link getIntent} at configured `intervalMs`.
    * Each poll attempt inherits `getIntent`'s retry policy for transient errors,
@@ -455,11 +463,13 @@ export class PerihelionClient {
    * 1. It exists and has not been settled or previously refunded.
    * 2. Its deadline has passed **and** the confirmation grace period has elapsed.
    * 3. No `FillConfirmed` was received — the status is still `'pending'`.
-   *    An intent with status `'claimed'`, `'settling'`, or `'expired'` is **not**
-   *    refundable: `settling` means a cross-chain message is already in flight
-   *    (calling `cancelExpired` would race it and likely revert with
-   *    `AlreadyFinalized`), and `claimed` / `expired` indicate the on-chain
-   *    state has already diverged from the refund path.
+   *    An intent with status `'claimed'`, `'settling'`, `'filled'`, or
+   *    `'expired'` is **not** refundable: `settling` means a cross-chain message
+   *    is already in flight (calling `cancelExpired` would race it and likely
+   *    revert with `AlreadyFinalized`), `filled` means the intent was delivered
+   *    on the destination chain and is awaiting source-chain release (the
+   *    refund path no longer applies), and `claimed` / `expired` indicate the
+   *    on-chain state has already diverged from the refund path.
    *
    * This helper detects when a bridge has definitively failed and the user's
    * funds can be recovered locally without waiting for cross-chain confirmation.
@@ -482,20 +492,34 @@ export class PerihelionClient {
    *   the value is timelock-governed and can change after deployment.
    *   There is deliberately no default; passing a stale constant will produce
    *   an incorrect verdict.
+   * @param now Current time in unix seconds. Defaults to the local clock, but
+   *   pass chain time here when available to avoid client-clock disagreements
+   *   with the on-chain `block.timestamp` check that `cancelExpired` performs.
+   * @param clockSkew Seconds to bias toward "not yet refundable" near the
+   *   boundary, mirroring {@link isExpired}'s `clockSkew` parameter. Useful
+   *   when `now` comes from a client clock that may run fast.
+   *   Default: `0`.
    * @returns `true` if the intent can be refunded via `cancelExpired`.
    *
    * @see {PerihelionEscrowClient.confirmationGrace} to read the live grace period.
    */
-  isRefundable(record: IntentRecord, confirmationGraceMs: number): boolean {
+  isRefundable(
+    record: IntentRecord,
+    confirmationGraceMs: number,
+    now: number = Math.floor(Date.now() / 1_000),
+    clockSkew = 0,
+  ): boolean {
     // Condition 3: only 'pending' intents are candidates — no settlement is
-    // in progress or has already completed.
+    // in progress or has already completed. This also excludes 'settling',
+    // which has a cross-chain message in flight, and 'filled', which has been
+    // delivered on the destination chain and is awaiting source-chain release;
+    // neither must be treated as refundable purely on elapsed time.
     if (record.status !== "pending") {
       return false;
     }
     // Conditions 1 & 2: deadline + grace must have passed (unix seconds).
-    const now = Math.floor(Date.now() / 1_000);
     const deadlineWithGrace = record.intent.deadline + Math.floor(confirmationGraceMs / 1_000);
-    return now >= deadlineWithGrace;
+    return now - clockSkew >= deadlineWithGrace;
   }
 
   // ─── private helpers ───────────────────────────────────────────────────────

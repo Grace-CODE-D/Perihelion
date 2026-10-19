@@ -3,24 +3,46 @@ name: Soroban
 on:
   push:
     branches: [main]
-    paths: ["contracts/soroban/**", ".github/workflows/soroban.yml", "scripts/check-spdx-headers.sh"]
   pull_request:
     branches: [main]
-    paths: ["contracts/soroban/**", ".github/workflows/soroban.yml", "scripts/check-spdx-headers.sh"]
 
 concurrency:
   group: soroban-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default; jobs only check out, build, and test.
+permissions:
+  contents: read
+
 jobs:
+  changes:
+    name: Detect Soroban changes
+    runs-on: ubuntu-latest
+    outputs:
+      soroban: ${{ steps.filter.outputs.soroban }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3.0.2
+        with:
+          filters: |
+            soroban:
+              - 'contracts/soroban/**'
+              - '.github/workflows/soroban.yml'
+              - 'scripts/check-spdx-headers.sh'
+
   soroban:
     name: Soroban (Rust)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.soroban == 'true'
     defaults:
       run:
         working-directory: contracts/soroban
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Check SPDX license headers
         working-directory: .
@@ -32,7 +54,7 @@ jobs:
         working-directory: .
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # master (pinned)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: wasm32-unknown-unknown
@@ -42,13 +64,20 @@ jobs:
         run: ../../scripts/check-toolchain.sh rust
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.2.3
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             contracts/soroban/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/soroban/**/Cargo.toml', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/soroban/**/Cargo.toml', 'contracts/soroban/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Fails a Cargo.lock update (e.g. from Dependabot) that pulls in a crate
+      # whose MSRV is newer than rust-toolchain.toml, with a clear step name.
+      - name: Cargo.lock builds on the pinned toolchain
+        run: cargo check --workspace --locked
 
       - name: Format check
         run: cargo fmt --all --check
@@ -82,7 +111,7 @@ jobs:
   # Required gate for branch protection on the Soroban workflow.
   # Passes when the soroban job succeeds or is skipped; fails if it fails/cancels.
   check:
-    name: Required check
+    name: Soroban / required
     runs-on: ubuntu-latest
     needs: [soroban]
     if: always()

@@ -26,6 +26,87 @@ versioned independently.
   mapping getter (previously every call reverted) and returns the full record,
   including the new `minDestAmount` field. Pause reverts now decode as
   `EnforcedPause`.
+- **Soroban settlement:** `lz_receive_bytes` accepts the raw LayerZero `message`
+  bytes, decodes them with the same codec the differential-fuzz harness
+  exercises, and dispatches through the same endpoint/peer checks, pause gate,
+  nonce guard and handlers as the typed `lz_receive`. The inbound decoders are now
+  `pub` and compiled into the release contract instead of being
+  `#[allow(dead_code)]` test-only helpers. `decode_fill_instruction` accepts only
+  the canonical 227-byte layout with a trailing `reservation_window`; the
+  219-byte layout shares protocol version `0x01` and is rejected as
+  `MalformedPayload` (#722, #903).
+
+### Changed
+
+- **Breaking (Soroban events):** every settlement-contract event topic is now
+  the event's full documented name — e.g. `admin_transfer_started` (was
+  `adm_start`), `confirmation_sent` (was `confirmed`), `cancelled_inbound`
+  (was `canl_in`). Indexers must subscribe to the names in
+  [docs/EVENT-SHAPES.md](./docs/EVENT-SHAPES.md) (#679).
+- **Breaking (Soroban):** `get_rolling_window_reset_earliest_at` is renamed
+  `get_rolling_window_reset_at`; Soroban caps contract function names at 32
+  characters (#678).
+- `@perihelion/relayer` and `@perihelion/solver`: the runnable node moved from
+  `index.ts` to `cli.ts`. Importing either package no longer starts a node,
+  binds a port or calls `process.exit`; the `bin` entries, `npm start` and the
+  Docker image now run `dist/cli.js`, and `sideEffects` lists only the CLI
+  (#579).
+
+### Fixed
+
+- The local Stellar quickstart service in `docker-compose.yml` uses the standalone
+  network passphrase that `--local` creates, points the relayer and solver at the
+  `/rpc` Soroban endpoint, and probes `getHealth` with `curl` instead of `node`,
+  which the quickstart image does not ship (#894).
+- The mempool service in `docker-compose.yml` uses the image's `/healthz` healthcheck
+  instead of an override that reported a 404 from `/health` as healthy. The relayer
+  and solver wait for `service_healthy` (#895).
+- The local stack in `docker-compose.yml` uses placeholder LayerZero endpoint ids
+  (31337 for the EVM side, 99161 for Stellar) instead of the Ethereum mainnet and
+  Sepolia ids 30101 and 40161 (#896).
+- The local stack in `docker-compose.yml` no longer defaults the escrow address to
+  Anvil's first account, which is an EOA, or the settlement contract id to a contract
+  that is never deployed. Both are required, so `docker compose up` fails fast when
+  they are unset (#897).
+- The differential-fuzz workflow runs again (#816, #823, #824, #825). It now
+  installs Foundry `stable` (the pinned nightly had been pruned and returned
+  HTTP 404), reads the Soroban SDK major version correctly (the greedy `sed`
+  always yielded an empty string), and takes its Rust toolchain from
+  `rust-toolchain.toml`. `contracts/soroban/Cargo.lock` pins `serde_with` 3.17
+  and `darling` 0.21, the newest releases that build on the pinned Rust 1.85
+  (3.21 / 0.23 need 1.88). The EVM test suite compiles again: the
+  `WireFormat.t.sol` tests truncated by #706 are restored with the 227-byte
+  FillInstruction vector lengths, and `Fork.t.sol`, `PerihelionTimelock.t.sol`,
+  `PerihelionEscrow.t.sol` and `Fuzz.t.sol` no longer use an invalid hex
+  literal, non-ASCII string literals or 7-field `locks()` destructures for the
+  8-field `Lock` struct.
+- The Soroban settlement contract's inbound-nonce storage no longer grows
+  without bound: a per-eid low-water mark (`InboundNonceFloor`) plus the new
+  permissionless `prune_nonce_words(eid)` entrypoint reclaims the rent of
+  fully-consumed nonce-bitmap words, emitting `nonce_words_pruned`. Nonces
+  below the floor are rejected without a bitmap lookup, so pruning cannot
+  re-open a replay (#718).
+- The Soroban settlement crate compiles again: over-long `symbol_short!`
+  event topics and test-only compile errors that had been hidden behind the
+  `messages.rs` parse error are fixed (#678, #679).
+- The Soroban settlement crate builds again: `MIN_MAX_TTL` and
+  `MAX_TTL_CEILING`, the `set_max_ttl` bounds documented by #719, are declared
+  again after being lost in a merge (#852). The test suite compiles against the
+  three-argument `propose_peer(eid, peer, &delay)`; tests that only need a
+  configured peer now share one `register_peer` helper (#853).
+- The differential-fuzz workflow runs again: Foundry is installed from
+  `stable` instead of a pruned nightly pin that returned HTTP 404, and the
+  Soroban SDK/CLI major-version check no longer reads an empty SDK major
+  (#835, #826).
+
+### Changed
+
+- **Breaking (Soroban settlement ABI)**: renamed the contract accessor
+  `get_rolling_window_reset_earliest_at` to `get_rolling_window_reset_at`.
+  The old name was 36 characters, over Soroban's 32-character limit for
+  exported function names, so the contract did not compile. Deployment
+  tooling and monitoring that read the rolling-window reset time must call
+  the new name (#680).
 
 ## [0.1.0] - 2026-07-28
 
@@ -150,4 +231,4 @@ the merge history preserved one.
   above before merge, not just after.
 
 [Unreleased]: https://github.com/Perihelion-Protocol/Perihelion/compare/main...HEAD
-[0.1.0]: https://github.com/Perihelion-Protocol/Perihelion/releases/tag/v0.1.0
+[0.1.0]: https://github.com/Perihelion-Protocol/Perihelion/commits/main

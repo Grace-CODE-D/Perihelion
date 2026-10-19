@@ -23,6 +23,13 @@ The Perihelion contract uses a two-tier TTL strategy to ensure terminal state re
   - `DataKey::ConfirmationSent(intent_hash)` - written when FillConfirmed is dispatched
 - **TTL**: `MAX_TTL` (3,110,400 ledgers ≈ 180 days)
 - **Contains**: Just a boolean flag indicating terminal state
+- **Ceiling**: the admin-configured `MaxTtl` (`set_max_ttl`, default `MAX_TTL`), used for every persistent extension, including `ttl_for_deadline` (issue #911)
+
+### Instance Entry (issue #912)
+- **Storage**: the instance holds admin, endpoint, peers, pause flags, caps and nonce floors
+- **Policy**: when remaining TTL falls below `INSTANCE_TTL_THRESHOLD` (17,280 ledgers ≈ 1 day), extend to `INSTANCE_TTL_EXTEND` (1,209,600 ledgers ≈ 70 days)
+- **Bumped by**: every state-changing entrypoint (inbound registration and cancellation, dispatch, cancel, prune, and all admin setters), not only the fill path
+- **Why**: if the instance is archived, every entrypoint fails, including the cancel and dispatch exit paths that remain available while paused
 
 ### Retention Asymmetry (Issue #29)
 
@@ -172,12 +179,29 @@ cargo test ttl_archival
    - These have MAX_TTL and are extended on every message
    - Archival would reset replay protection (security risk)
 5. **Use `status()` for terminal state**: Never rely on `get_intent() == None` alone
+6. **Reclaim nonce-word rent (issue #718)**: call `prune_nonce_words(eid)` periodically
+   - **Permissionless**: anyone may pay the invocation fee to shrink the
+     contract's footprint; no keeper is on the critical path
+   - A word is deleted only when **all 64 nonces it covers have been
+     consumed**, so a partially-consumed word (in-flight stragglers) always
+     blocks the floor advance — pruning can never reject an unconsumed nonce
+   - Once a word is pruned, the floor (`InboundNonceFloor(eid)`) covers it:
+     every nonce below the floor is rejected by the floor comparison in
+     `accept_nonce` without any bitmap lookup, so deleting the word **cannot
+     re-open it to replay** — that is the safety argument
+   - Work per call is capped (`MAX_PRUNE_WORDS_PER_CALL` = 256 words ≈
+     16,384 nonces); schedule repeat calls to drain large backlogs
+   - Each advance emits `nonce_words_pruned(eid, old_floor, new_floor)`;
+     wire it into monitoring (see `docs/MONITORING.md`, Alert M4)
 
 ## Related Issues
 
 - **Issue #6**: Relayer-side restore-then-act for archived entries
 - **Issue #29**: Retention asymmetry between markers and records
 - **Issue #30**: TTL calculation overflow (fixed via u64 clamping before cast)
+- **Issue #718**: Unbounded growth of `InboundNonceWord` rent — fixed by the
+  per-eid low-water mark (`InboundNonceFloor`) plus permissionless
+  `prune_nonce_words`; see "Production Recommendations" above
 
 ## Technical Deep Dive
 

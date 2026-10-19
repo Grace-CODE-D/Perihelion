@@ -1,53 +1,57 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @notice Origin of an inbound LayerZero message (the subset Perihelion authenticates).
+/// @notice Official LayerZero V2 origin shape.
 struct Origin {
     uint32 srcEid;
     bytes32 sender;
     uint64 nonce;
 }
 
-/// @notice Parameters for an outbound LayerZero send. Minimal, swappable
-///         abstraction over the LayerZero V2 endpoint; a thin adapter maps this
-///         to the real `MessagingParams` once integrated.
+/// @notice Official LayerZero V2 MessagingParams shape.
 struct MessagingParams {
     uint32 dstEid;
     bytes32 receiver;
     bytes message;
-    uint256 nativeFee;
+    bytes options;
+    bool payInLzToken;
 }
 
-/// @notice Fee quote returned by the LayerZero endpoint.
+/// @notice Official LayerZero V2 fee quote shape.
 struct MessagingFee {
     uint256 nativeFee;
     uint256 lzTokenFee;
 }
 
-/// @notice The endpoint surface the escrow depends on to dispatch messages.
-interface ILayerZeroEndpoint {
-    /// @dev `refundAddress` receives excess native fee. Returns the message GUID.
-    function send(MessagingParams calldata params, address refundAddress)
+/// @notice Official LayerZero V2 send receipt shape.
+struct MessagingReceipt {
+    bytes32 guid;
+    uint64 nonce;
+    MessagingFee fee;
+}
+
+/// @notice Minimal official-equivalent LayerZero V2 endpoint surface used by Perihelion.
+interface ILayerZeroEndpointV2 {
+    function send(MessagingParams calldata _params, address _refundAddress)
         external
         payable
-        returns (bytes32 guid);
+        returns (MessagingReceipt memory receipt);
 
-    /// @dev Returns the native fee required for the given outbound message.
-    ///      Callers should pass this value (or more) as msg.value to {send};
-    ///      any excess is refunded to the `refundAddress` by the endpoint.
-    function quote(MessagingParams calldata params, address sender)
+    function quote(MessagingParams calldata _params, address _sender)
         external
         view
         returns (MessagingFee memory fee);
+
+    function setDelegate(address _delegate) external;
 }
 
-/// @notice The receive surface the endpoint invokes on the escrow (OApp).
+/// @notice OApp receiver callback required by LayerZero V2.
 interface ILayerZeroReceiver {
     function lzReceive(
-        Origin calldata origin,
-        bytes32 guid,
-        bytes calldata message,
-        address executor,
-        bytes calldata extraData
+        Origin calldata _origin,
+        bytes32 _guid,
+        bytes calldata _message,
+        address _executor,
+        bytes calldata _extraData
     ) external payable;
 }

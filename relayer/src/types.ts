@@ -7,6 +7,11 @@ import type { Hex } from "@perihelion/sdk";
 /** LayerZero endpoint identifiers for the chains Perihelion bridges. */
 export type EndpointId = number;
 
+/** Canonical Perihelion wire-message widths, shared with the Soroban/EVM codecs. */
+export const FILL_INSTRUCTION_LENGTH = 227;
+export const FILL_CONFIRMED_LENGTH = 90;
+export const CANCEL_INTENT_LENGTH = 35;
+
 /**
  * Discriminated message type carried in every bridge message.
  * Used as part of the composite dedup key so that distinct protocol messages
@@ -17,6 +22,21 @@ export type EndpointId = number;
  * - CancelIntent    — either direction: abort and allow a refund.
  */
 export type MessageType = "FillInstruction" | "FillConfirmed" | "CancelIntent";
+
+/**
+ * Reason code for a `CancelIntent` message, matching the wire format shared by
+ * the Soroban and EVM contracts.
+ *
+ * - `0` — EXPIRED: the intent's deadline passed without a fill.
+ * - `1` — ADMIN: an operator cancelled the intent.
+ * - `2` — INVALID: the intent failed validation.
+ */
+export type CancelReason = 0 | 1 | 2;
+
+/** Named aliases for the {@link CancelReason} codes. */
+export const CANCEL_REASON_EXPIRED: CancelReason = 0;
+export const CANCEL_REASON_ADMIN: CancelReason = 1;
+export const CANCEL_REASON_INVALID: CancelReason = 2;
 
 /**
  * A cross-chain message carrying proof that a solver locked source funds for an
@@ -41,6 +61,15 @@ export interface BridgeMessage {
   readonly amount: string;
   /** Monotonic per-source-endpoint nonce for ordering and replay protection. */
   readonly nonce: number;
+  /**
+   * User-signed intent deadline, in Unix seconds, carried in the FillInstruction.
+   * Decoded from the source `Locked` event and delivered verbatim so the
+   * destination contract can validate the fill window instead of treating the
+   * intent as already expired.
+   */
+  readonly deadline: bigint;
+  /** Exact LayerZero message bytes observed on the source chain. */
+  readonly rawPayload: Hex;
 }
 
 /** A {@link BridgeMessage} observed on-chain, awaiting relay to its destination. */

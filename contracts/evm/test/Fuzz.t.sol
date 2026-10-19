@@ -265,8 +265,8 @@ contract PerihelionEscrowFuzzTest is Test {
         bytes32 h2 = escrow.hashIntent(intent2);
         vm.assertEq(h1 != h2, true);
 
-        (,,, uint256 held1,,,) = escrow.locks(h1);
-        (,,, uint256 held2,,,) = escrow.locks(h2);
+        (,,, uint256 held1,,,,) = escrow.locks(h1);
+        (,,, uint256 held2,,,,) = escrow.locks(h2);
         assertEq(held1, amountA);
         assertEq(held2, amountB);
     }

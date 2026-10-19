@@ -2,11 +2,23 @@ name: Differential Fuzz
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
+    paths:
+      - 'contracts/soroban/**'
+      - 'contracts/evm/**'
+      - 'contracts/shared/wire-vectors/**'
+      - 'scripts/run-differential-fuzz.sh'
+      - '.github/workflows/differential-fuzz.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main]
+    paths:
+      - 'contracts/soroban/**'
+      - 'contracts/evm/**'
+      - 'contracts/shared/wire-vectors/**'
+      - 'scripts/run-differential-fuzz.sh'
+      - '.github/workflows/differential-fuzz.yml'
   schedule:
-    # Nightly extended run at 2 AM UTC
+    # Nightly extended run at 2 AM UTC (unfiltered; ignores the paths above)
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
@@ -19,7 +31,7 @@ on:
 # Cancel in-progress runs on the same branch/PR.
 env:
   # Keep in step with .github/workflows/evm.yml and CONTRIBUTING.md.
-  FOUNDRY_VERSION: nightly-f3f12cf3ccfae5c4db8ac622c165198125a83266
+  FOUNDRY_VERSION: v1.3.6
   # Soroban CLI and SDK versions must match major versions
   SOROBAN_CLI_VERSION: "22.0.0"
   FOUNDRY_PROFILE: ci
@@ -28,24 +40,36 @@ env:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-  
+
+# Least-privilege default; the report job below overrides this where needed.
+permissions:
+  contents: read
+
 jobs:
   differential-fuzz-evm:
     name: EVM Differential Fuzzing
     runs-on: ubuntu-latest
+    outputs:
+      # Lets the report job tell "does not build" apart from "codecs diverge".
+      compile-failed: ${{ steps.compile.outcome == 'failure' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09  # v1.6.0
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
       - name: Cache Foundry build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.2.3
         with:
           path: contracts/evm/out
           key: ${{ runner.os }}-forge-out-${{ hashFiles('contracts/evm/src/**/*.sol', 'contracts/evm/test/**/*.sol', 'contracts/evm/foundry.toml') }}
+
+      - name: Compile contracts and fuzz harness
+        id: compile
+        working-directory: contracts/evm
+        run: forge build
 
       - name: Run bounded differential fuzzing (100 cases)
         if: github.event_name != 'schedule' && !inputs.extended
@@ -61,7 +85,7 @@ jobs:
 
       - name: Upload fuzz failures
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: evm-fuzz-failures
           path: contracts/evm/test/**/*.failure.log
@@ -69,17 +93,30 @@ jobs:
   differential-fuzz-soroban:
     name: Soroban Differential Fuzzing
     runs-on: ubuntu-latest
+    outputs:
+      # Lets the report job tell "does not build" apart from "codecs diverge".
+      compile-failed: ${{ steps.compile.outcome == 'failure' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+
+      # rust-toolchain.toml overrides whatever is installed here once cargo runs
+      # inside the repo, so read the pin from it instead of hard-coding a second
+      # (drifting) copy. Mirrors .github/workflows/soroban.yml.
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # master (pinned)
         with:
-          toolchain: 1.81.0
+          toolchain: 1.85.0  # keep in step with rust-toolchain.toml
           targets: wasm32-unknown-unknown
 
+      - name: Verify toolchain in effect
+        run: ./scripts/check-toolchain.sh rust
+
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.2.3
         with:
           path: |
             ~/.cargo/bin/
@@ -90,20 +127,31 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Install Soroban CLI
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29  # v2
         with:
           tool: soroban-cli@${{ env.SOROBAN_CLI_VERSION }}
 
       - name: Verify CLI and SDK major versions match
         working-directory: contracts/soroban
         run: |
-          SDK_MAJOR=$(grep 'soroban-sdk = ' Cargo.toml | sed 's/.*"\([0-9]*\).*/\1/')
+          # Take the first number on the `soroban-sdk = ...` line; works for both
+          # `soroban-sdk = "22"` and `soroban-sdk = { version = "22.0.1", ... }`.
+          SDK_MAJOR=$(grep -E '^soroban-sdk[[:space:]]*=' Cargo.toml | grep -oE '[0-9]+' | head -n1)
           CLI_MAJOR=$(echo "${{ env.SOROBAN_CLI_VERSION }}" | cut -d. -f1)
+          if [ -z "$SDK_MAJOR" ]; then
+            echo "::error::Could not read the soroban-sdk version from contracts/soroban/Cargo.toml"
+            exit 1
+          fi
           if [ "$SDK_MAJOR" != "$CLI_MAJOR" ]; then
             echo "::error::Soroban SDK major ($SDK_MAJOR) and CLI major ($CLI_MAJOR) must match"
             exit 1
           fi
           echo "✓ SDK and CLI both use major version $SDK_MAJOR"
+
+      - name: Compile settlement crate and fuzz tests
+        id: compile
+        working-directory: contracts/soroban/settlement
+        run: cargo test fuzz --no-run
 
       - name: Run bounded differential fuzzing (100 cases)
         if: github.event_name != 'schedule' && !inputs.extended
@@ -117,15 +165,18 @@ jobs:
         run: |
           PROPTEST_CASES=10000 cargo test fuzz -- --test-threads=1 --nocapture
 
+      # Generated corpus lives under the (git-ignored) Cargo target dir so a
+      # plain `cargo test` never dirties the tracked fixture directory (#871).
       - name: Upload fuzz corpus
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: soroban-fuzz-corpus
-          path: contracts/shared/wire-vectors/fuzz-corpus/
+          path: contracts/soroban/target/fuzz-corpus/
+          if-no-files-found: error
 
       - name: Upload fuzz failures
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: soroban-fuzz-failures
           path: contracts/soroban/settlement/proptest-regressions/
@@ -135,21 +186,51 @@ jobs:
     needs: [differential-fuzz-soroban]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Download Soroban corpus
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: soroban-fuzz-corpus
-          path: contracts/shared/wire-vectors/fuzz-corpus/
+          path: contracts/soroban/target/fuzz-corpus/
+
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # master (pinned)
+        with:
+          toolchain: 1.85.0  # keep in step with rust-toolchain.toml
+
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.2.3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            contracts/soroban/target/
+          key: ${{ runner.os }}-cargo-cross-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+
+      # Runs the raw-bytes entrypoint itself, so the cross-validation job
+      # exercises the decoder on its live path and not only through unit-level
+      # calls (#722).
+      - name: Cross-validate the live raw-bytes inbound path
+        working-directory: contracts/soroban/settlement
+        run: cargo test lz_receive_bytes -- --test-threads=1 --nocapture
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09  # v1.6.0
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
       - name: Validate Rust-generated payloads with Solidity decoder
         working-directory: contracts/evm
+        env:
+          # Point CrossValidate.t.sol at the freshly generated corpus.
+          FUZZ_CORPUS_DIR: ${{ github.workspace }}/contracts/soroban/target/fuzz-corpus
         run: |
           # Run a custom test that reads corpus files and validates them
           forge test --match-test testCrossValidateCorpus -vv
@@ -163,45 +244,139 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Generate summary
         id: summary
+        env:
+          EVM_RESULT: ${{ needs.differential-fuzz-evm.result }}
+          SOROBAN_RESULT: ${{ needs.differential-fuzz-soroban.result }}
+          CROSS_RESULT: ${{ needs.cross-validate.result }}
+          EVM_COMPILE_FAILED: ${{ needs.differential-fuzz-evm.outputs.compile-failed }}
+          SOROBAN_COMPILE_FAILED: ${{ needs.differential-fuzz-soroban.outputs.compile-failed }}
         run: |
           echo "## Differential Fuzzing Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- EVM fuzzing: ${{ needs.differential-fuzz-evm.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Soroban fuzzing: ${{ needs.differential-fuzz-soroban.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Cross-validation: ${{ needs.cross-validate.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- EVM fuzzing: $EVM_RESULT" >> $GITHUB_STEP_SUMMARY
+          echo "- Soroban fuzzing: $SOROBAN_RESULT" >> $GITHUB_STEP_SUMMARY
+          echo "- Cross-validation: $CROSS_RESULT" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ needs.differential-fuzz-evm.result }}" == "failure" ]] || \
-             [[ "${{ needs.differential-fuzz-soroban.result }}" == "failure" ]] || \
-             [[ "${{ needs.cross-validate.result }}" == "failure" ]]; then
-            echo "❌ Differential fuzzing detected codec divergence!" >> $GITHUB_STEP_SUMMARY
-            echo "Review artifacts for failing test cases." >> $GITHUB_STEP_SUMMARY
-            echo "failed=true" >> "$GITHUB_OUTPUT"
-          else
+
+          if [[ "$EVM_RESULT" != "failure" && "$SOROBAN_RESULT" != "failure" && "$CROSS_RESULT" != "failure" ]]; then
             echo "✅ All differential fuzzing checks passed!" >> $GITHUB_STEP_SUMMARY
             echo "failed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+
+          # A crate that does not build is not evidence of wire-format drift.
+          # Classify it separately so it is filed without the security /
+          # wire-format labels and with a body that says what actually broke.
+          if [[ "$EVM_COMPILE_FAILED" == "true" || "$SOROBAN_COMPILE_FAILED" == "true" ]]; then
+            echo "kind=build" >> "$GITHUB_OUTPUT"
+            echo "❌ Fuzz harness failed to compile — no codec comparison was performed." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "kind=divergence" >> "$GITHUB_OUTPUT"
+            echo "❌ Differential fuzzing detected codec divergence!" >> $GITHUB_STEP_SUMMARY
+            echo "Review artifacts for failing test cases." >> $GITHUB_STEP_SUMMARY
           fi
 
       # A scheduled job whose failures nobody sees provides no protection —
-      # only file automatically on the nightly/dispatch runs, not on every
-      # red PR, so this doesn't spam an issue per failing pull request.
-      - name: Strip front matter from the issue template
+      # only file automatically on the nightly/dispatch/push runs, not on
+      # every red PR. Issues are keyed on a *stable* title (kind + branch),
+      # not the run id: a persistent failure updates one open issue with a
+      # comment per run instead of opening a new one every night (#770).
+      - name: Report to tracking issue
         if: steps.summary.outputs.failed == 'true' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          KIND: ${{ steps.summary.outputs.kind }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          EVM_RESULT: ${{ needs.differential-fuzz-evm.result }}
+          SOROBAN_RESULT: ${{ needs.differential-fuzz-soroban.result }}
+          CROSS_RESULT: ${{ needs.cross-validate.result }}
+          EVM_COMPILE_FAILED: ${{ needs.differential-fuzz-evm.outputs.compile-failed }}
+          SOROBAN_COMPILE_FAILED: ${{ needs.differential-fuzz-soroban.outputs.compile-failed }}
         run: |
-          sed '1{/^---$/!q}; 1,/^---$/d' \
-            .github/ISSUE_TEMPLATE/differential-fuzz-failure.md \
-            > /tmp/fuzz-failure-issue-body.md
+          if [[ "$KIND" == "build" ]]; then
+            title="[FUZZ] Differential fuzz harness does not compile on $BRANCH"
+            labels="bug,differential-fuzz"
+          else
+            title="[FUZZ] Differential fuzzing is failing on $BRANCH"
+            labels="bug,security,wire-format,differential-fuzz"
+          fi
 
-      - name: Open tracking issue
-        if: steps.summary.outputs.failed == 'true' && github.event_name != 'pull_request'
-        uses: peter-evans/create-issue-from-file@v5
-        with:
-          title: "[FUZZ] Differential fuzzing failed on ${{ github.event_name }} run ${{ github.run_id }} (${{ github.ref_name }}@${{ github.sha }})"
-          content-filepath: /tmp/fuzz-failure-issue-body.md
-          labels: bug, security, wire-format, differential-fuzz
+          # Per-run details go in the body/comment, never in the title.
+          {
+            echo "### Run details"
+            echo ""
+            echo "- Run: $RUN_URL"
+            echo "- Trigger: \`$EVENT\` on \`$BRANCH@$SHA\`"
+            echo "- EVM fuzzing: \`$EVM_RESULT\`$([[ "$EVM_COMPILE_FAILED" == "true" ]] && echo ' (compile failure)')"
+            echo "- Soroban fuzzing: \`$SOROBAN_RESULT\`$([[ "$SOROBAN_COMPILE_FAILED" == "true" ]] && echo ' (compile failure)')"
+            echo "- Cross-validation: \`$CROSS_RESULT\`"
+          } > /tmp/run-details.md
+
+          existing=$(gh issue list --repo "$REPO" --state open --limit 100 \
+                       --search "\"$title\" in:title" --json number,title \
+                     | jq -r --arg t "$title" '.[] | select(.title == $t) | .number' | head -n1)
+
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$REPO" --body-file /tmp/run-details.md
+            echo "Updated existing tracking issue #$existing"
+            exit 0
+          fi
+
+          if [[ "$KIND" == "build" ]]; then
+            {
+              echo "The differential fuzzing workflow could not compile its harness, so no"
+              echo "encode/decode comparison ran. This is a build failure, **not** evidence"
+              echo "of wire-format drift. Fix the build; the next green run closes this issue."
+              echo ""
+              cat /tmp/run-details.md
+            } > /tmp/fuzz-issue-body.md
+          else
+            sed '1{/^---$/!q}; 1,/^---$/d' \
+              .github/ISSUE_TEMPLATE/differential-fuzz-failure.md > /tmp/fuzz-issue-body.md
+            { echo ""; cat /tmp/run-details.md; } >> /tmp/fuzz-issue-body.md
+          fi
+
+          gh issue create --repo "$REPO" --title "$title" --label "$labels" \
+            --body-file /tmp/fuzz-issue-body.md
+
+      # Close the loop: once the branch is green again, close whatever
+      # tracking issues are still open for it.
+      - name: Close resolved tracking issues
+        if: steps.summary.outputs.failed == 'false' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for title in "[FUZZ] Differential fuzz harness does not compile on $BRANCH" \
+                       "[FUZZ] Differential fuzzing is failing on $BRANCH"; do
+            gh issue list --repo "$REPO" --state open --limit 100 \
+                --search "\"$title\" in:title" --json number,title \
+              | jq -r --arg t "$title" '.[] | select(.title == $t) | .number' \
+              | while read -r n; do
+                  gh issue close "$n" --repo "$REPO" --comment "Differential fuzzing passed on \`$BRANCH\` in $RUN_URL."
+                done
+          done
+
+          # Legacy per-run titles ("... failed on <event> run <id> (<branch>@<sha>)")
+          # predate the stable titles above and are matched here so they close too.
+          gh issue list --repo "$REPO" --state open --limit 100 \
+              --search "\"Differential fuzzing failed on\" in:title" --json number,title \
+            | jq -r --arg b "($BRANCH@" \
+                '.[] | select(.title | startswith("[FUZZ] Differential fuzzing failed on ") and contains($b)) | .number' \
+            | while read -r n; do
+                gh issue close "$n" --repo "$REPO" --comment "Differential fuzzing passed on \`$BRANCH\` in $RUN_URL."
+              done
 
       - name: Fail the job if fuzzing failed
         if: steps.summary.outputs.failed == 'true'

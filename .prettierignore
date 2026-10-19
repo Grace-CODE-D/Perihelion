@@ -1,0 +1,8 @@
+dist
+node_modules
+contracts
+target
+# Truncated on main (an editor placeholder replaced the end of the file);
+# Prettier cannot parse them. Restore and remove these lines.
+mempool/test/contract.test.ts
+mempool/test/server.test.ts

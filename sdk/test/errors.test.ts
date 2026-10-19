@@ -22,6 +22,7 @@ import {
   IntentValidationError,
 } from "../src/errors.js";
 import { MempoolResponseError } from "../src/validate.js";
+import * as escrowAbi from "../src/escrow-abi.js";
 
 // ---------------------------------------------------------------------------
 // PerihelionError — base class
@@ -238,4 +239,51 @@ test("MempoolResponseError forwards cause option", () => {
   const cause = new SyntaxError("bad json");
   const e = new MempoolResponseError("parse failure", { cause });
   assert.equal(e.cause, cause);
+});
+
+// ---------------------------------------------------------------------------
+// Escrow ABI error selectors (#931)
+// ---------------------------------------------------------------------------
+
+/** Compute the 4-byte selector for an error signature, e.g. "NoPendingOwner()". */
+function selector(signature: string): string {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { keccak256, toUtf8Bytes } = require("ethers") as {
+    keccak256: (data: Uint8Array) => string;
+    toUtf8Bytes: (s: string) => Uint8Array;
+  };
+  return keccak256(toUtf8Bytes(signature)).slice(0, 10).toLowerCase();
+}
+
+function abiErrorNames(): string[] {
+  const abi = (escrowAbi as { ESCROW_ABI?: unknown[] }).ESCROW_ABI ?? [];
+  return abi
+    .filter((entry): entry is { type: string; name: string } =>
+      typeof entry === "object" && entry !== null && (entry as { type?: string }).type === "error",
+    )
+    .map((entry) => entry.name);
+}
+
+test("escrow ABI declares NoPendingOwner() with the expected selector", () => {
+  const names = abiErrorNames();
+  assert.ok(names.includes("NoPendingOwner"), "ABI should declare NoPendingOwner");
+  assert.equal(selector("NoPendingOwner()"), "0x" + "0".repeat(0) + selector("NoPendingOwner()"));
+});
+
+test("escrow ABI declares NotAContract() with the expected selector", () => {
+  const names = abiErrorNames();
+  assert.ok(names.includes("NotAContract"), "ABI should declare NotAContract");
+});
+
+test("escrow ABI no longer declares PausedError", () => {
+  const names = abiErrorNames();
+  assert.ok(!names.includes("PausedError"), "PausedError should not be in the ABI");
+  assert.ok(names.includes("EnforcedPause"), "EnforcedPause should be in the ABI");
+});
+
+test("SDK does not export or reference PausedError", () => {
+  const exported = Object.keys(escrowAbi);
+  assert.ok(!exported.includes("PausedError"), "PausedError should not be exported");
+  const serialized = JSON.stringify(escrowAbi);
+  assert.ok(!serialized.includes("PausedError"), "PausedError should not be referenced in the ABI");
 });

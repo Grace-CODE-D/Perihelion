@@ -5,9 +5,16 @@ import { IERC20 } from "./IERC20.sol";
 import {
     Origin,
     MessagingParams,
-    ILayerZeroEndpoint,
+    MessagingReceipt,
+    ILayerZeroEndpointV2,
     ILayerZeroReceiver
 } from "./interfaces/ILayerZero.sol";
+
+/// @dev Minimal ERC-1271 interface for smart-contract wallet signature validation.
+interface IERC1271 {
+    /// @notice Returns the magic value `0x1626ba7e` when `hash` is validly signed by this account.
+    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
+}
 
 /// @title Perihelion Escrow
 /// @notice Source-chain leg of the Perihelion bridge, and a LayerZero OApp.
@@ -37,30 +44,35 @@ import {
 ///      Events are the off-chain integration surface for indexers, relayers, and
 ///      monitoring tooling. Each event shape below is a VERSIONED INTERFACE.
 ///      Changes to event topics or payloads MUST be reflected in the Soroban
-///      contract (see `contracts/soroban/settlement/src/lib.rs`).
+///      contract (see `contracts/soroban/settlement/src/lib.rs`). The Soroban
+///      topic column is the exact symbol the Soroban contract emits for the
+///      analogous event (full names, never abbreviated; see
+///      `docs/EVENT-SHAPES.md`). "-" means there is no Soroban analogue.
 ///
-///      | Event                  | Topics                                              | Data                                                          |
-///      |------------------------|-----------------------------------------------------|---------------------------------------------------------------|
-///      | Locked                 | intentHash, solver, user                             | asset, amount, destination, destAsset, minDestAmount, deadline|
-///      | Released               | intentHash, solver                                  | amount, fillAmount, fillLedger |
-///      | Refunded               | intentHash, user                                    | amount, reason                |
-///      | RefundedLocalTimeout   | intentHash, user                                    | amount                        |
-///      | PeerSet                | -                                                   | peer                          |
-///      | ConfirmationGraceSet   | -                                                   | secondsGrace                  |
-///      | GuardianSet            | guardian                                            | -                             |
-///      | PausedSet              | -                                                   | paused                        |
-///      | OwnershipTransferStart | previousOwner, newOwner                             | -                             |
-///      | OwnershipTransferred   | previousOwner, newOwner                             | -                             |
-///      | OwnershipTransferCancel| previousOwner                                       | -                             |
-///      | Skimmed                | token, to                                           | amount                        |
-///      | MaxIntentAmountSet     | -                                                   | maxAmount                     |
-///      | RollingWindowCapSet    | -                                                   | duration, cap                 |
-///      | RollingWindowCapTriggered | windowStart                                      | accumulated                   |
-///      | RollingWindowCapReset  | -                                                   | -                             |
+///      | Event                  | Topics                                              | Data                                                          | Soroban topic                  |
+///      |------------------------|-----------------------------------------------------|---------------------------------------------------------------|--------------------------------|
+///      | Locked                 | intentHash, solver, user                             | asset, amount, destination, destAsset, minDestAmount, deadline| `registered`                   |
+///      | Released               | intentHash, solver                                  | amount, fillAmount, fillLedger | `filled`                       |
+///      | Refunded               | intentHash, user                                    | amount, reason                | `cancelled`                    |
+///      | RefundedLocalTimeout   | intentHash, user                                    | amount                        | -                              |
+///      | PeerSet                | -                                                   | peer                          | `peer_set`                     |
+///      | ConfirmationGraceSet   | -                                                   | secondsGrace                  | -                              |
+///      | GuardianSet            | guardian                                            | -                             | -                              |
+///      | PausedSet              | -                                                   | paused                        | `paused_set`                   |
+///      | OwnershipTransferStart | previousOwner, newOwner                             | -                             | `admin_transfer_started`       |
+///      | OwnershipTransferred   | previousOwner, newOwner                             | -                             | `admin_transfer_completed`     |
+///      | OwnershipTransferCancel| previousOwner                                       | -                             | -                              |
+///      | Skimmed                | token, to                                           | amount                        | -                              |
+///      | MaxIntentAmountSet     | -                                                   | maxAmount                     | `max_intent_amount_set`        |
+///      | RollingWindowCapSet    | -                                                   | duration, cap                 | `rolling_window_cap_set`       |
+///      | RollingWindowCapTriggered | windowStart                                      | accumulated                   | `rolling_window_cap_triggered` |
+///      | RollingWindowCapReset  | -                                                   | -                             | `rolling_window_cap_reset`     |
 contract PerihelionEscrow is ILayerZeroReceiver {
     // --- Types ---------------------------------------------------------------
 
-    uint256 internal constant FILL_INSTRUCTION_LENGTH = 219;
+    uint256 public constant FILL_INSTRUCTION_LENGTH = 227;
+    uint256 public constant FILL_CONFIRMED_LENGTH = 90;
+    uint256 public constant CANCEL_INTENT_LENGTH = 35;
 
     struct Intent {
         address user;
@@ -83,6 +95,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     }
 
     struct Lock {
+        /// @dev Canonical EVM solver identity bound at lock time. The same identity
+        ///      must be carried by FillConfirmed; payout aliases cannot bypass it.
         address solver;
         address user;
         address asset;
@@ -125,6 +139,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @dev Local refund fallback: timed out waiting for cross-chain confirmation.
     ///      This value (0xFF) is EVM-only; it does not appear in Soroban messages.
     uint8 private constant CANCEL_REASON_LOCAL_TIMEOUT = 0xFF;
+    uint8 private constant IGNORE_UNKNOWN_LOCK = 0x01;
+    uint8 private constant IGNORE_ALREADY_FINALIZED = 0x02;
 
     bytes1 private constant PROTOCOL_VERSION = 0x01;
     bytes1 private constant MSG_FILL_INSTRUCTION = 0x01;
@@ -162,7 +178,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///         Domain: name="Perihelion", version="1", chainId=<deployment chain>, verifyingContract=<this>.
     bytes32 public immutable DOMAIN_SEPARATOR;
     /// @notice Trusted LayerZero endpoint.
-    ILayerZeroEndpoint public immutable endpoint;
+    ILayerZeroEndpointV2 public immutable endpoint;
     /// @notice LayerZero endpoint id of the Stellar settlement contract.
     uint32 public immutable stellarEid;
 
@@ -179,9 +195,9 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @notice Extra delay beyond `deadline` before the local refund fallback opens,
     ///         giving an in-flight FillConfirmed time to land first (race guard).
     uint256 public confirmationGrace = 2 hours;
-    /// @notice Emergency halt. Blocks new `lock`s and local `cancelExpired` refunds;
-    ///         in-flight settlement still completes via `lzReceive` so funds are
-    ///         never stranded mid-flight. Mirrors the Soroban side's pause.
+    /// @notice Emergency halt. Blocks new `lock`s only; local `cancelExpired`
+    ///         refunds and inbound settlement via `lzReceive` remain available so
+    ///         funds are never stranded mid-flight. Mirrors the Soroban side's pause.
     bool public paused;
     /// @notice When a guardian-initiated pause auto-expires (0 if no guardian
     ///         pause is active, or the current pause is owner-controlled).
@@ -194,7 +210,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     /// @notice Mapping of allowed source assets. Only assets in this allowlist can be locked.
     mapping(address => bool) public assetAllowed;
-    /// @notice Mapping of per-asset maximum lock amounts. Zero means use global cap.
+    /// @notice Mapping of per-asset maximum lock amounts. Every allowlisted asset
+    ///         must have an explicit non-zero entry before it can be locked.
     mapping(address => uint256) public maxIntentAmountPerAsset;
 
     // --- Value caps (issue #145) -----------------------------------------------
@@ -204,12 +221,16 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     uint256 public maxIntentAmount;
     /// @notice Time window (in seconds) for rolling throughput cap. Zero means disabled.
     uint256 public rollingWindowDuration;
-    /// @notice Maximum total value that can be locked within rollingWindowDuration.
-    ///         Zero means unlimited. Timelock-governed.
+    /// @notice Deprecated protocol-wide value retained for ABI compatibility.
+    ///         Enforcement uses rollingWindowCapPerAsset instead.
     uint256 public rollingWindowCap;
+    /// @notice Maximum rolling-window amount for each allowlisted asset.
+    mapping(address => uint256) public rollingWindowCapPerAsset;
     /// @notice Whether the rolling-window cap has been triggered (exceeded).
     ///         When true, new locks are paused until the admin resets this flag.
     bool public rollingWindowTriggered;
+    /// @notice Asset whose rolling-window breach engaged the breaker.
+    address public rollingWindowTriggeredAsset;
     /// @notice Earliest timestamp at which rollingWindowTriggered may be reset.
     ///         Prevents spam-resetting the cap within the same window.
     uint256 public rollingWindowResetEarliestAt;
@@ -223,11 +244,11 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///         and cancelExpired. Allows skim() to compute the genuine on-chain surplus
     ///         and prevents the owner from draining active user deposits.
     mapping(address => uint256) public totalLocked;
-    /// @notice Rolling-window bucket tracking: window start timestamp => cumulative locked amount.
+    /// @notice Rolling-window bucket tracking per asset and window start.
     ///         Each lock bumps the current window bucket. Windows slide; old buckets are orphaned.
-    mapping(uint256 => uint256) private _rollingWindowBuckets;
+    mapping(address => mapping(uint256 => uint256)) private _rollingWindowBuckets;
     /// @notice Latest window start timestamp (memoized for efficiency).
-    uint256 private _latestWindowStart;
+    mapping(address => uint256) private _latestWindowStart;
 
     /// @notice Observational high-water mark for inbound nonces per source endpoint id.
     ///
@@ -313,6 +334,9 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     event RollingWindowCapSet(uint256 duration, uint256 cap);
     event RollingWindowCapTriggered(uint256 windowStart, uint256 accumulated);
     event RollingWindowCapReset();
+    event RollingWindowCapPerAssetSet(address indexed asset, uint256 duration, uint256 cap);
+    event FillConfirmedIgnored(bytes32 indexed intentHash, uint8 reason);
+    event CancelIgnored(bytes32 indexed intentHash, uint8 reason);
     event AssetAllowed(address indexed asset, bool allowed);
     event MaxIntentAmountPerAssetSet(address indexed asset, uint256 maxAmount);
 
@@ -338,6 +362,10 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     error StaleNonce();
     error NotOwner();
     error NotPendingOwner();
+    /// @dev `cancelOwnershipTransfer` was called while no handover is pending.
+    error NoPendingOwner();
+    /// @dev An address expected to be a contract (e.g. an allowlisted asset) has no code.
+    error NotAContract();
     error NotAuthorized();
     error Reentrancy();
     error EnforcedPause();
@@ -360,6 +388,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @dev skim() would draw into funds locked by active intents.
     error ExceedsSurplus();
     error AssetNotAllowed();
+    error AssetCapNotConfigured();
     error UnderDelivered();
     /// @dev A uint256 intent field cannot fit in the narrower wire/storage type
     ///      without wrapping (minDestAmount/sourceAmount vs uint128, deadline vs uint64).
@@ -392,7 +421,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @param _stellarEid LayerZero endpoint id for the Stellar settlement contract.
     constructor(address _endpoint, uint32 _stellarEid) {
         if (_endpoint == address(0)) revert ZeroAddress();
-        endpoint = ILayerZeroEndpoint(_endpoint);
+        endpoint = ILayerZeroEndpointV2(_endpoint);
+        endpoint.setDelegate(msg.sender);
         stellarEid = _stellarEid;
         owner = msg.sender;
         _reentrancy = 1; // 1/2/1 sentinel: slot stays non-zero, each lock/unlock is a warm SSTORE
@@ -411,8 +441,12 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     // --- Admin ---------------------------------------------------------------
 
     /// @notice Set the trusted Stellar settlement peer.
+    /// @dev Reverts with {ZeroAddress} for `bytes32(0)`: a zero peer would make every
+    ///      inbound message revert with {UntrustedPeer} and route FillInstructions to
+    ///      the zero receiver, silently disabling settlement.
     /// @param peer 32-byte LayerZero address of the trusted Stellar settlement OApp.
     function setPeer(bytes32 peer) external onlyOwner {
+        if (peer == bytes32(0)) revert ZeroAddress();
         stellarPeer = peer;
         emit PeerSet(peer);
     }
@@ -435,12 +469,13 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         emit GuardianSet(newGuardian);
     }
 
-    /// @notice Emergency halt / resume. Blocks new locks and local refunds; does
-    ///         not block inbound settlement so in-flight funds still resolve.
+    /// @notice Emergency halt / resume. Blocks new locks only; local `cancelExpired`
+    ///         refunds and inbound settlement remain available so in-flight funds
+    ///         still resolve.
     ///         Owner calling this clears any guardian-initiated expiry — if called
     ///         with `true` the pause becomes indefinite; if `false` it also resets
     ///         the guardian cooldown so the guardian remains operational.
-    /// @param _paused True to halt new locks and local refunds; false to resume.
+    /// @param _paused True to halt new locks; false to resume.
     function setPaused(bool _paused) external onlyOwner {
         paused = _paused;
         guardianPauseExpiry = 0; // owner takes full control; no auto-expiry
@@ -485,7 +520,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @param asset Address of the ERC-20 token to allow or disallow.
     /// @param allowed True to add to allowlist, false to remove.
     function setAssetAllowed(address asset, bool allowed) external onlyOwner {
-        if (allowed && asset.code.length == 0) revert TransferFailed();
+        if (allowed && asset.code.length == 0) revert NotAContract();
         assetAllowed[asset] = allowed;
         emit AssetAllowed(asset, allowed);
     }
@@ -522,6 +557,20 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         rollingWindowCap = _cap;
         emit RollingWindowCapSet(_windowDuration, _cap);
     }
+    /// @notice Set the rolling-window cap for one allowlisted asset.
+    ///         Window accounting is isolated by asset; amounts from another
+    ///         token can never consume this asset's bucket.
+    function setRollingWindowCapForAsset(address asset, uint256 _windowDuration, uint256 _cap)
+        external
+        onlyOwner
+    {
+        if (!assetAllowed[asset]) revert AssetNotAllowed();
+        if (_cap > 0 && _windowDuration == 0) revert InvalidDuration();
+        if (_windowDuration > block.timestamp) revert InvalidDuration();
+        rollingWindowDuration = _windowDuration;
+        rollingWindowCapPerAsset[asset] = _cap;
+        emit RollingWindowCapPerAssetSet(asset, _windowDuration, _cap);
+    }
 
     /// @notice Admin-only: reset the rolling-window cap trigger if it has been
     ///         exceeded. Can only be called after rollingWindowResetEarliestAt passes
@@ -532,11 +581,11 @@ contract PerihelionEscrow is ILayerZeroReceiver {
             revert RollingWindowNotYetResettable();
         }
         rollingWindowTriggered = false;
-        if (rollingWindowDuration > 0) {
+        if (rollingWindowDuration > 0 && rollingWindowTriggeredAsset != address(0)) {
             uint256 windowStart = (block.timestamp / rollingWindowDuration) * rollingWindowDuration;
-            delete _rollingWindowBuckets[windowStart];
+            delete _rollingWindowBuckets[rollingWindowTriggeredAsset][windowStart];
         }
-        _latestWindowStart = 0; // reset memoized window, forces recalc on next lock
+        rollingWindowTriggeredAsset = address(0);
         emit RollingWindowCapReset();
     }
 
@@ -554,7 +603,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///         event so off-chain monitors can clearly distinguish a cancellation
     ///         from a transfer-to-zero. Reverts if no handover is pending.
     function cancelOwnershipTransfer() external onlyOwner {
-        if (pendingOwner == address(0)) revert NotOwner();
+        if (pendingOwner == address(0)) revert NoPendingOwner();
         pendingOwner = address(0);
         emit OwnershipTransferCancelled(owner);
     }
@@ -608,10 +657,11 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// @notice Solver claims an intent: verify the user's signature, pull the
     ///         funds (measured-delta), and dispatch FillInstruction to Stellar.
     /// @dev `msg.value` funds the LayerZero send. Call {quoteFee} to size it.
-    ///      The LayerZero endpoint is expected to refund any excess nativeFee to
-    ///      `msg.sender` (the refundAddress passed to endpoint.send); this is the
-    ///      standard V2 convention. Callers should still use {quoteFee} to minimise
-    ///      over-payment rather than relying on endpoint refunds.
+    ///      Exactly the quoted fee is forwarded to the endpoint; any excess
+    ///      (`msg.value - quoted`) is refunded to `msg.sender` by this contract.
+    ///      Callers should use {quoteFee} to minimise over-payment.
+    ///      Reverts with {ZeroAddress} while `stellarPeer` is unset, so no lock can
+    ///      be created whose FillInstruction would go nowhere.
     ///      The user must have approved this contract for `sourceAmount` of `sourceAsset`.
     /// @param intent The user's signed intent specifying bridge parameters.
     /// @param signature EIP-712 signature over the intent by intent.user.
@@ -620,6 +670,24 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         payable
         nonReentrant
         whenNotPaused
+    {
+        // Refuse to lock before a peer is configured: the FillInstruction would be
+        // dispatched to the zero receiver and no FillConfirmed could ever arrive.
+        if (stellarPeer == bytes32(0)) revert ZeroAddress();
+        // `lock` is split into narrowly-scoped helpers so no single frame holds
+        // enough live locals to exceed the legacy codegen's 16-slot stack limit
+        // (#857). Order of checks, effects and interactions is unchanged.
+        bytes32 intentHash = _validateIntent(intent, signature);
+        uint256 received = _pullFunds(intent);
+        _recordLock(intentHash, intent, received);
+        _dispatchFillInstruction(intentHash, intent);
+    }
+
+    /// @dev Stateless validation of a signed intent; returns its EIP-712 hash.
+    function _validateIntent(Intent calldata intent, bytes calldata signature)
+        private
+        view
+        returns (bytes32 intentHash)
     {
         if (block.timestamp >= intent.deadline) revert IntentExpired();
         // #39: bind intent to the chain the user signed for.
@@ -642,22 +710,32 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         // Reject values that would silently wrap when narrowed to the storage/wire
         // type below (Lock.minDestAmount/deadline, and the FillInstruction fields),
         // rather than truncating a signed intent into a different meaning.
-        if (intent.minDestAmount > type(uint128).max) revert AmountTooLarge();
+        if (intent.minDestAmount > (uint256(type(uint128).max) >> 1)) revert AmountTooLarge();
         if (intent.sourceAmount > type(uint128).max) revert AmountTooLarge();
         if (intent.deadline > type(uint64).max) revert AmountTooLarge();
 
-        bytes32 intentHash = hashIntent(intent);
+        intentHash = hashIntent(intent);
         if (locks[intentHash].user != address(0)) revert AlreadyLocked();
         if (!_verify(intentHash, intent.user, signature)) revert InvalidSignature();
+    }
 
+    /// @dev Enforce value caps, pull `sourceAmount` from the user and return the
+    ///      amount the escrow actually received.
+    function _pullFunds(Intent calldata intent) private returns (uint256 received) {
         // Check value caps before pulling funds.
-        _checkValueCaps(intent.sourceAmount, intent.sourceAsset);
+        if (!_checkValueCaps(intent.sourceAmount, intent.sourceAsset)) {
+            if (msg.value > 0) {
+                (bool refunded,) = msg.sender.call{ value: msg.value }("");
+                if (!refunded) revert NativeTransferFailed();
+            }
+            return;
+        }
 
         // Measured-delta accounting: store exactly what the escrow received, so
         // fee-on-transfer / rebasing tokens can never release more than is held.
         uint256 balBefore = IERC20(intent.sourceAsset).balanceOf(address(this));
         _safeTransferFrom(intent.sourceAsset, intent.user, address(this), intent.sourceAmount);
-        uint256 received = IERC20(intent.sourceAsset).balanceOf(address(this)) - balBefore;
+        received = IERC20(intent.sourceAsset).balanceOf(address(this)) - balBefore;
         // Measured-delta off a balance diff after the pull is intentional; the
         // exact-zero check rejects transfers that delivered nothing (e.g. a
         // fully-taxed token). Safe under `nonReentrant`.
@@ -665,8 +743,10 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         if (received == 0) revert NothingReceived();
 
         // Commit the actual received amount to the rolling window accumulator.
-        _commitValueCaps(received);
+        _commitValueCaps(intent.sourceAsset, received);
 
+    /// @dev Persist the lock, bump the aggregate liability and emit {Locked}.
+    function _recordLock(bytes32 intentHash, Intent calldata intent, uint256 received) private {
         // The lock is written after the pull because measured-delta needs the
         // post-transfer balance; safe because `lock` and every fund-moving path
         // are `nonReentrant`, so the token callback cannot re-enter them.
@@ -696,18 +776,22 @@ contract PerihelionEscrow is ILayerZeroReceiver {
             uint128(intent.minDestAmount),
             uint64(intent.deadline)
         );
+    }
 
-        bytes memory message = _encodeFillInstruction(intentHash, intent);
+        bytes memory message = _encodeFillInstruction(intentHash, intent, msg.sender);
         // Quote with nativeFee=0, identical to quoteFee(), so the value a solver
         // sized off-chain via quoteFee is the same value compared against below.
-        MessagingParams memory params = _buildMessagingParams(message, 0);
+        MessagingParams memory params = _buildMessagingParams(message);
         // Revert early on obvious underpayment rather than letting the endpoint
         // bubble an opaque error. Only the quoted fee is actually sent to the
         // endpoint; any excess is refunded locally to the caller.
         uint256 quoted = endpoint.quote(params, msg.sender).nativeFee;
         if (msg.value < quoted) revert FeeTooLow();
         uint256 refundAmount = msg.value - quoted;
-        endpoint.send{ value: quoted }(params, msg.sender);
+        MessagingReceipt memory receipt = endpoint.send{ value: quoted }(params, msg.sender);
+        // Touch every V2 receipt field so ABI decoding is explicit and future
+        // endpoint upgrades cannot silently fall back to the legacy bytes32 ABI.
+        receipt.guid; receipt.nonce; receipt.fee.nativeFee; receipt.fee.lzTokenFee;
         if (refundAmount > 0) {
             (bool ok,) = msg.sender.call{ value: refundAmount }("");
             if (!ok) revert NativeTransferFailed();
@@ -716,53 +800,55 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     // --- Value cap enforcement -----------------------------------------------
 
-    /// @dev Pre-flight check per-intent and rolling-window value caps against requested sourceAmount.
-    ///      Reverts if exceeded. Must be called before funds are transferred.
-    function _checkValueCaps(uint256 sourceAmount, address asset) private {
-        // Check 1: Per-intent maximum (per-asset takes precedence, then global)
-        uint256 maxAmount = maxIntentAmountPerAsset[asset] > 0
-            ? maxIntentAmountPerAsset[asset]
-            : maxIntentAmount;
-        if (maxAmount > 0 && sourceAmount > maxAmount) {
+    /// @dev Pre-flight check per-asset caps against requested sourceAmount.
+    ///      Returns false for a rolling-cap breach so the breaker latch and
+    ///      diagnostic event persist; no funds have been transferred yet.
+    function _checkValueCaps(uint256 sourceAmount, address asset) private returns (bool) {
+        // Every allowlisted asset requires an explicit per-asset maximum.
+        uint256 maxAmount = maxIntentAmountPerAsset[asset];
+        if (maxAmount == 0) revert AssetCapNotConfigured();
+        if (sourceAmount > maxAmount) {
             revert ExceedsMaxIntentAmount();
         }
 
         // Check 2: Rolling-window cap (disabled if duration is zero)
-        if (rollingWindowDuration > 0 && rollingWindowCap > 0) {
-            // Reject if cap has already been triggered.
-            if (rollingWindowTriggered) {
-                revert RollingWindowCapAlreadyTriggered();
-            }
+        if (rollingWindowTriggered) {
+            revert RollingWindowCapAlreadyTriggered();
+        }
+        uint256 assetCap = rollingWindowCapPerAsset[asset];
+        if (rollingWindowDuration > 0 && assetCap > 0) {
 
             // Calculate current window start. Each window spans [windowStart, windowStart + duration).
             uint256 windowStart = (block.timestamp / rollingWindowDuration) * rollingWindowDuration;
 
             // If time has moved to a new window, existing bucket for this window is 0.
-            uint256 currentBucket = windowStart > _latestWindowStart
+            uint256 currentBucket = windowStart > _latestWindowStart[asset]
                 ? 0
-                : _rollingWindowBuckets[windowStart];
+                : _rollingWindowBuckets[asset][windowStart];
 
             uint256 projected = currentBucket + sourceAmount;
-            if (projected > rollingWindowCap) {
-                // Cap exceeded: trigger halt and record the window + amount for diagnostics.
+            if (projected > assetCap) {
+                // Do not revert: a revert would roll back the latch and event.
                 rollingWindowTriggered = true;
+                rollingWindowTriggeredAsset = asset;
                 rollingWindowResetEarliestAt = block.timestamp + rollingWindowDuration;
                 emit RollingWindowCapTriggered(windowStart, projected);
-                revert RollingWindowCapExceeded();
+                return false;
             }
         }
+        return true;
     }
 
     /// @dev Commit the measured delta (actual received tokens) to the rolling-window bucket.
     ///      Ensures fee-on-transfer tokens do not cause accumulator drift.
-    function _commitValueCaps(uint256 receivedAmount) private {
-        if (rollingWindowDuration > 0 && rollingWindowCap > 0) {
+    function _commitValueCaps(address asset, uint256 receivedAmount) private {
+        if (rollingWindowDuration > 0 && rollingWindowCapPerAsset[asset] > 0) {
             uint256 windowStart = (block.timestamp / rollingWindowDuration) * rollingWindowDuration;
-            if (windowStart > _latestWindowStart) {
-                _latestWindowStart = windowStart;
+            if (windowStart > _latestWindowStart[asset]) {
+                _latestWindowStart[asset] = windowStart;
                 // In a new window; prior buckets are orphaned and expire implicitly.
             }
-            _rollingWindowBuckets[windowStart] += receivedAmount;
+            _rollingWindowBuckets[asset][windowStart] += receivedAmount;
         }
     }
 
@@ -805,20 +891,21 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         }
     }
 
-    /// @dev Release destination is `solverEvm` from the Stellar FillConfirmed message,
-    ///      NOT `l.solver` (the address that called `lock` on the source chain). This is
-    ///      intentional: solvers may operate a hot locking key on EVM and a separate cold
-    ///      payout address, supplying the payout address as `solver_evm` in `fill_intent`
-    ///      on Stellar. The two addresses can legitimately differ. Solver tooling MUST
-    ///      surface both addresses explicitly so operators understand which key receives
-    ///      the payout. The on-chain check that prevents theft is the LayerZero peer
-    ///      authentication in `lzReceive` — only the trusted Stellar peer can supply
-    ///      `solverEvm`, so an attacker cannot redirect funds to an arbitrary address.
+    /// @dev `solverEvm` is the canonical solver identity carried by the FillInstruction
+    ///      that was locked on the source chain. It must match the locking solver
+    ///      during the lock's exclusivity window; after the deadline, another solver
+    ///      may complete the fill before the confirmation grace period expires.
     function _onFillConfirmed(bytes calldata message) internal {
         (bytes32 intentHash, address solverEvm, uint128 fillAmount, uint64 fillLedger) =
             _decodeFillConfirmed(message);
         Lock storage l = locks[intentHash];
         if (l.user == address(0)) revert NotLocked();
+        // Exclusivity invariant: before expiry, only the EVM address that called
+        // lock may receive the release. After expiry, the reservation is open to
+        // another solver until cancelExpired reaches the confirmation-grace edge.
+        if (solverEvm != l.solver && block.timestamp < l.deadline) {
+            revert ReservedForSolver();
+        }
         if (l.released || l.refunded) revert AlreadyFinalized();
         if (fillAmount < l.minDestAmount) revert UnderDelivered();
 
@@ -831,8 +918,14 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     function _onCancelIntent(bytes calldata message) internal {
         (bytes32 intentHash, uint8 reason) = _decodeCancelIntent(message);
         Lock storage l = locks[intentHash];
-        if (l.user == address(0)) revert NotLocked();
-        if (l.released || l.refunded) revert AlreadyFinalized();
+        if (l.user == address(0)) {
+            emit CancelIgnored(intentHash, IGNORE_UNKNOWN_LOCK);
+            return;
+        }
+        if (l.released || l.refunded) {
+            emit CancelIgnored(intentHash, IGNORE_ALREADY_FINALIZED);
+            return;
+        }
 
         l.refunded = true;
         totalLocked[l.asset] -= l.amount;
@@ -866,8 +959,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     /// so it is best-effort only — do not rely on third-party keepers for liveness.
     ///
     /// # Liveness guarantee
-    /// The refund IS guaranteed to be available (barring contract pause) once the
-    /// grace period elapses. The guarantee is ENFORCED by the user's SDK helper
+    /// The refund IS guaranteed to be available once the grace period elapses;
+    /// `cancelExpired` is not pause-gated. The guarantee is ENFORCED by the user's SDK helper
     /// or a front-end integration that watches for expired intents. Liveness is
     /// a **user responsibility**, not a protocol feature. If neither the user nor
     /// any keeper calls `cancelExpired`, the funds remain locked until the grace
@@ -893,15 +986,15 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     /// @notice Quote the LayerZero native fee for a FillInstruction to Stellar for a specific payer.
     ///         Solvers should call this off-chain passing their own address as `payer` and pass
-    ///         the result (with a small buffer) as `msg.value` to {lock}. Any excess is refunded by
-    ///         the endpoint to the caller per the LayerZero V2 convention.
+    ///         the result (with a small buffer) as `msg.value` to {lock}. {lock} forwards exactly
+    ///         the quoted fee to the endpoint and refunds any excess to the caller itself.
     /// @param intent Intent whose FillInstruction message size determines the fee.
-    /// @param payer The address that will call lock (refund destination for LayerZero endpoint).
+    /// @param payer The address that will call lock (used for the quote context).
     /// @return nativeFee Estimated native token fee in wei.
     function quoteFee(Intent calldata intent, address payer) public view returns (uint256 nativeFee) {
         // Use a placeholder hash — the fee depends only on message size, not content.
-        bytes memory message = _encodeFillInstruction(bytes32(0), intent);
-        MessagingParams memory params = _buildMessagingParams(message, 0);
+        bytes memory message = _encodeFillInstruction(bytes32(0), intent, payer);
+        MessagingParams memory params = _buildMessagingParams(message);
         return endpoint.quote(params, payer).nativeFee;
     }
 
@@ -965,10 +1058,20 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     // --- Internal: codec -----------------------------------------------------
 
+    /// @dev Official LayerZero V2 Type-3 executor option for lzReceive.
+    ///      The option is part of both quote and send, avoiding underquoted
+    ///      messages that the executor cannot deliver.
+    function _lzReceiveOptions() internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            bytes2(0x0003), bytes1(0x01), bytes1(0x01), bytes2(0x0011),
+            uint128(300_000), uint128(0)
+        );
+    }
+
     /// @dev Build MessagingParams for a FillInstruction message. Both lock and quoteFee
-    ///      call this with nativeFee=0, so the two quote identically and the value a
+    ///      use the same options and payInLzToken=false, so the two quote identically and the value a
     ///      solver sizes via quoteFee is the value lock actually compares msg.value against.
-    function _buildMessagingParams(bytes memory message, uint256 nativeFee)
+    function _buildMessagingParams(bytes memory message)
         internal
         view
         returns (MessagingParams memory)
@@ -977,7 +1080,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
             dstEid: stellarEid,
             receiver: stellarPeer,
             message: message,
-            nativeFee: nativeFee
+            options: _lzReceiveOptions(),
+            payInLzToken: false
         });
     }
 
@@ -998,7 +1102,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///      signals "open" (no preferred solver) on the Soroban side.
     function _encodeFillInstruction(
         bytes32 intentHash,
-        Intent calldata intent
+        Intent calldata intent,
+        address lockingSolver
     )
         internal
         view
@@ -1022,8 +1127,9 @@ contract PerihelionEscrow is ILayerZeroReceiver {
             destAssetField[i] = destAssetBytes[i];
         }
 
-        // Encode preferredSolver: EVM address left-padded to 32 bytes (zeros = open).
-        bytes32 solverWord = bytes32(uint256(uint160(intent.preferredSolver)));
+        // Encode the canonical locking solver, not the user preference. This field
+        // is the cross-chain exclusivity binding and is never an alias/payout field.
+        bytes32 solverWord = bytes32(uint256(uint160(lockingSolver)));
 
         return abi.encodePacked(
             PROTOCOL_VERSION,     // 1  byte  offset 0
@@ -1061,7 +1167,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         pure
         returns (bytes32 intentHash, address solverEvm, uint128 fillAmount, uint64 fillLedger)
     {
-        if (m.length != 90) {
+        if (m.length != FILL_CONFIRMED_LENGTH) {
             revert MalformedPayload();
         }
         bytes32 hashWord;
@@ -1096,7 +1202,7 @@ contract PerihelionEscrow is ILayerZeroReceiver {
         pure
         returns (bytes32 intentHash, uint8 reason)
     {
-        if (m.length != 35) revert MalformedPayload();
+        if (m.length != CANCEL_INTENT_LENGTH) revert MalformedPayload();
         bytes32 hashWord;
         assembly {
             hashWord := calldataload(add(m.offset, 2))
@@ -1132,11 +1238,25 @@ contract PerihelionEscrow is ILayerZeroReceiver {
 
     // --- Internal: signature & token safety ----------------------------------
 
+    /// @dev Verify an intent signature. Contract accounts (Safe, ERC-4337 smart
+    ///      accounts) are validated via ERC-1271 with a bounded gas stipend; EOAs use
+    ///      the 65-byte ECDSA path. Returns false rather than reverting on failure.
     function _verify(bytes32 digest, address signer, bytes calldata signature)
         private
-        pure
+        view
         returns (bool)
     {
+        // ERC-1271 path for smart-contract wallets.
+        if (signer.code.length > 0) {
+            uint256 gasStipend = gasleft();
+            if (gasStipend > 100_000) gasStipend = 100_000;
+            (bool ok, bytes memory ret) = signer.staticcall{ gas: gasStipend }(
+                abi.encodeWithSelector(IERC1271.isValidSignature.selector, digest, signature)
+            );
+            if (!ok || ret.length < 32) return false;
+            return abi.decode(ret, (bytes4)) == IERC1271.isValidSignature.selector;
+        }
+
         if (signature.length != 65) return false;
         bytes32 r;
         bytes32 s;

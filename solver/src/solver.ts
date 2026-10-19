@@ -18,20 +18,28 @@ import {
 import type { SolverConfig } from "./config.js";
 import { evaluate, type PricingDeps, type NativeCostDeps } from "./quote.js";
 import { BackoffState } from "./backoff.js";
-import type { Metrics } from "./metrics.js";
+import type { Metrics, FillFees } from "./metrics.js";
 import type { InventoryProvider } from "./inventory.js";
 import { InFlightTracker } from "./inventory.js";
 import { SeenLRU } from "./seen-lru.js";
-import { DefiniteFailureError } from "./executor.js";
+import { DefiniteFailureError, LockOwnedByOtherError } from "./executor.js";
 
 /** Pluggable execution backend — abstracts the two settlement legs. */
 export interface Executor {
   /**
    * Lock the user's source funds in the EVM escrow against the intent hash and
    * release the destination assets on Stellar once the LayerZero message is
-   * confirmed. Returns the Stellar settlement tx hash.
+   * confirmed. Returns the Stellar settlement tx hash and optional fee breakdown.
    */
-  fill(signed: SignedIntent): Promise<{ settlementTx: string }>;
+  fill(signed: SignedIntent): Promise<{ settlementTx: string; fees?: FillFees }>;
+
+  /**
+   * Optional: report the persisted progress stage for an intent
+   * (`"lock"`, `"await_registration"`, `"fill"`, `"done"`). Used for logging
+   * and metrics so operators can see where intents stall. Implementations
+   * that do not persist stages may omit it.
+   */
+  stage?(hash: Hex): string | undefined;
 }
 
 /** Minimal logger interface so callers can inject structured logging. */
@@ -39,6 +47,22 @@ export interface Logger {
   info(msg: string, meta?: Record<string, unknown>): void;
   warn(msg: string, meta?: Record<string, unknown>): void;
   error(msg: string, meta?: Record<string, unknown>): void;
+}
+
+/**
+ * Readiness snapshot for the solver health/readiness server.
+ */
+export interface SolverReadinessState {
+  /** True if the last tick completed without throwing. */
+  lastTickOk: boolean;
+  /** Timestamp (ms since epoch) of the last successful tick, or 0 if none yet. */
+  lastTickAt: number;
+  /** Number of consecutive tick failures. */
+  consecutiveFailures: number;
+  /** Current size of the seen-set cache. */
+  seenCount: number;
+  /** Current size of the retry-state cache. */
+  retryStateCount: number;
 }
 
 /**
@@ -272,8 +296,29 @@ class RetryStateLRU {
 // Solver
 // ---------------------------------------------------------------------------
 
+const MAX_UNRECOVERABLE_FAILURES = 3;
+
+function isUnrecoverableError(err: unknown): boolean {
+  if (
+    err instanceof TypeError ||
+    err instanceof RangeError ||
+    err instanceof SyntaxError ||
+    err instanceof URIError
+  ) {
+    return true;
+  }
+  if (
+    err instanceof Error &&
+    (err.name === "PerihelionValidationError" || err.name === "ValidationError")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export class Solver {
   private readonly client: PerihelionClient;
+  private consecutiveUnrecoverableFailures = 0;
 
   /**
    * `seen` tracks hashes whose outcome is terminal (filled, or exhausted
@@ -314,10 +359,20 @@ export class Solver {
    * Capacity defaults to {@link SolverConfig.retryCacheSize} (10,000).
    */
   private readonly retryState: RetryStateLRU;
+  private consecutiveImplausibleTriggers = 0;
   private running = false;
   private readonly backoff: BackoffState;
   /** Resolves an in-progress interruptibleSleep early when stop() is called. */
   private abortSleep: (() => void) | null = null;
+
+  /** Readiness state snapshot for orchestrator checks. */
+  readonly readiness: SolverReadinessState = {
+    lastTickOk: false,
+    lastTickAt: 0,
+    consecutiveFailures: 0,
+    seenCount: 0,
+    retryStateCount: 0,
+  };
 
   constructor(
     private readonly config: SolverConfig,
@@ -354,10 +409,30 @@ export class Solver {
       try {
         await this.tick();
         this.backoff.recordSuccess();
+        this.consecutiveUnrecoverableFailures = 0;
       } catch (err) {
+        this.readiness.lastTickOk = false;
+        this.readiness.consecutiveFailures = this.backoff.consecutiveFailures + 1;
+        this.readiness.seenCount = this.seen.size();
+        this.readiness.retryStateCount = this.retryState.size();
         if (err instanceof FatalError) {
           this.log.error("fatal error, solver stopping", { err: String(err) });
           throw err;
+        }
+        if (isUnrecoverableError(err)) {
+          this.consecutiveUnrecoverableFailures += 1;
+          if (this.consecutiveUnrecoverableFailures >= MAX_UNRECOVERABLE_FAILURES) {
+            this.log.error("repeated unrecoverable error in poll loop, escalating to fatal", {
+              err: String(err),
+              consecutiveUnrecoverableFailures: this.consecutiveUnrecoverableFailures,
+            });
+            throw new FatalError(
+              `Repeated unrecoverable error in poll loop: ${String(err)}`,
+              err,
+            );
+          }
+        } else {
+          this.consecutiveUnrecoverableFailures = 0;
         }
         this.backoff.recordFailure();
         this.log.error("tick failed", {
@@ -512,7 +587,25 @@ export class Solver {
       this.inFlight,
     );
     if (!decision.fill) {
-      if (decision.nativeShortfall) {
+      if (decision.implausibleProfit) {
+        this.consecutiveImplausibleTriggers += 1;
+        this.log.error(
+          "skipping intent: implausible profit exceeds sanity bound — possible decimals/pricing misconfiguration",
+          {
+            hash,
+            profitBps: decision.profitBps,
+            maxPlausibleProfitBps: this.config.maxPlausibleProfitBps ?? 1000,
+            consecutiveTriggers: this.consecutiveImplausibleTriggers,
+          },
+        );
+        this.metrics?.recordImplausibleProfitTrigger?.();
+        const maxTriggers = this.config.maxImplausibleProfitTriggers ?? 5;
+        if (this.consecutiveImplausibleTriggers >= maxTriggers) {
+          throw new FatalError(
+            `Solver halted: repeated implausible profit triggers (${this.consecutiveImplausibleTriggers}) exceeded limit (${maxTriggers}) — check pricing configuration`,
+          );
+        }
+      } else if (decision.nativeShortfall) {
         // Operator-actionable and affects every intent, not just this one —
         // log at error level so it pages rather than scrolling past as info.
         this.log.error("skipping intent: native balance shortfall — solver cannot fund a fill leg", {
@@ -522,7 +615,7 @@ export class Solver {
       } else {
         this.log.info("skipping intent", { hash, reason: decision.reason });
       }
-      this.metrics?.recordSkip(decision.reason);
+      this.metrics?.recordSkip(decision.code ?? decision.reason);
       // Terminal: this intent will never become fillable (wrong chain,
       // expired, unsupported asset, reserved for another solver, ...).
       // Without this, evaluate() re-derives the same terminal verdict
@@ -534,35 +627,74 @@ export class Solver {
       return false;
     }
 
-    this.log.info("filling intent", { hash, profitBps: decision.profitBps });
+    this.consecutiveImplausibleTriggers = 0;
+    // A retry resumes from the executor's persisted per-intent stage: if a
+    // previous attempt already locked on the EVM escrow, `fill` skips the lock
+    // and proceeds straight to the registration wait / Soroban leg instead of
+    // re-submitting `lock` (which would revert with `AlreadyLocked`).
+    const retry = this.retryState.get(hash);
+    this.log.info("filling intent", {
+      hash,
+      profitBps: decision.profitBps,
+      attempt: (retry?.attempts ?? 0) + 1,
+    });
     this.metrics?.recordFillAttempt(intent.destAsset);
     const reserved = BigInt(intent.minDestAmount);
     this.inFlight.reserve(intent.destAsset, reserved);
     let fillSucceeded = false;
     let caughtErr: unknown = undefined;
     try {
-      const { settlementTx } = await this.executor.fill(record);
+      const settlement = await this.executor.fill(record);
+      const { settlementTx } = settlement;
       fillSucceeded = true;
       this.log.info("filled", { hash, settlementTx });
+      const profitUnits =
+        decision.estimatedProfitSmallestUnits ??
+        (BigInt(intent.minDestAmount) * BigInt(decision.profitBps ?? 0)) / 10_000n;
       this.metrics?.recordFillWon(
         intent.destAsset,
-        BigInt(intent.minDestAmount),
-        decision.profitBps ?? 0,
+        profitUnits,
+        decision.estimatedFeeSmallestUnits,
       );
+      if (settlement.fees) {
+        if (this.metrics?.recordFees) {
+          this.metrics.recordFees(settlement.fees);
+        } else if (settlement.fees.sourceGasWei) {
+          this.metrics?.recordFee(settlement.fees.sourceGasWei);
+        }
+      }
       // Terminal: filled successfully.
       this.seen.add(hash, deadlineMs);
       this.retryState.delete(hash);
-      // Best-effort: report "settled" to the mempool so the record leaves
+      // Best-effort: report "filled" to the mempool so the record leaves
       // "pending" immediately rather than waiting for deadline eviction.
+      // "filled" is deliberately *not* terminal: at this point we have only
+      // delivered on Stellar — the source-chain escrow has not released yet,
+      // and the LayerZero message may still be in flight, be rejected, or
+      // lose the race with cancelExpired. A separate watcher that observes
+      // the EVM `Released` event promotes the record to "settled".
       // A failed report must never fail or retry the fill — the on-chain
       // settlement already succeeded.
-      await this.reportSettled(hash);
+      await this.reportFilled(hash);
     } catch (err) {
       caughtErr = err;
       if (err instanceof FatalError) throw err;
-      this.log.error("fill failed", { hash, err: String(err) });
-      this.metrics?.recordFillLost(intent.destAsset, String(err));
-      this.scheduleRetry(hash, deadlineMs);
+      if (err instanceof LockOwnedByOtherError) {
+        // The escrow already holds a lock for this intent owned by another
+        // solver: this solver can never complete the fill, so retire the
+        // intent as lost instead of retrying until the budget is exhausted.
+        this.log.warn("retiring intent: locked by another solver", {
+          hash,
+          owner: err.owner,
+        });
+        this.metrics?.recordFillLost(intent.destAsset, "locked_by_other_solver");
+        this.seen.add(hash, deadlineMs);
+        this.retryState.delete(hash);
+      } else {
+        this.log.error("fill failed", { hash, err: String(err) });
+        this.metrics?.recordFillLost(intent.destAsset, String(err));
+        this.scheduleRetry(hash, deadlineMs);
+      }
     } finally {
       if (fillSucceeded) {
         // Successful fill: the capital has left the account on-chain but the
@@ -573,8 +705,13 @@ export class Solver {
         this.inFlight.holdForRefresh(intent.destAsset, reserved);
       } else if (caughtErr instanceof DefiniteFailureError) {
         // Definite failure (on-chain revert / rejection): the transaction
-        // never landed so the capital was never spent.  Release immediately
-        // so the next intent can use the same balance.
+        // never landed so the capital was never spent.  Release the
+        // InFlightTracker reservation in the same tick so the next intent can
+        // use the same balance immediately, rather than holding it until the
+        // next refresh.  The executor is responsible for wrapping definite
+        // failures (simulation errors, sendTransaction ERROR, FAILED tx
+        // results, pre-broadcast reverts) in DefiniteFailureError; anything
+        // else (timeouts, unknown errors) is treated as indefinite below.
         this.inFlight.release(intent.destAsset, reserved);
       } else {
         // Indefinite failure (timeout, network error, etc.): the transaction
@@ -587,29 +724,44 @@ export class Solver {
   }
 
   /**
-   * Best-effort: report `"settled"` to the mempool after a successful fill.
+   * Best-effort: report `"filled"` to the mempool after a successful fill.
    * Errors are logged and swallowed — a failed status report must never
    * affect the on-chain outcome or retry logic.
+   *
+   * `"filled"` is an intermediate, non-terminal status: it means the solver
+   * has delivered on Stellar but the source-chain escrow has not released
+   * yet. Only a component that observes the EVM `Released` event may report
+   * `"settled"`, so a user whose release fails is not shown a completed
+   * bridge and is not steered away from the refund path.
    *
    * Only called when {@link SolverConfig.mempoolStatusToken} is configured.
    * Without a token the PATCH endpoint requires no auth in local/dev setups,
    * but we skip reporting entirely when the operator has not provided one to
    * avoid noisy 401s in production environments that do require auth.
    */
-  private async reportSettled(hash: Hex): Promise<void> {
+  private async reportFilled(hash: Hex): Promise<void> {
     const token = this.config.mempoolStatusToken;
     if (!token) return;
     try {
-      await this.client.reportStatus(hash, "settled" satisfies MempoolIntentStatus, token);
-      this.log.info("reported settled to mempool", { hash });
+      await this.client.reportStatus(hash, "filled" satisfies MempoolIntentStatus, token);
+      this.log.info("reported filled to mempool", { hash });
     } catch (err) {
-      this.log.warn("failed to report settled to mempool (non-fatal)", {
+      this.log.warn("failed to report filled to mempool (non-fatal)", {
         hash,
         err: String(err),
       });
     }
   }
 
+  /**
+   * Schedule a retry of a failed fill.
+   *
+   * The retry does **not** restart at `lock`: the executor persists per-intent
+   * progress, so a retry after a successful lock resumes at the registration
+   * wait / Soroban leg (see {@link Executor.fill}). This is what makes a
+   * partial failure — lock landed, Soroban leg failed — recoverable with
+   * exactly one `lock` transaction.
+   */
   private scheduleRetry(hash: string, deadlineMs: number): void {
     const state = this.retryState.get(hash) ?? { attempts: 0, nextRetryAt: 0 };
     const attempts = state.attempts + 1;
@@ -618,6 +770,13 @@ export class Solver {
       this.seen.add(hash, deadlineMs);
       this.retryState.delete(hash);
     } else {
+      this.log.info("scheduling fill retry", {
+        hash,
+        attempts,
+        // The executor resumes from its persisted stage; surface it so
+        // operators can see where the intent is stalling.
+        stage: this.executor.stage?.(hash) ?? "unknown",
+      });
       this.retryState.set(
         hash,
         { attempts, nextRetryAt: Date.now() + retryBackoff(attempts - 1) },

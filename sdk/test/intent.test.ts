@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { privateKeyToAccount } from "viem/accounts";
 import { createWalletClient, http, zeroAddress } from "viem";
+import type { PublicClient } from "viem";
 import { base } from "viem/chains";
 import {
   buildIntent,
@@ -126,6 +127,127 @@ test("verifyIntent rejects a 64-byte EIP-2098 compact re-encoding of an otherwis
   assert.equal(await verifyIntent(intent, compact, DOMAIN), false);
 });
 
+// ---------------------------------------------------------------------------
+// Issue #932 — ERC-1271 contract-wallet signature verification
+// ---------------------------------------------------------------------------
+
+const ERC1271_MAGIC = "0x1626ba7e";
+const ERC1271_INVALID = "0xffffffff";
+const CONTRACT_WALLET = "0x9999999999999999999999999999999999999999" as const;
+
+/**
+ * Build a stubbed PublicClient that reports `code` for `getCode` and returns
+ * `magic` from `readContract` (the ERC-1271 isValidSignature call).
+ */
+function stubPublicClient(opts: {
+  code: `0x${string}`;
+  magic: `0x${string}`;
+  onRead?: (args: unknown) => void;
+}): PublicClient {
+  return {
+    getCode: async () => opts.code,
+    readContract: async (args: unknown) => {
+      opts.onRead?.(args);
+      return opts.magic;
+    },
+  } as unknown as PublicClient;
+}
+
+test("#932 verifyIntent accepts an ERC-1271 contract-wallet signature", async () => {
+  const intent = { ...sampleIntent(), user: CONTRACT_WALLET };
+  const digest = hashIntent(intent, DOMAIN);
+  let readArgs: any;
+  const publicClient = stubPublicClient({
+    code: "0x6001600155", // non-empty runtime code => contract account
+    magic: ERC1271_MAGIC,
+    onRead: (args) => {
+      readArgs = args;
+    },
+  });
+
+  const signature = "0xdeadbeef" as `0x${string}`;
+  assert.equal(await verifyIntent(intent, signature, DOMAIN, { publicClient }), true);
+
+  // The SDK must call isValidSignature(digest, signature) on the intent.user.
+  assert.ok(readArgs, "expected readContract to be called for a contract user");
+  assert.equal(readArgs.address, CONTRACT_WALLET);
+  assert.equal(readArgs.functionName, "isValidSignature");
+  assert.deepEqual(readArgs.args, [digest, signature]);
+});
+
+test("#932 verifyIntent rejects an invalid ERC-1271 signature", async () => {
+  const intent = { ...sampleIntent(), user: CONTRACT_WALLET };
+  const publicClient = stubPublicClient({
+    code: "0x6001600155",
+    magic: ERC1271_INVALID, // not the magic value
+  });
+
+  assert.equal(
+    await verifyIntent(intent, "0xdeadbeef" as `0x${string}`, DOMAIN, { publicClient }),
+    false,
+  );
+});
+
+test("#932 verifyIntent rejects an ERC-1271 signature when the wallet call reverts", async () => {
+  const intent = { ...sampleIntent(), user: CONTRACT_WALLET };
+  const publicClient = {
+    getCode: async () => "0x6001600155",
+    readContract: async () => {
+      throw new Error("execution reverted");
+    },
+  } as unknown as PublicClient;
+
+  assert.equal(
+    await verifyIntent(intent, "0xdeadbeef" as `0x${string}`, DOMAIN, { publicClient }),
+    false,
+  );
+});
+
+test("#932 verifyIntent keeps the ECDSA path for EOA users (no contract call)", async () => {
+  const intent = sampleIntent();
+  const client = new PerihelionClient({
+    mempoolUrl: "http://localhost",
+    chainId: CHAIN_ID,
+    verifyingContract: CONTRACT_ADDRESS,
+  });
+  const wallet = createWalletClient({ account, chain: base, transport: http() });
+  const signed = await client.signIntent(wallet, intent);
+
+  let readCalled = false;
+  const publicClient = {
+    getCode: async () => "0x", // EOA: no code
+    readContract: async () => {
+      readCalled = true;
+      return ERC1271_MAGIC;
+    },
+  } as unknown as PublicClient;
+
+  assert.equal(await verifyIntent(intent, signed.signature, DOMAIN, { publicClient }), true);
+  assert.equal(readCalled, false, "ECDSA path must not invoke isValidSignature");
+});
+
+test("#932 verifyIntent agrees with the contract harness for ERC-1271 wallets", async () => {
+  // Mirrors PerihelionEscrow._verify: contract user => accept iff
+  // isValidSignature returns the magic value; EOA user => ECDSA recovery.
+  const contractHarness = (isContract: boolean, magic: `0x${string}`): boolean =>
+    isContract ? magic.toLowerCase() === ERC1271_MAGIC : false;
+
+  const intent = { ...sampleIntent(), user: CONTRACT_WALLET };
+
+  const validClient = stubPublicClient({ code: "0x6001600155", magic: ERC1271_MAGIC });
+  const invalidClient = stubPublicClient({ code: "0x6001600155", magic: ERC1271_INVALID });
+
+  const sdkValid = await verifyIntent(intent, "0xdeadbeef" as `0x${string}`, DOMAIN, {
+    publicClient: validClient,
+  });
+  const sdkInvalid = await verifyIntent(intent, "0xdeadbeef" as `0x${string}`, DOMAIN, {
+    publicClient: invalidClient,
+  });
+
+  assert.equal(sdkValid, contractHarness(true, ERC1271_MAGIC));
+  assert.equal(sdkInvalid, contractHarness(true, ERC1271_INVALID));
+});
+
 test("verifyIntent rejects a 65-byte signature with a high-s (malleated) value", async () => {
   const intent = sampleIntent();
   const client = new PerihelionClient({
@@ -242,7 +364,7 @@ test("buildIntent warns for a 6-decimal (USDC) amount just below the default V_m
         sourceAmount: "9999999", // $9.999999 at 6dp — just under the $10 default V_min
         destAsset: VALID_DEST_ASSET,
         minDestAmount: "9000000",
-        deadline: 4102444800,
+        deadline: FUTURE_DEADLINE,
       },
       { sourceDecimals: 6 }
     );
@@ -270,7 +392,7 @@ test("buildIntent warns for the economically-equivalent 18-decimal (WETH) amount
         sourceAmount: "9999999000000000000",
         destAsset: VALID_DEST_ASSET,
         minDestAmount: "9000000",
-        deadline: 4102444800,
+        deadline: FUTURE_DEADLINE,
       },
       { sourceDecimals: 18 }
     );
@@ -299,7 +421,7 @@ test("buildIntent does not warn at the exact V_min boundary for an 18-decimal as
         sourceAmount: "10000000000000000000",
         destAsset: VALID_DEST_ASSET,
         minDestAmount: "9000000",
-        deadline: 4102444800,
+        deadline: FUTURE_DEADLINE,
       },
       { sourceDecimals: 18 }
     );
@@ -324,7 +446,7 @@ test("buildIntent does not warn for an 18-decimal amount comfortably above V_min
         sourceAmount: "1000000000000000000000", // 1000 token-units @ 18dp — normalizes to $1000
         destAsset: VALID_DEST_ASSET,
         minDestAmount: "900000",
-        deadline: 4102444800,
+        deadline: FUTURE_DEADLINE,
       },
       { sourceDecimals: 18 }
     );
@@ -355,7 +477,7 @@ test("validateIntent rejects a destination with an invalid CRC-16 checksum", () 
       sourceAmount: "1000000",
       destAsset: VALID_DEST_ASSET,
       minDestAmount: "900000",
-      deadline: 4102444800,
+      deadline: FUTURE_DEADLINE,
     });
     assert.fail("expected validateIntent to throw for a bad destination checksum");
   } catch (err) {
@@ -378,7 +500,7 @@ test("validateIntent rejects a destAsset whose issuer has an invalid CRC-16 chec
       sourceAmount: "1000000",
       destAsset: `USDC:${badChecksumIssuer}`,
       minDestAmount: "900000",
-      deadline: 4102444800,
+      deadline: FUTURE_DEADLINE,
     });
     assert.fail("expected validateIntent to throw for a bad destAsset issuer checksum");
   } catch (err) {
@@ -401,7 +523,7 @@ test("buildIntent rejects a destination with an invalid checksum via validateInt
       sourceAmount: "1000000",
       destAsset: VALID_DEST_ASSET,
       minDestAmount: "900000",
-      deadline: 4102444800,
+      deadline: FUTURE_DEADLINE,
     });
     assert.fail("expected buildIntent to throw for a bad destination checksum");
   } catch (err) {

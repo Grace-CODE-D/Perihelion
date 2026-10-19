@@ -8,27 +8,33 @@
 //! chain. All payloads use the fixed big-endian binary layout from the
 //! architecture spec §3.3 so they decode identically in Solidity and Rust.
 //!
-//! ## Why the inbound decoders below are `#[allow(dead_code)]`
+//! ## Where the inbound decoders run
 //!
-//! `Perihelion::lz_receive` (`lib.rs`) takes an already-typed `LzMessage`
-//! argument, not raw `Bytes` — Soroban's native contract-call ABI marshals
-//! the argument, so the settlement contract itself never parses the
-//! EVM-encoded wire bytes directly. `decode_message`/`decode_fill_instruction`/
-//! `decode_cancel_intent` define and pin the inbound half of the wire format
-//! (mirroring the outbound `encode_*` functions, which *are* used by
-//! `lz_receive`'s dispatch of `FillConfirmed`/`CancelIntent`) for whatever
-//! adapter eventually bridges raw LayerZero calldata to a typed contract
-//! call — endpoint.rs is presently a mock (see docs/differential-fuzzing.md).
-//! Until then, their only callers are `fuzz.rs`'s specification-derived and
-//! round-trip tests, which is real, load-bearing usage the plain (non-test)
-//! `cdylib` build target can't see.
+//! The inbound half of the wire format is implemented by
+//! `decode_message`/`decode_fill_instruction`/`decode_cancel_intent` and their
+//! `read_field` helper. They are `pub` and are called by
+//! `Perihelion::lz_receive_bytes` (`lib.rs`), the raw-`Bytes` entrypoint:
+//! `lz_receive` remains the typed entrypoint for an endpoint that marshals a
+//! `LzMessage` argument through the Soroban ABI, while `lz_receive_bytes`
+//! accepts the unmodified LayerZero `message` bytes, decodes them here, and
+//! hands the result to the same pause gate, nonce guard and handlers. Both
+//! entrypoints authenticate the endpoint and the registered peer before any
+//! bytes are parsed.
+//!
+//! Because a production entrypoint calls them, these decoders are no longer
+//! dead code — they are compiled into the release `cdylib`, and the
+//! differential fuzzer (`fuzz.rs`) exercises the very functions that parse
+//! attacker-controlled inbound bytes. `endpoint.rs` is still a mock, so the
+//! LayerZero adapter that will deliver those bytes does not exist yet; see
+//! `docs/differential-fuzzing.md` for the verified scope.
 
 use soroban_sdk::{Address, Bytes, BytesN, Env};
 
+use crate::strkey;
 use crate::types::{
-    CancelInstruction, FillInstruction, CANCEL_REASON_ADMIN, CANCEL_REASON_EXPIRED,
-    CANCEL_REASON_INVALID, MSG_CANCEL_INTENT, MSG_FILL_CONFIRMED, MSG_FILL_INSTRUCTION,
-    FILL_INSTRUCTION_LENGTH, PROTOCOL_VERSION,
+    CancelInstruction, FillInstruction, CANCEL_INTENT_LENGTH, CANCEL_REASON_ADMIN,
+    CANCEL_REASON_EXPIRED, CANCEL_REASON_INVALID, FILL_CONFIRMED_LENGTH, FILL_INSTRUCTION_LENGTH,
+    MSG_CANCEL_INTENT, MSG_FILL_CONFIRMED, MSG_FILL_INSTRUCTION, PROTOCOL_VERSION,
 };
 
 /// Build an `Address` from a raw 32-byte contract-id payload.
@@ -52,7 +58,10 @@ use crate::types::{
 /// values the wire-vector README's canonical table specifies, for
 /// specification-derived (not just implementation-derived) test coverage.
 ///
-/// See the module doc-comment for why this is only reachable from tests.
+/// Only the test and fuzz modules build `Address` values this way; the live
+/// inbound path decodes the 56-byte strkey text field with
+/// [`decode_strkey_address`] instead, so this helper stays `#[allow(dead_code)]`
+/// for non-test builds.
 #[allow(dead_code)]
 pub(crate) fn address_from_contract_id(env: &Env, id: [u8; 32]) -> Address {
     let strkey = crate::strkey::contract_strkey(&id);
@@ -60,7 +69,7 @@ pub(crate) fn address_from_contract_id(env: &Env, id: [u8; 32]) -> Address {
     Address::from_str(env, strkey_str)
 }
 
-/// Encode a `FillConfirmed` payload (90 bytes):
+/// Encode a `FillConfirmed` payload (FILL_CONFIRMED_LENGTH bytes):
 /// `version(1) | type(1) | intent_hash(32) | solver_evm(32) | amount(16) | ledger(8)`.
 ///
 /// ## Field authority
@@ -125,7 +134,7 @@ pub fn encode_fill_confirmed(
     b
 }
 
-/// Encode a `CancelIntent` payload (35 bytes):
+/// Encode a `CancelIntent` payload (CANCEL_INTENT_LENGTH bytes):
 /// `version(1) | type(1) | intent_hash(32) | reason(1)`.
 pub fn encode_cancel_intent(env: &Env, intent_hash: &BytesN<32>, reason: u8) -> Bytes {
     let mut b = Bytes::new(env);
@@ -137,8 +146,6 @@ pub fn encode_cancel_intent(env: &Env, intent_hash: &BytesN<32>, reason: u8) -> 
 }
 
 /// Read a fixed-size big-endian field out of `message` at `offset`.
-/// See the module doc-comment for why this is only reachable from tests.
-#[allow(dead_code)]
 fn read_field<const N: usize>(
     message: &Bytes,
     offset: u32,
@@ -156,8 +163,10 @@ fn read_field<const N: usize>(
 /// Decode an inbound message payload. Returns the message type discriminant and
 /// parsed message, or an error if the payload is malformed.
 /// Validates version and routes to the appropriate decoder.
-/// See the module doc-comment for why this is only reachable from tests.
-#[allow(dead_code)]
+///
+/// Called by `Perihelion::lz_receive_bytes` on every raw inbound message, and by
+/// the differential-fuzz harness, so the fuzzed codec and the live codec are the
+/// same code (issue #722).
 pub fn decode_message(
     env: &Env,
     message: &Bytes,
@@ -183,10 +192,10 @@ pub fn decode_message(
         }
         MSG_CANCEL_INTENT => {
             let ci = decode_cancel_intent(env, message)?;
-            // Return a dummy FillInstruction with the intent_hash from cancel for union type compat.
-            // Use the zero-account strkey as a placeholder — decode_message is not called on the
-            // hot path (lib.rs routes FillInstruction and CancelIntent separately); this dummy
-            // exists only for API symmetry.
+            // Return a dummy FillInstruction carrying the cancel's intent_hash so the
+            // decoder keeps one return shape. The zero-account strkey is a
+            // placeholder: callers that handle CancelIntent read the third element
+            // and ignore this one.
             let zero_addr = Address::from_str(
                 env,
                 "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -199,16 +208,17 @@ pub fn decode_message(
                 min_dest_amount: 0,
                 deadline: 0,
                 preferred_solver: None,
+                locked_solver: None,
                 reservation_window: 0,
             };
             Ok((msg_type, dummy, Some(ci)))
         }
-        _ => Err(PerihelionError::MalformedPayload),
+        _ => Err(PerihelionError::UnknownMessageType),
     }
 }
 
-/// Decode a `FillInstruction` payload (227 bytes):
-/// `version(1) | type(1) | intent_hash(32) | src_eid(4) | recipient(56) | dest_asset(69) | min_dest_amount(16) | deadline(8) | preferred_solver(32) | reservation_window(8)`.
+/// Decode the canonical `FillInstruction` payload (227 bytes):
+/// `version(1) | type(1) | intent_hash(32) | src_eid(4) | recipient(56) | dest_asset(69) | min_dest_amount(16) | deadline(8) | locked_solver(32) | reservation_window(8)`.
 ///
 /// # Address decoding
 ///
@@ -219,24 +229,24 @@ pub fn decode_message(
 /// must not decode an asset identifier as a Soroban `Address`. The recipient
 /// remains a Soroban `Address` and is decoded from its 56-byte strkey field.
 ///
-/// # preferred_solver
+/// # solver identity and preferred solver
 ///
-/// The EVM side encodes `preferredSolver` as a 20-byte EVM address left-padded
-/// to 32 bytes. This is not a Stellar strkey and cannot be decoded as a Soroban
-/// `Address`. The field is therefore left as `None` — the preferred-solver
-/// reservation mechanism for cross-chain intents requires a dedicated design
-/// (tracked as a follow-up to #271). The trailing `reservation_window` field is
-/// explicit on the wire and is decoded as a big-endian `u64`.
+/// The EVM side encodes the canonical locking solver as a 20-byte EVM address
+/// left-padded to 32 bytes. This is not a Stellar strkey and cannot be decoded
+/// as a Soroban `Address`, so it is preserved as `locked_solver` and must be
+/// echoed by the solver in `fill_intent`. The separate user `preferredSolver`
+/// reservation remains unset by this adapter until its cross-chain representation
+/// is specified. The trailing `reservation_window` field is explicit on the wire
+/// and is decoded as a big-endian `u64`.
 ///
-/// See the module doc-comment for why this is only reachable from tests.
-#[allow(dead_code)]
 fn decode_fill_instruction(
     env: &Env,
     message: &Bytes,
 ) -> Result<FillInstruction, crate::PerihelionError> {
     use crate::PerihelionError;
 
-    // Validate length: 2 (header) + 217 (payload) = 219
+    // Release delivery accepts only the canonical fixed-width payload. The
+    // historical 219-byte layout is intentionally not a production decode path.
     if message.len() != FILL_INSTRUCTION_LENGTH {
         return Err(PerihelionError::MalformedPayload);
     }
@@ -252,8 +262,8 @@ fn decode_fill_instruction(
     // Extract recipient (offset 38, 56 bytes): ASCII strkey characters right-zero-padded.
     // Strip trailing zeros and decode as a Stellar strkey (G... or C...).
     let mut recipient_raw = [0u8; 56];
-    for i in 0..56 {
-        recipient_raw[i] = message
+    for (i, byte) in recipient_raw.iter_mut().enumerate() {
+        *byte = message
             .get(38 + i as u32)
             .ok_or(PerihelionError::MalformedPayload)?;
     }
@@ -263,8 +273,8 @@ fn decode_fill_instruction(
     // The field is 69 bytes wide (not 32) so CODE:ISSUER assets survive the wire
     // without truncation — see #270. Strip trailing zeros and decode.
     let mut dest_asset_raw = [0u8; 69];
-    for i in 0..69 {
-        dest_asset_raw[i] = message
+    for (i, byte) in dest_asset_raw.iter_mut().enumerate() {
+        *byte = message
             .get(94 + i as u32)
             .ok_or(PerihelionError::MalformedPayload)?;
     }
@@ -272,8 +282,8 @@ fn decode_fill_instruction(
 
     // Extract min_dest_amount (offset 163, 16 bytes, big-endian)
     let mut min_dest_amount_bytes = [0u8; 16];
-    for i in 0..16 {
-        min_dest_amount_bytes[i] = message
+    for (i, byte) in min_dest_amount_bytes.iter_mut().enumerate() {
+        *byte = message
             .get(163 + i as u32)
             .ok_or(PerihelionError::MalformedPayload)?;
     }
@@ -284,20 +294,22 @@ fn decode_fill_instruction(
 
     // Extract deadline (offset 179, 8 bytes, big-endian)
     let mut deadline_bytes = [0u8; 8];
-    for i in 0..8 {
-        deadline_bytes[i] = message
+    for (i, byte) in deadline_bytes.iter_mut().enumerate() {
+        *byte = message
             .get(179 + i as u32)
             .ok_or(PerihelionError::MalformedPayload)?;
     }
     let deadline = u64::from_be_bytes(deadline_bytes);
 
-    // preferred_solver occupies offset 187, 32 bytes.
-    // The EVM side writes a 20-byte EVM address left-padded to 32 bytes — this
-    // is not a valid Stellar strkey, and cannot be decoded as a Soroban Address.
-    // For now, preferred_solver is omitted from the decoded struct; an all-zero
-    // slot already means "open" (no reservation). Cross-chain preferred-solver
-    // semantics are a follow-up to #271.
-    let preferred_solver = None;
+    // Offset 187 is the canonical 32-byte EVM identity of the solver that
+    // locked the source escrow. Preserve it verbatim; it is not a Stellar
+    // Address and must never be converted through strkey parsing.
+    let solver_word = read_field::<32>(message, 187)?;
+    let locked_solver = if solver_word == [0u8; 32] {
+        None
+    } else {
+        Some(BytesN::from_array(env, &solver_word))
+    };
 
     Ok(FillInstruction {
         intent_hash,
@@ -306,7 +318,9 @@ fn decode_fill_instruction(
         dest_asset,
         min_dest_amount,
         deadline,
-        preferred_solver,
+        preferred_solver: None,
+        locked_solver,
+        // Canonical 227-byte layout: read the explicit 8-byte field at offset 219.
         reservation_window: u64::from_be_bytes(read_field::<8>(message, 219)?),
     })
 }
@@ -318,15 +332,24 @@ fn decode_fill_instruction(
 /// the last non-zero byte, takes the prefix as the strkey string, and converts
 /// it using `Address::from_string_bytes` which handles both account keys (G...)
 /// and contract keys (C...) without reinterpreting raw bytes as a contract id.
+///
+/// `Address::from_string_bytes` traps the host on invalid input rather than
+/// returning an error, so the strkey is fully validated first (length, prefix,
+/// alphabet, version byte and CRC16). Any failure is `MalformedPayload` (issue #902).
 fn decode_strkey_address(env: &Env, padded: &[u8]) -> Result<Address, crate::PerihelionError> {
     use crate::PerihelionError;
     // Find length by trimming trailing zero bytes.
-    let len = padded.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
-    if len == 0 {
+    let len = padded
+        .iter()
+        .rposition(|&b| b != 0)
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let strkey_bytes = &padded[..len];
+    if !strkey::is_valid_strkey(strkey_bytes) {
         return Err(PerihelionError::MalformedPayload);
     }
     let mut b = Bytes::new(env);
-    for &byte in &padded[..len] {
+    for &byte in strkey_bytes {
         b.push_back(byte);
     }
     // from_string_bytes accepts both G... (account) and C... (contract) strkeys.
@@ -373,15 +396,20 @@ pub(crate) fn encode_fill_instruction(env: &Env, fi: &FillInstruction) -> Bytes 
         &(fi.min_dest_amount as u128).to_be_bytes(),
     ));
     b.append(&Bytes::from_array(env, &fi.deadline.to_be_bytes()));
-    b.append(&Bytes::from_array(env, &[0u8; 32]));
-    b.append(&Bytes::from_array(env, &fi.reservation_window.to_be_bytes()));
+    if let Some(ref locked_solver) = fi.locked_solver {
+        b.append(&Bytes::from_array(env, &locked_solver.to_array()));
+    } else {
+        b.append(&Bytes::from_array(env, &[0u8; 32]));
+    }
+    b.append(&Bytes::from_array(
+        env,
+        &fi.reservation_window.to_be_bytes(),
+    ));
     b
 }
 
-/// Decode a `CancelIntent` payload (35 bytes):
+/// Decode a `CancelIntent` payload (CANCEL_INTENT_LENGTH bytes):
 /// `version(1) | type(1) | intent_hash(32) | reason(1)`.
-/// See the module doc-comment for why this is only reachable from tests.
-#[allow(dead_code)]
 fn decode_cancel_intent(
     env: &Env,
     message: &Bytes,
@@ -389,7 +417,7 @@ fn decode_cancel_intent(
     use crate::PerihelionError;
 
     // Validate length: 2 (header) + 33 (payload) = 35
-    if message.len() != 35 {
+    if message.len() != CANCEL_INTENT_LENGTH {
         return Err(PerihelionError::MalformedPayload);
     }
 
@@ -417,9 +445,10 @@ fn decode_cancel_intent(
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use std::string::ToString;
 
     use super::*;
+    use crate::fuzz::decode_hex;
+    use crate::PerihelionError;
 
     // A known valid G... account strkey (all-zeros account).
     const ZERO_ACCOUNT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -430,26 +459,24 @@ mod tests {
     #[test]
     fn test_decode_strkey_address_g_key() {
         let env = Env::default();
-        let mut buf = [0u8; 32];
-        let strkey = ZERO_ACCOUNT.as_bytes();
-        let copy_len = strkey.len().min(32);
-        buf[..copy_len].copy_from_slice(&strkey[..copy_len]);
+        let mut buf = [0u8; 56];
+        buf.copy_from_slice(ZERO_ACCOUNT.as_bytes());
 
         let addr = decode_strkey_address(&env, &buf).expect("should decode G... strkey");
         // Round-trip: the decoded Address should re-encode to the same strkey.
-        let roundtrip = addr.to_string().to_string();
-        assert_eq!(&roundtrip[..copy_len], &ZERO_ACCOUNT[..copy_len]);
+        // `Address::to_string` already returns a `soroban_sdk::String`, and that
+        // type has no `Index`/`Deref`-to-`str`, so the comparison stays in the
+        // SDK's own string domain instead of converting out of it.
+        let roundtrip = addr.to_string();
+        assert_eq!(roundtrip, soroban_sdk::String::from_str(&env, ZERO_ACCOUNT));
     }
 
     /// decode_strkey_address correctly decodes a C... strkey from a zero-padded buffer.
     #[test]
     fn test_decode_strkey_address_c_key() {
         let env = Env::default();
-        let strkey = ZERO_CONTRACT.as_bytes();
-        // The C... strkey is 56 bytes, fits in a 56-byte padded field; use 32 for this test.
-        let copy_len = strkey.len().min(32);
-        let mut buf = [0u8; 32];
-        buf[..copy_len].copy_from_slice(&strkey[..copy_len]);
+        let mut buf = [0u8; 56];
+        buf.copy_from_slice(ZERO_CONTRACT.as_bytes());
 
         // Should not panic — from_string_bytes handles C... keys.
         let addr = decode_strkey_address(&env, &buf).expect("should decode C... strkey");
@@ -460,9 +487,53 @@ mod tests {
     #[test]
     fn test_decode_strkey_address_empty_returns_error() {
         let env = Env::default();
-        let buf = [0u8; 32];
+        let buf = [0u8; 56];
         let result = decode_strkey_address(&env, &buf);
-        assert!(result.is_err());
+        assert_eq!(result.err(), Some(PerihelionError::MalformedPayload));
+    }
+
+    /// Negative vectors for issue #902: each malformed strkey must come back as
+    /// `MalformedPayload` from the decoder, never as a host trap.
+    #[test]
+    fn test_decode_strkey_address_malformed_vectors_return_error() {
+        let env = Env::default();
+        let valid = ZERO_ACCOUNT.as_bytes();
+
+        // Bad checksum: last character changed, prefix and alphabet still valid.
+        let mut bad_checksum = [0u8; 56];
+        bad_checksum.copy_from_slice(valid);
+        bad_checksum[55] = b'A';
+        assert_eq!(
+            decode_strkey_address(&env, &bad_checksum).err(),
+            Some(PerihelionError::MalformedPayload)
+        );
+
+        // Wrong version byte: the prefix is swapped to G over a contract payload,
+        // so the version byte and the checksum no longer agree.
+        let mut wrong_version = [0u8; 56];
+        wrong_version.copy_from_slice(ZERO_CONTRACT.as_bytes());
+        wrong_version[0] = b'G';
+        assert_eq!(
+            decode_strkey_address(&env, &wrong_version).err(),
+            Some(PerihelionError::MalformedPayload)
+        );
+
+        // Interior NUL: a zero byte inside the strkey, followed by more characters.
+        let mut interior_nul = [0u8; 56];
+        interior_nul.copy_from_slice(valid);
+        interior_nul[20] = 0;
+        assert_eq!(
+            decode_strkey_address(&env, &interior_nul).err(),
+            Some(PerihelionError::MalformedPayload)
+        );
+
+        // Short strkey: 55 characters, one short of the canonical length.
+        let mut short = [0u8; 56];
+        short[..55].copy_from_slice(&valid[..55]);
+        assert_eq!(
+            decode_strkey_address(&env, &short).err(),
+            Some(PerihelionError::MalformedPayload)
+        );
     }
 
     /// decode_fill_instruction requires exactly FILL_INSTRUCTION_LENGTH bytes.
@@ -482,39 +553,66 @@ mod tests {
         assert!(decode_fill_instruction(&env, &long).is_err());
     }
 
-    /// A well-formed 227-byte FillInstruction with G... recipient and C... dest_asset decodes
-    /// correctly using from_string_bytes (not from_contract_id).
+    /// The shared off-by-one negative vectors (one byte short / one byte long)
+    /// must both be rejected by the decoder.
     #[test]
-    fn test_decode_fill_instruction_strkey_addresses() {
+    fn test_decode_fill_instruction_rejects_neg_length_vectors() {
+        const SHORT: &str =
+            include_str!("../../../shared/wire-vectors/neg/fill_instruction_short.hex");
+        const LONG: &str =
+            include_str!("../../../shared/wire-vectors/neg/fill_instruction_long.hex");
+
         let env = Env::default();
 
-        // Build a 227-byte payload manually.
-        let mut msg = Bytes::new(&env);
-
-        let env = Env::default();
-
-        // 218-byte payload (one byte short) — must be rejected.
         let short_bytes = decode_hex(SHORT);
-        assert_eq!(short_bytes.len(), 218, "fill_instruction_short.hex must be 218 bytes");
+        assert_eq!(
+            short_bytes.len() as u32,
+            FILL_INSTRUCTION_LENGTH - 1,
+            "fill_instruction_short.hex must be one byte short"
+        );
         let mut short_msg = Bytes::new(&env);
         for b in short_bytes {
             short_msg.push_back(b);
         }
         assert!(
             decode_fill_instruction(&env, &short_msg).is_err(),
-            "decoder must reject a 218-byte payload (one byte short)"
+            "decoder must reject a payload one byte short"
         );
 
-        // 220-byte payload (one byte long) — must be rejected.
         let long_bytes = decode_hex(LONG);
-        assert_eq!(long_bytes.len(), 220, "fill_instruction_long.hex must be 220 bytes");
+        assert_eq!(
+            long_bytes.len() as u32,
+            FILL_INSTRUCTION_LENGTH + 1,
+            "fill_instruction_long.hex must be one byte long"
+        );
         let mut long_msg = Bytes::new(&env);
         for b in long_bytes {
             long_msg.push_back(b);
         }
         assert!(
             decode_fill_instruction(&env, &long_msg).is_err(),
-            "decoder must reject a 220-byte payload (one byte long)"
+            "decoder must reject a payload one byte long"
+        );
+    }
+
+    /// Issue #903: the 219-byte legacy layout (no trailing `reservation_window`)
+    /// shares protocol version 0x01 with the canonical 227-byte layout, so it must
+    /// be rejected rather than decoded with the window defaulted to 0. Checked
+    /// through `decode_message`, the codec `lz_receive_bytes` dispatches on.
+    #[test]
+    fn test_decode_message_rejects_219_byte_legacy_fill_instruction() {
+        const LEGACY: &str =
+            include_str!("../../../shared/wire-vectors/neg/fill_instruction_legacy_219.hex");
+
+        let env = Env::default();
+        let mut legacy_msg = Bytes::new(&env);
+        for b in decode_hex(LEGACY) {
+            legacy_msg.push_back(b);
+        }
+        assert_eq!(legacy_msg.len(), FILL_INSTRUCTION_LENGTH - 8);
+        assert_eq!(
+            decode_message(&env, &legacy_msg).err(),
+            Some(PerihelionError::MalformedPayload)
         );
     }
 
@@ -526,27 +624,25 @@ mod tests {
     /// encoder or decoder diverges from the documented layout, a test goes red.
     #[test]
     fn test_decode_fill_instruction_strkey_addresses() {
-        // The canonical 219-byte golden vector (see wire-vectors/README.md for
-        // the full field table). Loaded via include_str! so it is baked into the
-        // test binary at compile time and cannot differ between runs.
-        const GOLDEN: &str =
-            include_str!("../../../shared/wire-vectors/fill_instruction.hex");
+        // Loaded via include_str! so it is baked into the test binary at
+        // compile time and cannot differ between runs.
+        const GOLDEN: &str = include_str!("../../../shared/wire-vectors/fill_instruction.hex");
 
         let env = Env::default();
 
         let bytes = decode_hex(GOLDEN);
-        assert_eq!(bytes.len(), 219, "golden fill_instruction.hex must be 219 bytes");
+        assert_eq!(
+            bytes.len() as u32,
+            FILL_INSTRUCTION_LENGTH,
+            "golden fill_instruction.hex must be FILL_INSTRUCTION_LENGTH bytes"
+        );
 
         let mut msg = Bytes::new(&env);
         for b in &bytes {
             msg.push_back(*b);
         }
-        // reservation_window (8 bytes) = zero, no reservation
-        for _ in 0..8u32 {
-            msg.push_back(0x00);
-        }
 
-        assert_eq!(msg.len(), 227);
+        let fi = decode_fill_instruction(&env, &msg).expect("golden vector must decode");
 
         // Values match the canonical table in wire-vectors/README.md.
         assert_eq!(fi.src_eid, 30316);
@@ -563,17 +659,35 @@ mod tests {
         let mut msg = Bytes::new(&env);
         msg.push_back(0x01);
         msg.push_back(0x01);
-        for _ in 0..32u32 { msg.push_back(0xaa); }
-        for byte in [0u8, 0, 0, 1] { msg.push_back(byte); }
-        for byte in ZERO_ACCOUNT.as_bytes() { msg.push_back(*byte); }
-        for byte in ZERO_CONTRACT.as_bytes() { msg.push_back(*byte); }
-        for _ in 0..13u32 { msg.push_back(0); }
+        for _ in 0..32u32 {
+            msg.push_back(0xaa);
+        }
+        for byte in [0u8, 0, 0, 1] {
+            msg.push_back(byte);
+        }
+        for byte in ZERO_ACCOUNT.as_bytes() {
+            msg.push_back(*byte);
+        }
+        for byte in ZERO_CONTRACT.as_bytes() {
+            msg.push_back(*byte);
+        }
+        for _ in 0..13u32 {
+            msg.push_back(0);
+        }
         msg.push_back(0x80);
-        for _ in 1..16u32 { msg.push_back(0); }
-        for _ in 0..8u32 { msg.push_back(0); }
-        for _ in 0..32u32 { msg.push_back(0); }
-        for _ in 0..8u32 { msg.push_back(0); }
-        assert_eq!(msg.len(), 227);
+        for _ in 1..16u32 {
+            msg.push_back(0);
+        }
+        for _ in 0..8u32 {
+            msg.push_back(0);
+        }
+        for _ in 0..32u32 {
+            msg.push_back(0);
+        }
+        for _ in 0..8u32 {
+            msg.push_back(0);
+        }
+        assert_eq!(msg.len(), FILL_INSTRUCTION_LENGTH);
         assert!(decode_fill_instruction(&env, &msg).is_err());
     }
 }

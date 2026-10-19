@@ -11,7 +11,11 @@ pub const MSG_FILL_CONFIRMED: u8 = 0x02;
 pub const MSG_CANCEL_INTENT: u8 = 0x03;
 
 /// Fixed wire length of a FillInstruction payload.
-pub const FILL_INSTRUCTION_LENGTH: u32 = 219;
+pub const FILL_INSTRUCTION_LENGTH: u32 = 227;
+/// Fixed wire length of FillConfirmed (version + type + hash + solver + amount + ledger).
+pub const FILL_CONFIRMED_LENGTH: u32 = 90;
+/// Fixed wire length of CancelIntent (version + type + hash + reason).
+pub const CANCEL_INTENT_LENGTH: u32 = 35;
 
 /// Cancellation reason codes carried in a CancelIntent message.
 pub const CANCEL_REASON_EXPIRED: u8 = 0x00;
@@ -38,6 +42,9 @@ pub enum DataKey {
     /// Timestamp when the current pending peer change was proposed.
     /// Used to enforce the minimum peer-change delay. Issue #165.
     PendingPeerTime(u32),
+    /// Configurable delay (in seconds) for the current pending peer change.
+    /// Validated to be between MIN_PEER_CHANGE_DELAY and MAX_PEER_CHANGE_DELAY. Issue #715.
+    PendingPeerDelay(u32),
     /// Per-corridor pause flag. When set for an eid, all inbound and outbound
     /// operations for that corridor are blocked independently of the global flag.
     /// Allows quarantining a single compromised chain without halting others.
@@ -48,6 +55,12 @@ pub enum DataKey {
     /// Keeper reward in stroops (Stellar's smallest unit) paid to callers of
     /// `cancel_expired_intent`. Incentivizes timely refund processing (issue #173).
     KeeperReward,
+    /// Keeper reward in stroops paid to callers of `dispatch_confirmation`.
+    /// Incentivizes third-party dispatch of stalled FillConfirmed messages,
+    /// closing the window where a solver has paid out on Stellar but the
+    /// source-chain escrow has not yet been notified. Independent of
+    /// `KeeperReward` so the two incentives can be tuned separately.
+    DispatchKeeperReward,
     /// Configurable maximum TTL for TTL extensions (issue #340).
     /// If unset, defaults to MAX_TTL_DEFAULT. Settable by admin.
     MaxTtl,
@@ -64,7 +77,8 @@ pub enum DataKey {
     /// Earliest timestamp to allow resetting the rolling-window cap.
     RollingWindowResetEarliestAt,
 
-    // Persistent tier (rolling-window tracking, issue #145).
+    // Instance tier (rolling-window accumulator, issue #145). Only the current
+    // window's bucket is kept (#905).
     /// Rolling-window bucket: window start timestamp => cumulative settled amount.
     RollingWindowBucket(u64),
     /// Latest memoized window start timestamp (for efficiency).
@@ -105,6 +119,15 @@ pub enum DataKey {
     /// nonces it covered. TTL is extended to MAX_TTL on every write; see
     /// `accept_nonce` in lib.rs.
     InboundNonceWord(u32, u64),
+    /// Per-eid nonce pruning floor (issue #718): every nonce `n <`
+    /// `InboundNonceFloor(eid)` is permanently rejected as already consumed.
+    /// The floor is the first nonce not covered by the fully-consumed words
+    /// pruned so far; it is not a claim that all higher nonces are consumed.
+    /// `prune_nonce_words` advances it only after verifying every bit in each
+    /// deleted 64-nonce word is set. Archiving/deleting bitmap words below the
+    /// floor therefore cannot reopen a replay; nonces at or above the floor
+    /// continue to use their bitmap word (or its implicit zero state).
+    InboundNonceFloor(u32),
     /// Consumed nonce bitmap for a source endpoint id (unordered delivery).
     /// **Deprecated** — superseded by `InboundNonceWord(eid, word_index)` (issue #285).
     /// Kept to avoid breaking any archived storage entries; never written by
@@ -192,9 +215,10 @@ pub const RECIPIENT_TYPE_CONTRACT: u8 = 0x10; // C... contract (0x02 << 3)
 /// A registration instruction from the source chain (FillInstruction), decoded
 /// at the endpoint/adapter boundary into native Soroban types.
 ///
-/// Wire format (219 bytes):
+/// Wire format (227 bytes):
 ///   version(1) | type(1) | intent_hash(32) | src_eid(4) | recipient(56)
 ///   | dest_asset(69) | min_dest_amount(16) | deadline(8) | preferred_solver(32)
+///   | reservation_window(8)
 ///
 /// `recipient` contains the full Stellar strkey text (56 bytes), while `dest_asset`
 /// contains its canonical text form (up to 69 bytes). Both are decoded into Soroban
@@ -209,6 +233,9 @@ pub struct FillInstruction {
     pub min_dest_amount: i128,
     pub deadline: u64,
     pub preferred_solver: Option<Address>,
+    /// EVM solver identity that locked the source escrow. Raw canonical
+    /// FillInstructions always carry this value; typed test messages may omit it.
+    pub locked_solver: Option<BytesN<32>>,
     /// Seconds from registration during which only the preferred solver may fill.
     /// After this window lapses, any solver may fill. Zero means no reservation.
     pub reservation_window: u64,
@@ -230,12 +257,16 @@ pub enum LzMessage {
     Cancel(CancelInstruction),
 }
 
-/// Parameters for an outbound LayerZero send. Simplified abstraction over the
-/// LayerZero V2 `MessagingParams`; the real endpoint adapter maps this 1:1.
+/// Parameters for an outbound LayerZero V2 send. The endpoint adapter maps
+/// these fields to the official `MessagingParams`; the fee remains an explicit
+/// repository-level argument because Soroban does not expose an EVM-style
+/// `msg.value` call surface.
 #[contracttype]
 #[derive(Clone)]
 pub struct MessagingParams {
     pub dst_eid: u32,
     pub receiver: BytesN<32>,
     pub message: Bytes,
+    pub options: Bytes,
+    pub pay_in_lz_token: bool,
 }

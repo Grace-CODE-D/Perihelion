@@ -2,8 +2,15 @@
 
 import express, { type Request, Response, NextFunction } from "express";
 import type { Server } from "node:http";
-import { hashIntent, verifyIntent, perihelionDomain, parseIntent, isExpired } from "@perihelion/sdk";
-import type { Hex, SignedIntent, Address } from "@perihelion/sdk";
+import {
+  hashIntent,
+  verifyIntent,
+  verifyIntentOnChain,
+  perihelionDomain,
+  parseIntent,
+  isExpired,
+} from "@perihelion/sdk";
+import type { Hex, SignedIntent, Address, IntentRpcProvider } from "@perihelion/sdk";
 import { IntentStore } from "./store.js";
 import type { MempoolIntentRecord, IntentStatus } from "./types.js";
 
@@ -29,6 +36,7 @@ const HASH_RE = /^0x[0-9a-f]{64}$/;
  */
 const INTENT_STATUSES: ReadonlySet<string> = new Set([
   "pending",
+  "filled",
   "settled",
   "refunded",
   "expired",
@@ -66,6 +74,12 @@ export interface MempoolServerOptions {
   writeRateLimit?: number;
   /** Per-IP request budget within the window for read routes (GET). Default 600. */
   readRateLimit?: number;
+  /**
+   * Optional JSON-RPC provider used to verify signatures from contract wallets
+   * (ERC-1271). When omitted, contract-wallet intents are rejected because
+   * their signatures cannot be checked with ECDSA alone.
+   */
+  provider?: IntentRpcProvider;
 }
 
 const DEFAULT_LIST_LIMIT = 100;
@@ -88,6 +102,10 @@ export class MempoolServer {
   private readRateLimit: number;
   private sweepTimer?: ReturnType<typeof setInterval>;
   private statusToken?: string;
+  private provider?: IntentRpcProvider;
+  private isReady = false;
+  private submissionStats = { accepted: 0, rejected: 0 };
+  private rateLimitRejections = 0;
 
   constructor(opts: MempoolServerOptions) {
     if (opts.chainId === undefined || opts.chainId === null || Number.isNaN(opts.chainId)) {
@@ -104,6 +122,7 @@ export class MempoolServer {
     this.verifyingContract = opts.verifyingContract;
     this.domain = perihelionDomain(this.chainId, this.verifyingContract);
     this.statusToken = opts.statusToken;
+    this.provider = opts.provider;
     this.store = new IntentStore({
       maxSize: opts.maxStoreSize,
       expiryGraceMs: opts.expiryGraceMs,
@@ -128,11 +147,22 @@ export class MempoolServer {
     const read = this.rateLimit("read", this.readRateLimit);
     const write = this.rateLimit("write", this.writeRateLimit);
 
-    this.app.get("/healthz", read, (req: Request, res: Response) => {
+    this.app.get("/healthz", (req: Request, res: Response) => {
       res.status(200).json({ status: "ok" });
     });
+    this.app.get("/readyz", (req: Request, res: Response) => {
+      if (!this.isReady) {
+        res.status(503).json({ status: "not ready", reason: "sweep timer not started" });
+        return;
+      }
+      res.status(200).json({ status: "ready" });
+    });
+    this.app.get("/metrics", (req: Request, res: Response) => {
+      res.setHeader("Content-Type", "text/plain; version=0.0.4");
+      res.status(200).send(this.getPrometheusMetrics());
+    });
     this.app.get("/info", read, this.handleInfo.bind(this));
-    this.app.post("/intents", write, this.handleSubmitIntent.bind(this));
+    this.app.post("/intents", write, (req: Request, res: Response) => void this.handleSubmitIntent(req, res));
     this.app.get("/intents/:hash", read, this.handleGetIntent.bind(this));
     this.app.get("/intents", read, this.handleListIntents.bind(this));
     this.app.patch("/intents/:hash/status", write, this.handleUpdateStatus.bind(this));
@@ -189,295 +219,266 @@ export class MempoolServer {
    * takes a `:hash` so the two cannot drift apart (#561).
    */
   private parseHashParam(req: Request, res: Response): Hex | undefined {
-    const raw = String(req.params.hash ?? "").toLowerCase();
-    if (!HASH_RE.test(raw)) {
-      res.status(400).json({ error: "hash must be a 0x-prefixed 32-byte hex string" });
+    const raw = req.params.hash;
+    if (typeof raw !== "string" || !HASH_RE.test(raw.toLowerCase())) {
+      res.status(400).json({ error: "Invalid intent hash" });
       return undefined;
     }
-    return raw as Hex;
+    return raw.toLowerCase() as Hex;
+  }
+
+  private rateLimit(kind: "read" | "write", limit: number) {
+    return (req: Request, res: Response, next: NextFunction): void => {
+      const now = Date.now();
+      const key = `${kind}:${req.ip ?? "unknown"}`;
+      const hits = (this.rateLimitHits.get(key) ?? []).filter(
+        (t) => now - t < this.rateLimitWindowMs,
+      );
+      if (hits.length >= limit) {
+        this.rateLimitRejections++;
+        res.status(429).json({ error: "Too many requests" });
+        return;
+      }
+      hits.push(now);
+      this.rateLimitHits.set(key, hits);
+      next();
+    };
+  }
+
+  private handleInfo(_req: Request, res: Response): void {
+    res.status(200).json({
+      chainId: this.chainId,
+      verifyingContract: this.verifyingContract,
+      domain: this.domain,
+    });
+  }
+
+  private async handleSubmitIntent(req: Request, res: Response): Promise<void> {
+    const body = req.body as Partial<SignedIntent> | undefined;
+    if (!body || typeof body !== "object") {
+      this.submissionStats.rejected++;
+      res.status(400).json({ error: "Missing request body" });
+      return;
+    }
+    const { intent, signature } = body;
+    if (!intent || typeof intent !== "object") {
+      this.submissionStats.rejected++;
+      res.status(400).json({ error: "Missing intent" });
+      return;
+    }
+    if (typeof signature !== "string" || !SIGNATURE_RE.test(signature)) {
+      this.submissionStats.rejected++;
+      res.status(400).json({ error: "Invalid signature" });
+      return;
+    }
+    let parsed;
+    try {
+      parsed = parseIntent(intent);
+    } catch (err) {
+      this.submissionStats.rejected++;
+      res.status(400).json({ error: `Invalid intent: ${(err as Error).message}` });
+      return;
+    }
+    if (isExpired(parsed)) {
+      this.submissionStats.rejected++;
+      res.status(400).json({ error: "Intent has expired" });
+      return;
+    }
+    // verifyIntent is async: without the await the check below sees a Promise
+    // (always truthy), so no signature would ever be rejected. A throw from
+    // malformed input is treated as a failed verification, since Express 4 does
+    // not forward rejected promises from async handlers.
+    //
+    // Contract wallets (Safe, ERC-4337 accounts) cannot produce an ECDSA
+    // signature that recovers to their address, so their signatures are
+    // checked through ERC-1271 `isValidSignature` over RPC instead. Without a
+    // configured provider the check fails closed.
+    const signatureValid = await this.verifySignature(parsed, signature).catch(() => false);
+    if (!signatureValid) {
+      this.submissionStats.rejected++;
+      res.status(400).json({ error: "Signature verification failed" });
+      return;
+    }
+    const hash = hashIntent(parsed, this.domain);
+    const record: MempoolIntentRecord = {
+      hash,
+      intent: parsed,
+      signature: signature,
+      status: "pending",
+      createdAt: Math.floor(Date.now() / 1000),
+    };
+    this.store.set(hash, record);
+    this.submissionStats.accepted++;
+    res.status(201).json({ hash });
+  }
+
+  /**
+   * Verify a submitted signature against the intent's user. EOA users keep the
+   * pure ECDSA path; contract users are verified on-chain via ERC-1271. The
+   * result is always awaited so a rejected verification is never mistaken for
+   * a truthy Promise (#888).
+   */
+  private async verifySignature(intent: SignedIntent["intent"], signature: Hex): Promise<boolean> {
+    if (!this.provider) {
+      return verifyIntent(intent, signature, this.domain);
+    }
+    return verifyIntentOnChain(intent, signature, this.domain, this.provider);
+  }
+
+  private handleGetIntent(req: Request, res: Response): void {
+    const hash = this.parseHashParam(req, res);
+    if (!hash) return;
+    const record = this.store.get(hash);
+    if (!record) {
+      res.status(404).json({ error: "Intent not found" });
+      return;
+    }
+    res.status(200).json(record);
+  }
+
+  private handleListIntents(req: Request, res: Response): void {
+    const statusParam = req.query.status;
+    let status: IntentStatus | undefined;
+    if (statusParam !== undefined) {
+      if (typeof statusParam !== "string" || !INTENT_STATUSES.has(statusParam)) {
+        res.status(400).json({ error: "Invalid status filter" });
+        return;
+      }
+      status = statusParam as IntentStatus;
+    }
+
+    const chainIdParam = req.query.chainId;
+    let chainId: number | undefined;
+    if (chainIdParam !== undefined) {
+      const parsed = typeof chainIdParam === "string" ? Number(chainIdParam) : NaN;
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        res.status(400).json({ error: "Invalid chainId filter" });
+        return;
+      }
+      chainId = parsed;
+    }
+
+    const limitParam = req.query.limit;
+    let limit = DEFAULT_LIST_LIMIT;
+    if (limitParam !== undefined) {
+      const parsed = typeof limitParam === "string" ? Number(limitParam) : NaN;
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_LIST_LIMIT) {
+        res.status(400).json({ error: "Invalid limit" });
+        return;
+      }
+      limit = parsed;
+    }
+
+    const cursorParam = req.query.cursor;
+    let cursor: Hex | undefined;
+    if (cursorParam !== undefined) {
+      if (typeof cursorParam !== "string" || !HASH_RE.test(cursorParam.toLowerCase())) {
+        res.status(400).json({ error: "Invalid cursor" });
+        return;
+      }
+      cursor = cursorParam.toLowerCase() as Hex;
+      // An unknown cursor is a client error, not an empty page: the caller is
+      // paginating against a snapshot that no longer exists.
+      if (!this.store.get(cursor)) {
+        res.status(400).json({ error: "Invalid cursor" });
+        return;
+      }
+    }
+
+    const result = this.store.list({ status, chainId, cursor, limit });
+    res.status(200).json(result);
   }
 
   private handleUpdateStatus(req: Request, res: Response): void {
     if (this.statusToken) {
       const auth = req.header("authorization");
       if (auth !== `Bearer ${this.statusToken}`) {
-        res.status(401).json({ error: "Missing or invalid status token" });
+        res.status(401).json({ error: "Unauthorized" });
         return;
       }
     }
-
     const hash = this.parseHashParam(req, res);
-    if (hash === undefined) return;
-    const { status } = req.body as { status?: IntentStatus };
-
-    if (!status || !INTENT_STATUSES.has(status)) {
-      res.status(400).json({ error: `status must be one of ${[...INTENT_STATUSES].join(", ")}` });
+    if (!hash) return;
+    const body = req.body as { status?: unknown } | undefined;
+    const status = body?.status;
+    if (typeof status !== "string" || !INTENT_STATUSES.has(status)) {
+      res.status(400).json({ error: "Invalid status" });
       return;
     }
-
-    if (!this.store.get(hash)) {
-      res.status(404).json({ error: "Intent not found" });
-      return;
-    }
-
-    const updated = this.store.updateStatus(hash, status);
+    const updated = this.store.updateStatus(hash, status as IntentStatus);
     if (!updated) {
-      res.status(409).json({ error: "Cannot change status of a terminal intent" });
-      return;
-    }
-
-    res.json(this.store.get(hash));
-  }
-
-  /**
-   * Builds middleware that rejects an IP once it exceeds `max` requests within
-   * the configured sliding window. `bucket` keeps the read and write counters
-   * separate so the two budgets are enforced independently.
-   */
-  private rateLimit(
-    bucket: "read" | "write",
-    max: number,
-  ): (req: Request, res: Response, next: NextFunction) => void {
-    return (req: Request, res: Response, next: NextFunction): void => {
-      const key = `${bucket}:${req.ip ?? "unknown"}`;
-      const now = Date.now();
-      const recent = (this.rateLimitHits.get(key) ?? []).filter(
-        (t) => now - t < this.rateLimitWindowMs,
-      );
-
-      if (recent.length >= max) {
-        res.status(429).json({ error: "Too many requests" });
-        return;
-      }
-
-      recent.push(now);
-      this.rateLimitHits.set(key, recent);
-      next();
-    };
-  }
-
-  /**
-   * Insert or refresh an IP's hit list, keeping {@link rateLimitHits} in
-   * least-recently-used order (Map iteration order == insertion order) and
-   * bounded by {@link rateLimitMaxIps}. Eviction here is a backstop; the
-   * periodic {@link sweepRateLimits} is the main reclaim path.
-   */
-  private touchRateLimit(ip: string, hits: number[]): void {
-    this.rateLimitHits.delete(ip);
-    this.rateLimitHits.set(ip, hits);
-    while (this.rateLimitHits.size > this.rateLimitMaxIps) {
-      const oldest = this.rateLimitHits.keys().next().value;
-      if (oldest === undefined) break;
-      this.rateLimitHits.delete(oldest);
-    }
-  }
-
-  /**
-   * Drop rate-limit entries whose most recent hit is older than the window —
-   * they can no longer affect a decision. Runs on the same timer as the store
-   * sweep. Returns the number of entries evicted.
-   */
-  private sweepRateLimits(now = Date.now()): number {
-    let evicted = 0;
-    for (const [ip, hits] of this.rateLimitHits) {
-      const last = hits.at(-1) ?? 0;
-      if (now - last >= RATE_LIMIT_WINDOW_MS) {
-        this.rateLimitHits.delete(ip);
-        evicted += 1;
-      }
-    }
-    return evicted;
-  }
-
-  /**
-   * Run the periodic maintenance sweep immediately: evict past-deadline intents
-   * from the store and prune stale rate-limit entries. Invoked on a timer by
-   * {@link start}; exposed for tests that need to force a sweep.
-   */
-  sweep(now = Date.now()): void {
-    this.store.evictExpired(Math.floor(now / 1000));
-    this.sweepRateLimits(now);
-  }
-
-  /** Number of distinct source IPs currently tracked by the rate limiter. Exposed for tests. */
-  rateLimitEntryCount(): number {
-    return this.rateLimitHits.size;
-  }
-
-  private async handleSubmitIntent(req: Request, res: Response): Promise<void> {
-    try {
-      const signed = req.body as SignedIntent;
-
-      if (!signed.intent || !signed.signature || !SIGNATURE_RE.test(signed.signature)) {
-        res.status(400).json({ error: "Missing or malformed intent or signature" });
-        return;
-      }
-
-      // Cheap structural validation before the costly signature recovery below.
-      let intent: SignedIntent["intent"];
-      try {
-        intent = parseIntent(signed.intent);
-      } catch (err) {
-        res.status(400).json({ error: err instanceof Error ? err.message : "Invalid intent" });
-        return;
-      }
-
-      if (isExpired(intent)) {
-        res.status(400).json({ error: "Intent deadline has passed" });
-        return;
-      }
-
-      if (signed.intent.sourceChainId !== this.domain.chainId) {
-        res.status(400).json({
-          error: `Chain ID mismatch: intent is for chain ${signed.intent.sourceChainId}, mempool is configured for chain ${this.domain.chainId}`,
-        });
-        return;
-      }
-
-      // Verify EIP-712 signature
-      const isValid = await verifyIntent(intent, signed.signature, this.domain);
-      if (!isValid) {
-        res.status(400).json({ error: "Invalid signature" });
-        return;
-      }
-
-      const hash = hashIntent(intent, this.domain);
-
-      // Reject duplicate submissions rather than silently overwriting the
-      // existing record (and its status).
-      const existing = this.store.get(hash);
-      if (existing) {
-        res.status(409).json({ error: "Intent already exists", hash, status: existing.status });
-        return;
-      }
-
-      const record: MempoolIntentRecord = {
-        hash,
-        intent,
-        signature: signed.signature,
-        status: "pending",
-        createdAt: Math.floor(Date.now() / 1_000),
-      };
-
-      this.store.set(hash, record);
-      res.json({ hash });
-    } catch (err) {
-      console.error("[mempool] submitIntent failed:", err);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  }
-
-  private handleGetIntent(req: Request, res: Response): void {
-    const hash = this.parseHashParam(req, res);
-    if (hash === undefined) return;
-
-    const record = this.store.get(hash);
-    if (!record) {
       res.status(404).json({ error: "Intent not found" });
       return;
     }
-
-    res.json(record);
+    res.status(200).json(updated);
   }
 
-  private handleListIntents(req: Request, res: Response): void {
-    // Every query parameter is validated the same strict way: a malformed
-    // value is a 400 that names the parameter, never a silently-substituted
-    // default (`limit`) or an empty page (`chainId`) that a caller cannot tell
-    // apart from "nothing matched". A repeated parameter arrives as an array
-    // rather than a string and is rejected on the `typeof` guard (#566, #348).
+  private getPrometheusMetrics(): string {
+    const records = this.store.all();
+    const recordsByStatus = {
+      pending: records.filter((r) => r.status === "pending").length,
+      filled: records.filter((r) => r.status === "filled").length,
+      settled: records.filter((r) => r.status === "settled").length,
+      refunded: records.filter((r) => r.status === "refunded").length,
+      expired: records.filter((r) => r.status === "expired").length,
+    };
 
-    const rawStatus = req.query.status;
-    let status: IntentStatus | undefined;
-    if (rawStatus !== undefined) {
-      if (typeof rawStatus !== "string" || !INTENT_STATUSES.has(rawStatus)) {
-        res.status(400).json({
-          error: `status must be one of ${[...INTENT_STATUSES].join(", ")}`,
-        });
-        return;
-      }
-      status = rawStatus as IntentStatus;
-    }
+    const lines: string[] = [
+      "# HELP mempool_store_size Total number of records in the store",
+      "# TYPE mempool_store_size gauge",
+      `mempool_store_size ${records.length}`,
+      "# HELP mempool_store_pending_intents Number of pending intents",
+      "# TYPE mempool_store_pending_intents gauge",
+      `mempool_store_pending_intents ${recordsByStatus.pending}`,
+      "# HELP mempool_store_filled_intents Number of filled intents (delivered on Stellar, awaiting source-chain release)",
+      "# TYPE mempool_store_filled_intents gauge",
+      `mempool_store_filled_intents ${recordsByStatus.filled}`,
+      "# HELP mempool_store_settled_intents Number of settled intents",
+      "# TYPE mempool_store_settled_intents gauge",
+      `mempool_store_settled_intents ${recordsByStatus.settled}`,
+      "# HELP mempool_store_refunded_intents Number of refunded intents",
+      "# TYPE mempool_store_refunded_intents gauge",
+      `mempool_store_refunded_intents ${recordsByStatus.refunded}`,
+      "# HELP mempool_store_expired_intents Number of expired intents",
+      "# TYPE mempool_store_expired_intents gauge",
+      `mempool_store_expired_intents ${recordsByStatus.expired}`,
+      "# HELP mempool_submissions_accepted Total number of accepted submissions",
+      "# TYPE mempool_submissions_accepted counter",
+      `mempool_submissions_accepted ${this.submissionStats.accepted}`,
+      "# HELP mempool_submissions_rejected Total number of rejected submissions",
+      "# TYPE mempool_submissions_rejected counter",
+      `mempool_submissions_rejected ${this.submissionStats.rejected}`,
+      "# HELP mempool_rate_limit_rejections Total number of rate-limit rejections",
+      "# TYPE mempool_rate_limit_rejections counter",
+      `mempool_rate_limit_rejections ${this.rateLimitRejections}`,
+    ];
 
-    let limit = DEFAULT_LIST_LIMIT;
-    const rawLimit = req.query.limit;
-    if (rawLimit !== undefined) {
-      if (typeof rawLimit !== "string" || !/^\d+$/.test(rawLimit) || Number(rawLimit) === 0) {
-        res.status(400).json({ error: "limit must be a positive integer" });
-        return;
-      }
-      limit = Math.min(Number(rawLimit), MAX_LIST_LIMIT);
-    }
-
-    let chainId: number | undefined;
-    const rawChainId = req.query.chainId;
-    if (rawChainId !== undefined) {
-      if (typeof rawChainId !== "string" || !/^\d+$/.test(rawChainId) || Number(rawChainId) === 0) {
-        res.status(400).json({ error: "chainId must be a positive integer" });
-        return;
-      }
-      chainId = Number(rawChainId);
-    }
-
-    const rawCursor = req.query.cursor;
-    if (rawCursor !== undefined && typeof rawCursor !== "string") {
-      res.status(400).json({ error: "cursor must be provided at most once" });
-      return;
-    }
-    const cursor = rawCursor as Hex | undefined;
-
-    const { records, nextCursor } = this.store.list({ status, chainId, cursor, limit });
-    res.json({ records, nextCursor });
+    return lines.join("\n") + "\n";
   }
 
-  private handleInfo(_req: Request, res: Response): void {
-    res.json({
-      name: this.domain.name,
-      version: this.domain.version,
-      chainId: this.chainId,
-      verifyingContract: this.verifyingContract,
+  async start(): Promise<void> {
+    if (this.server) return;
+    this.sweepTimer = setInterval(() => {
+      this.store.evictExpired();
+    }, SWEEP_INTERVAL_MS);
+    if (typeof this.sweepTimer.unref === "function") this.sweepTimer.unref();
+    this.isReady = true;
+    await new Promise<void>((resolve) => {
+      this.server = this.app.listen(this.port, this.host, () => resolve());
     });
   }
 
-  start(): Promise<void> {
-    return new Promise((resolve) => {
-      console.warn(
-        "Mempool store is in-memory only: pending intents are lost on restart.",
-      );
-      if (!this.statusToken) {
-        console.warn(
-          "PATCH /intents/:hash/status is unauthenticated (no statusToken configured) — do not expose this port publicly.",
-        );
-      }
-      this.sweepTimer = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS);
-      this.sweepTimer.unref?.();
-      this.server = this.app.listen(this.port, this.host, () => {
-        console.log(
-          `Mempool server listening on http://${this.host}:${this.port} ` +
-            `(chainId=${this.domain.chainId}, escrow=${this.domain.verifyingContract})`,
-        );
-        resolve();
-      });
+  async stop(): Promise<void> {
+    this.isReady = false;
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = undefined;
+    }
+    if (!this.server) return;
+    const server = this.server;
+    this.server = undefined;
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
     });
-  }
-
-  /** Stop the HTTP listener. Resolves once the server has closed. */
-  stop(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.sweepTimer) {
-        clearInterval(this.sweepTimer);
-        this.sweepTimer = undefined;
-      }
-      if (!this.server) {
-        resolve();
-        return;
-      }
-      this.server.close((err) => (err ? reject(err) : resolve()));
-      this.server = undefined;
-    });
-  }
-
-  updateStatus(hash: Hex, status: IntentStatus): boolean {
-    return this.store.updateStatus(hash, status);
   }
 }

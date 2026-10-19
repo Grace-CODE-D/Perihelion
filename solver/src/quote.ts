@@ -23,9 +23,9 @@
  * that table.
  */
 
-import { isExpired, fromSmallestUnits, toSmallestUnits, MIN_FILL_HEADROOM_SECS } from "@perihelion/sdk";
+import { isExpired, MIN_FILL_HEADROOM_SECS } from "@perihelion/sdk";
 import type { Intent } from "@perihelion/sdk";
-import { zeroAddress, isAddressEqual, type Address } from "viem";
+import { zeroAddress, isAddress, isAddressEqual, type Address } from "viem";
 import type { SolverConfig } from "./config.js";
 import type { InventoryProvider, InFlightTracker } from "./inventory.js";
 import { UnlimitedInventoryProvider } from "./inventory.js";
@@ -63,7 +63,6 @@ export type FeeEstimator = (intent: Intent) => Promise<bigint>;
 const KNOWN_DECIMALS: Record<string, number> = {
   // Stellar (7dp)
   "native": 7,
-  // EVM stablecoins (6dp) — matched by lower-cased address prefix check below
 };
 
 /** Fallback decimal lookup: known table → 7dp for Stellar assets → error. */
@@ -124,9 +123,25 @@ export async function computeProceeds(
 
 // ─── decision types ──────────────────────────────────────────────────────────
 
+/**
+ * Stable code from a closed set for metric labeling and programmatic handling.
+ */
+export type SkipCode =
+  | "wrong_chain"
+  | "expired"
+  | "unsupported_asset"
+  | "reserved"
+  | "pricing_error"
+  | "below_margin"
+  | "implausible_profit"
+  | "insufficient_inventory"
+  | "insufficient_native_balance";
+
 export interface FillDecision {
   readonly fill: boolean;
   readonly reason: string;
+  /** Stable skip code for metrics exposition when fill is false. */
+  readonly code?: SkipCode;
   /**
    * True when the skip reason is durable (intent will never become profitable
    * or fillable). False indicates a transient condition worth retrying.
@@ -134,6 +149,10 @@ export interface FillDecision {
   readonly terminal: boolean;
   /** Estimated profit in basis points of capital deployed, when computed. */
   readonly profitBps?: number;
+  /** Estimated net profit in dest-asset smallest units (proceeds - minOut - fees). */
+  readonly estimatedProfitSmallestUnits?: bigint;
+  /** Estimated fee cost in dest-asset smallest units. */
+  readonly estimatedFeeSmallestUnits?: bigint;
   /**
    * Set when the skip is caused by the solver lacking the *native* balance to
    * pay a fill leg's fees (source-chain gas + LayerZero, or Stellar XLM).
@@ -142,6 +161,11 @@ export interface FillDecision {
    * should surface it as an alert rather than a routine info log.
    */
   readonly nativeShortfall?: boolean;
+  /**
+   * Set when the skip is caused by profit exceeding the sanity bound (config.maxPlausibleProfitBps).
+   * Indicates pricing or decimals misconfiguration.
+   */
+  readonly implausibleProfit?: boolean;
 }
 
 // ─── native-balance deps ─────────────────────────────────────────────────────
@@ -191,12 +215,23 @@ export function escrowSourceNativeCost(
 /**
  * Returns true when the intent is open to any solver or is reserved for
  * `solverAddress`. Uses viem helpers for checksum-insensitive comparison.
+ *
+ * `solverAddress` is `config.solverAddress` (`PERIHELION_SOLVER_ADDRESS`).
+ * When executor configuration is present, startup validates that this address
+ * equals the one derived from `PERIHELION_EVM_PRIVATE_KEY` (the identity the
+ * escrow sees as `msg.sender`), so reserved-intent matching here cannot
+ * diverge from the signing identity. In watch-only mode no key is present and
+ * the explicit address is used as-is.
  */
 export function isSolverEligible(
   preferredSolver: string,
   solverAddress: Address,
 ): boolean {
-  const preferred = preferredSolver as Address;
+  // A malformed `preferredSolver` must not reach `isAddressEqual`, which throws
+  // `InvalidAddressError` on invalid input. Treat it as ineligible so the
+  // caller produces a terminal skip instead of an escaping exception.
+  if (!isAddress(preferredSolver)) return false;
+  const preferred = preferredSolver;
   return (
     isAddressEqual(preferred, zeroAddress) ||
     isAddressEqual(preferred, solverAddress)
@@ -222,12 +257,13 @@ export async function evaluate(
   if (intent.sourceChainId !== config.sourceChainId) {
     return {
       fill: false,
+      code: "wrong_chain",
       reason: `wrong chain ${intent.sourceChainId} (solver is on ${config.sourceChainId})`,
       terminal: true,
     };
   }
   if (isExpired(intent)) {
-    return { fill: false, reason: "intent expired", terminal: true };
+    return { fill: false, code: "expired", reason: "intent expired", terminal: true };
   }
   // Reject intents that lack sufficient deadline headroom for the Soroban
   // settlement contract.  The contract's validate_and_stage_fill guard is:
@@ -247,15 +283,16 @@ export async function evaluate(
   if (isExpired(intent, nowSec, -MIN_FILL_HEADROOM_SECS)) {
     return {
       fill: false,
+      code: "expired",
       reason: `insufficient deadline headroom: ${intent.deadline - nowSec}s remaining, need >${MIN_FILL_HEADROOM_SECS}s`,
       terminal: true,
     };
   }
   if (!config.supportedDestAssets.includes(intent.destAsset)) {
-    return { fill: false, reason: `unsupported dest asset ${intent.destAsset}`, terminal: true };
+    return { fill: false, code: "unsupported_asset", reason: `unsupported dest asset ${intent.destAsset}`, terminal: true };
   }
   if (!isSolverEligible(intent.preferredSolver, config.solverAddress)) {
-    return { fill: false, reason: "reserved for another solver", terminal: true };
+    return { fill: false, code: "reserved", reason: "reserved for another solver", terminal: true };
   }
 
   // ── pricing (transient failures → non-terminal skip so we retry later) ────
@@ -265,13 +302,13 @@ export async function evaluate(
     proceeds = await computeProceeds(intent, deps);
     fees = await (deps.feeEstimator ?? defaultFeeEstimator)(intent);
   } catch (err) {
-    return { fill: false, reason: `pricing error: ${String(err)}`, terminal: false };
+    return { fill: false, code: "pricing_error", reason: `pricing error: ${String(err)}`, terminal: false };
   }
 
   // The solver must deliver at least minDestAmount of the dest asset.
   const minOut = BigInt(intent.minDestAmount);
   if (proceeds < minOut) {
-    return { fill: false, reason: "cannot meet minDestAmount", terminal: false };
+    return { fill: false, code: "below_margin", reason: "cannot meet minDestAmount", terminal: false };
   }
 
   // ── profit check ─────────────────────────────────────────────────────────
@@ -279,29 +316,38 @@ export async function evaluate(
   // profitBps = profit * 10_000 / proceeds
   const profit = proceeds - minOut - fees;
   if (profit <= 0n) {
-    return { fill: false, reason: "fee-inclusive profit is non-positive", terminal: false };
+    return { fill: false, code: "below_margin", reason: "fee-inclusive profit is non-positive", terminal: false };
   }
-  const profitBps = Number((profit * 10_000n) / proceeds);
-  if (profitBps < config.minMarginBps) {
+  // Carry profit at hundredths of a basis point so a sub-bps margin is not
+  // truncated to zero before the gate. Compare against the minimum scaled by
+  // 100, then convert to whole bps only for reporting.
+  const profitBpsScaled = (profit * 1_000_000n) / proceeds;
+  const minMarginBpsScaled = BigInt(config.minMarginBps) * 100n;
+  if (profitBpsScaled < minMarginBpsScaled) {
+    const profitBps = Number(profitBpsScaled / 100n);
     return {
       fill: false,
+      code: "below_margin",
       reason: `margin ${profitBps}bps below minimum ${config.minMarginBps}bps`,
       terminal: false,
       profitBps,
     };
   }
+  const profitBps = Number(profitBpsScaled / 100n);
 
   // ── sanity bound ──────────────────────────────────────────────────────────
   // A stablecoin corridor should never yield >10% profit; a figure this large
   // is far more likely to be a decimals/pricing misconfiguration than a real
   // opportunity, so refuse to fill rather than risk a catastrophic mis-quote.
-  const MAX_PLAUSIBLE_PROFIT_BPS = 1000;
-  if (profitBps > MAX_PLAUSIBLE_PROFIT_BPS) {
+  const maxPlausibleBps = config.maxPlausibleProfitBps ?? 1000;
+  if (profitBps > maxPlausibleBps) {
     return {
       fill: false,
-      reason: `implausible profit ${profitBps}bps exceeds sanity bound ${MAX_PLAUSIBLE_PROFIT_BPS}bps — check decimals/pricing config`,
+      code: "implausible_profit",
+      reason: `implausible profit ${profitBps}bps exceeds sanity bound ${maxPlausibleBps}bps — check decimals/pricing config`,
       terminal: false,
       profitBps,
+      implausibleProfit: true,
     };
   }
 
@@ -315,7 +361,7 @@ export async function evaluate(
   const available = await inventory.availableBalance(intent.destAsset);
   const reserved = inFlight?.reservedFor(intent.destAsset) ?? 0n;
   if (available - reserved < required) {
-    return { fill: false, reason: "insufficient inventory", terminal: false };
+    return { fill: false, code: "insufficient_inventory", reason: "insufficient inventory", terminal: false };
   }
 
   // ── native balance check ─────────────────────────────────────────────────
@@ -337,6 +383,7 @@ export async function evaluate(
     if (have < need) {
       return {
         fill: false,
+        code: "insufficient_native_balance",
         reason: "insufficient native balance on source chain (gas + LayerZero fee)",
         terminal: false,
         nativeShortfall: true,
@@ -351,6 +398,7 @@ export async function evaluate(
     if (have < need) {
       return {
         fill: false,
+        code: "insufficient_native_balance",
         reason: "insufficient native XLM on Stellar (delivery + confirmation fees)",
         terminal: false,
         nativeShortfall: true,
@@ -358,5 +406,12 @@ export async function evaluate(
     }
   }
 
-  return { fill: true, reason: "profitable", terminal: false, profitBps };
+  return {
+    fill: true,
+    reason: "profitable",
+    terminal: false,
+    profitBps,
+    estimatedProfitSmallestUnits: profit,
+    estimatedFeeSmallestUnits: fees,
+  };
 }

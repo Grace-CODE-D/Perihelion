@@ -13,8 +13,10 @@
 //!
 //! This module hand-ports just the one operation the contract needs —
 //! encoding a 32-byte contract ID as a strkey — using only `core`, into a
-//! fixed-size stack buffer (no heap allocation). Decoding is not needed: the
-//! host resolves the string via `Address::from_str`.
+//! fixed-size stack buffer (no heap allocation). Decoding is needed only to
+//! validate inbound strkeys before the host parser sees them: `Address`
+//! construction traps the invocation on malformed input instead of returning
+//! an error, so [`is_valid_strkey`] must reject anything the host would refuse.
 //!
 //! Base32 (RFC4648, no padding) and the CRC16/XMODEM checksum are ported from
 //! `stellar-strkey` v0.0.9 (Apache-2.0), whose CRC16 implementation itself
@@ -26,6 +28,9 @@
 //! — hence the module-wide `dead_code` allow, not a claim that this code is
 //! unused in spirit.
 #![allow(dead_code)]
+
+/// version byte for an `Account` strkey: `6 << 3`. See SEP-0023.
+const VERSION_ACCOUNT: u8 = 6 << 3;
 
 /// version byte for a `Contract` strkey: `2 << 3`. See SEP-0023.
 const VERSION_CONTRACT: u8 = 2 << 3;
@@ -109,9 +114,93 @@ pub fn contract_strkey(id: &[u8; 32]) -> [u8; 56] {
     out
 }
 
+fn base32_value(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'2'..=b'7' => Some(c - b'2' + 26),
+        _ => None,
+    }
+}
+
+/// Whether `s` is a well-formed 56-character `G...` (account) or `C...`
+/// (contract) strkey: exact length, base32 alphabet, a version byte matching
+/// the prefix, and a CRC16 checksum over the payload that agrees with the
+/// trailing two bytes. This mirrors what the host parser accepts, so a `true`
+/// result means `Address::from_string_bytes` will not trap (issue #902).
+pub fn is_valid_strkey(s: &[u8]) -> bool {
+    if s.len() != 56 {
+        return false;
+    }
+    let expected_version = match s[0] {
+        b'G' => VERSION_ACCOUNT,
+        b'C' => VERSION_CONTRACT,
+        _ => return false,
+    };
+
+    // 56 base32 characters carry exactly 280 bits = 35 bytes, with no leftover.
+    let mut payload = [0u8; 35];
+    let mut bit_buffer: u64 = 0;
+    let mut bits_in_buffer: u32 = 0;
+    let mut out_idx = 0usize;
+    for &c in s.iter() {
+        let Some(value) = base32_value(c) else {
+            return false;
+        };
+        bit_buffer = (bit_buffer << 5) | (value as u64);
+        bits_in_buffer += 5;
+        if bits_in_buffer >= 8 {
+            bits_in_buffer -= 8;
+            payload[out_idx] = ((bit_buffer >> bits_in_buffer) & 0xFF) as u8;
+            out_idx += 1;
+        }
+    }
+
+    payload[0] == expected_version && checksum(&payload[..33]) == [payload[33], payload[34]]
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The all-zero contract strkey from the messages tests.
+    const ZERO_CONTRACT: &[u8; 56] = b"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    /// The all-zero account strkey from the messages tests.
+    const ZERO_ACCOUNT: &[u8; 56] = b"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    #[test]
+    fn is_valid_strkey_accepts_well_formed_keys() {
+        assert!(is_valid_strkey(ZERO_CONTRACT));
+        assert!(is_valid_strkey(ZERO_ACCOUNT));
+        assert!(is_valid_strkey(&contract_strkey(&[0x7Bu8; 32])));
+    }
+
+    #[test]
+    fn is_valid_strkey_rejects_bad_checksum() {
+        let mut bad = *ZERO_ACCOUNT;
+        bad[55] = b'A';
+        assert!(!is_valid_strkey(&bad));
+    }
+
+    #[test]
+    fn is_valid_strkey_rejects_wrong_prefix_and_length() {
+        // Prefix flipped from C to G: the version byte and checksum no longer agree.
+        let mut swapped = *ZERO_CONTRACT;
+        swapped[0] = b'G';
+        assert!(!is_valid_strkey(&swapped));
+        assert!(!is_valid_strkey(b"S"));
+        assert!(!is_valid_strkey(&ZERO_ACCOUNT[..55]));
+        assert!(!is_valid_strkey(b""));
+    }
+
+    #[test]
+    fn is_valid_strkey_rejects_non_alphabet_bytes() {
+        let mut lower = *ZERO_ACCOUNT;
+        lower[10] = b'a';
+        assert!(!is_valid_strkey(&lower));
+        let mut nul = *ZERO_ACCOUNT;
+        nul[20] = 0;
+        assert!(!is_valid_strkey(&nul));
+    }
 
     #[test]
     fn checksum_matches_known_vector() {

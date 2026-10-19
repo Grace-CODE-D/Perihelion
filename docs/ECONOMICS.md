@@ -589,6 +589,28 @@ WS /api/v1/stream/intents
 
 ---
 
+## Dispatch Keeper Reward
+
+`dispatch_confirmation` is permissionless, but the dispatch keeper reward
+(`dispatch_keeper_reward`, set by `set_dispatch_keeper_reward`) is paid only
+when the dispatch is a genuine rescue of a stalled confirmation:
+
+- **The solver never earns it.** A solver dispatching its own fill receives no
+  reward. Paying it would turn a fixed reserve into a per-fill subsidy that
+  drains at the fill rate.
+- **Third parties wait for a grace period.** The reward is paid only once the
+  fill has been unconfirmed for `DISPATCH_REWARD_GRACE_LEDGERS` (360 ledgers,
+  about 30 minutes), so the solver has its own window to dispatch first.
+
+The reward is a fixed amount, so it can over-pay when the LayerZero fee is low
+and under-pay when it is high. Operators should compare it with the quoted fee
+(`quote_fill_confirmed_fee`) before relying on third-party keepers. The
+`KeeperReward` for `cancel_expired_intent` has the same farming exposure: small
+intents cancelled for the reward are profitable whenever the reward exceeds the
+cost of creating them. That reward is not yet bounded and is tracked separately.
+
+---
+
 ## Conclusion
 
 For mainnet deployment, **recommend a hybrid approach:**

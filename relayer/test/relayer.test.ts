@@ -6,6 +6,7 @@ import { loadConfig } from "../src/config.js";
 import { Relayer, FatalError } from "../src/relayer.js";
 import { InMemoryDeadLetterStore } from "../src/dead-letter.js";
 import { messageKeyString } from "../src/types.js";
+import { validConfigEnv, VALID_ESCROW, VALID_CONTRACT } from "./fixtures.js";
 import type {
   DestinationDelivery,
   Logger,
@@ -14,6 +15,14 @@ import type {
 } from "../src/relayer.js";
 import type { CheckpointStore } from "../src/checkpoint.js";
 import type { PendingMessage, MessageKey } from "../src/types.js";
+import {
+  SorobanSourceWatcher,
+  type SorobanOutboundMessage,
+} from "../src/soroban-watcher.js";
+import {
+  EvmDestinationDelivery,
+  type EvmEscrowClient,
+} from "../src/evm-delivery.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -26,9 +35,6 @@ function memCheckpoint(): CheckpointStore {
 }
 
 const silent: Logger = { info() {}, warn() {}, error() {} };
-
-const VALID_ESCROW = "0xaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaA";
-const VALID_CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4";
 
 function makeMsg(
   block: number,
@@ -53,16 +59,7 @@ function makeMsg(
 }
 
 function baseConfig() {
-  return loadConfig({
-    PERIHELION_ESCROW_ADDRESS: VALID_ESCROW,
-    PERIHELION_SETTLEMENT_CONTRACT: VALID_CONTRACT,
-    PERIHELION_EVM_RPC_URL: "http://localhost:8545",
-    PERIHELION_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
-    PERIHELION_SOURCE_EID: "30101",
-    PERIHELION_STELLAR_EID: "40161",
-    STELLAR_NETWORK: "Test SDF Network ; September 2015",
-    SIGNER_SECRET: "SBZVMB74Z76QB3ZL2YFBN7EWUIXVXSNXKNQRIPZTKMZDDQ3FJBNRHWBU",
-  });
+  return loadConfig(validConfigEnv());
 }
 
 // ─── Issue 1: Config validation ─────────────────────────────────────────────
@@ -131,11 +128,25 @@ test("loadConfig succeeds with valid required fields and applies defaults", () =
   const cfg = loadConfig({
     PERIHELION_ESCROW_ADDRESS: VALID_ESCROW,
     PERIHELION_SETTLEMENT_CONTRACT: VALID_CONTRACT,
+    PERIHELION_EVM_RPC_URL: "https://base.example/v2/test-key",
+    PERIHELION_STELLAR_RPC_URL: "https://soroban.example/rpc-key",
+    PERIHELION_SOURCE_EID: "30101",
+    PERIHELION_STELLAR_EID: "40161",
+    STELLAR_NETWORK: "Test SDF Network ; September 2015",
+    SIGNER_SECRET: "SBZVMB74Z76QB3ZL2YFBN7EWUIXVXSNXKNQRIPZTKMZDDQ3FJBNRHWBU",
   });
   assert.equal(cfg.escrowAddress, VALID_ESCROW);
   assert.equal(cfg.settlementContractId, VALID_CONTRACT);
   assert.equal(cfg.confirmations, 6);
   assert.equal(cfg.pollIntervalMs, 5000);
+});
+
+test("loadConfig does not echo any part of an invalid signer secret", () => {
+  const secret = "SSECRET-MUST-NOT-APPEAR";
+  assert.throws(
+    () => loadConfig({ SIGNER_SECRET: secret }),
+    (error: unknown) => error instanceof Error && !error.message.includes(secret),
+  );
 });
 
 test("loadConfig error message lists all invalid fields together", () => {
@@ -796,6 +807,712 @@ test("batch of two messages for one intent, both resolved, advances the cursor p
     relayer.readiness.cursor,
     11,
     "both messages resolved — cursor advances to confirmedHead + 1",
+  );
+});
+
+// ─── Issue #945: CancelIntent delivery must not report `refunded` ───────────
+
+test("CancelIntent delivery reports `cancelling`, not `refunded` (#945)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const intentHash = `0x${"ef".repeat(32)}` as `0x${string}`;
+  const watcher: SourceWatcher = {
+    async poll() {
+      return {
+        messages: [makeMsg(10, { intentHash, messageType: "CancelIntent", nonce: 1 })],
+        head: 10,
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+  const reported: Array<{ intentHash: string; status: string }> = [];
+  const mempoolClient = {
+    async reportStatus(hash: string, status: string) {
+      reported.push({ intentHash: hash, status });
+    },
+  };
+
+  const relayer = new Relayer(
+    config,
+    watcher,
+    delivery,
+    silent,
+    0,
+    memCheckpoint(),
+    undefined,
+    undefined,
+    mempoolClient as never,
+  );
+  await relayer.tick();
+
+  assert.ok(
+    !reported.some((r) => r.status === "refunded"),
+    `must not report refunded before a refund event exists; got ${JSON.stringify(reported)}`,
+  );
+  assert.ok(
+    reported.some((r) => r.intentHash === intentHash && r.status === "cancelling"),
+    `expected a cancelling report for the intent; got ${JSON.stringify(reported)}`,
+  );
+});
+
+test("`refunded` is reported only once a refund event is observed for the intent hash (#945)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const intentHash = `0x${"12".repeat(32)}` as `0x${string}`;
+  const watcher: SourceWatcher = {
+    async poll() {
+      return {
+        messages: [makeMsg(10, { intentHash, messageType: "CancelIntent", nonce: 1 })],
+        head: 10,
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+  const reported: Array<{ intentHash: string; status: string }> = [];
+  const mempoolClient = {
+    async reportStatus(hash: string, status: string) {
+      reported.push({ intentHash: hash, status });
+    },
+  };
+
+  const relayer = new Relayer(
+    config,
+    watcher,
+    delivery,
+    silent,
+    0,
+    memCheckpoint(),
+    undefined,
+    undefined,
+    mempoolClient as never,
+  );
+  await relayer.tick();
+
+  assert.ok(
+    !reported.some((r) => r.status === "refunded"),
+    "no refunded report without an observed refund event",
+  );
+
+  // Simulate the return-leg watcher observing the EVM refund event.
+  await relayer.observeRefund(intentHash);
+
+  assert.ok(
+    reported.some((r) => r.intentHash === intentHash && r.status === "refunded"),
+    `expected refunded after observing the refund event; got ${JSON.stringify(reported)}`,
+  );
+});
+
+// ─── Issue #736: detectReorg tests ──────────────────────────────────────────
+
+test("detects single-block reorg and rolls back cursor correctly", async () => {
+  const config = { ...baseConfig(), confirmations: 2 };
+  let pollCount = 0;
+  const watcher: SourceWatcher = {
+    async poll() {
+      pollCount++;
+      if (pollCount === 1) {
+        return {
+          messages: [],
+          head: 10,
+          headHash: "0xHASH10",
+          parentHash: "0xHASH9",
+          blockHeaders: [
+            { number: 9, hash: "0xHASH9", parentHash: "0xHASH8" },
+            { number: 10, hash: "0xHASH10", parentHash: "0xHASH9" },
+          ],
+        };
+      }
+      // Block 10 is replaced: its parent (block 9) now has a different hash.
+      return {
+        messages: [],
+        head: 10,
+        headHash: "0xHASH10_NEW",
+        parentHash: "0xHASH9_NEW",
+        blockHeaders: [
+          { number: 9, hash: "0xHASH9_NEW", parentHash: "0xHASH8" },
+          { number: 10, hash: "0xHASH10_NEW", parentHash: "0xHASH9_NEW" },
+        ],
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, checkpoint);
+
+  await relayer.tick();
+  const firstCursor = relayer.readiness.cursor;
+
+  await relayer.tick();
+  const secondCursor = relayer.readiness.cursor;
+
+  assert.ok(secondCursor < firstCursor, "cursor rolled back after single-block reorg");
+});
+
+test("detects reorg at exactly confirmation depth threshold", async () => {
+  const config = { ...baseConfig(), confirmations: 3 };
+  let pollCount = 0;
+  const watcher: SourceWatcher = {
+    async poll() {
+      pollCount++;
+      if (pollCount === 1) {
+        return {
+          messages: [],
+          head: 10,
+          headHash: "0xA",
+          parentHash: "0x9",
+          blockHeaders: [
+            { number: 7, hash: "0x7", parentHash: "0x6" },
+            { number: 8, hash: "0x8", parentHash: "0x7" },
+            { number: 9, hash: "0x9", parentHash: "0x8" },
+            { number: 10, hash: "0xA", parentHash: "0x9" },
+          ],
+        };
+      }
+      // Block 9 is replaced; the new head 11 links to the new block 9.
+      return {
+        messages: [],
+        head: 11,
+        headHash: "0xB",
+        parentHash: "0x9_NEW",
+        blockHeaders: [
+          { number: 9, hash: "0x9_NEW", parentHash: "0x8" },
+          { number: 10, hash: "0xA_NEW", parentHash: "0x9_NEW" },
+          { number: 11, hash: "0xB", parentHash: "0xA_NEW" },
+        ],
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, checkpoint);
+
+  await relayer.tick();
+  const firstCursor = relayer.readiness.cursor;
+
+  await relayer.tick();
+  const secondCursor = relayer.readiness.cursor;
+
+  assert.ok(secondCursor <= firstCursor, "reorg at confirmation threshold rolls back cursor");
+});
+
+test("detects reorg exceeding confirmation limit and emits DEEP_REORG", async () => {
+  const config = { ...baseConfig(), confirmations: 1 };
+  const errorLogs: string[] = [];
+  const logger: Logger = {
+    info() {},
+    warn() {},
+    error(msg) { errorLogs.push(msg); },
+  };
+
+  let pollCount = 0;
+  const watcher: SourceWatcher = {
+    async poll() {
+      pollCount++;
+      if (pollCount === 1) {
+        return {
+          messages: [],
+          head: 5,
+          headHash: "0xHEAD1",
+          parentHash: "0x4",
+          blockHeaders: [
+            { number: 3, hash: "0x3", parentHash: "0x2" },
+            { number: 4, hash: "0x4", parentHash: "0x3" },
+            { number: 5, hash: "0xHEAD1", parentHash: "0x4" },
+          ],
+        };
+      }
+      // Block 4 is replaced; the new head 5 links to the new block 4, so the
+      // reorg depth (2) exceeds confirmations (1).
+      return {
+        messages: [],
+        head: 5,
+        headHash: "0xHEAD2",
+        parentHash: "0x4_NEW",
+        blockHeaders: [
+          { number: 4, hash: "0x4_NEW", parentHash: "0x3" },
+          { number: 5, hash: "0xHEAD2", parentHash: "0x4_NEW" },
+        ],
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, logger, 0, checkpoint);
+
+  await relayer.tick();
+  await relayer.tick();
+
+  assert.ok(
+    errorLogs.some((m) => m.includes("DEEP_REORG")),
+    "DEEP_REORG alert emitted when reorg exceeds confirmations",
+  );
+});
+
+test("detects head-replacement reorg with unchanged parent linkage", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  let pollCount = 0;
+  const watcher: SourceWatcher = {
+    async poll() {
+      pollCount++;
+      if (pollCount === 1) {
+        return {
+          messages: [],
+          head: 10,
+          headHash: "0xHASH10_OLD",
+          parentHash: "0xHASH9",
+          blockHeaders: [
+            { number: 9, hash: "0xHASH9", parentHash: "0xHASH8" },
+            { number: 10, hash: "0xHASH10_OLD", parentHash: "0xHASH9" },
+          ],
+        };
+      }
+      return {
+        messages: [],
+        head: 10,
+        headHash: "0xHASH10_NEW",
+        parentHash: "0xHASH9",
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, checkpoint);
+
+  await relayer.tick();
+  const firstCursor = relayer.readiness.cursor;
+
+  await relayer.tick();
+  const secondCursor = relayer.readiness.cursor;
+
+  assert.equal(
+    secondCursor,
+    firstCursor,
+    "head-replacement with same parent linkage detected as no-reorg, cursor unchanged",
+  );
+});
+
+test("handles edge case with confirmations: 0", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  let pollCount = 0;
+  const watcher: SourceWatcher = {
+    async poll() {
+      pollCount++;
+      if (pollCount === 1) {
+        return {
+          messages: [makeMsg(5)],
+          head: 5,
+          headHash: "0xA",
+          parentHash: "0xB",
+          blockHeaders: [
+            { number: 5, hash: "0xA", parentHash: "0xB" },
+          ],
+        };
+      }
+      return {
+        messages: [],
+        head: 5,
+        headHash: "0xC",
+        parentHash: "0xD",
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, checkpoint);
+
+  await relayer.tick();
+  const firstCursor = relayer.readiness.cursor;
+
+  await relayer.tick();
+  const secondCursor = relayer.readiness.cursor;
+
+  assert.ok(
+    secondCursor <= firstCursor,
+    "with confirmations: 0, even finality reorg causes rollback",
+  );
+});
+
+// ─── Issue #737: Attempts map memory leak prevention tests ──────────────────
+
+test("keeps attempts map bounded when messages leave polling range", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const retry: RetryPolicy = { maxAttempts: 10, baseBackoffMs: 0 };
+  let tick = 0;
+
+  const watcher: SourceWatcher = {
+    async poll(fromBlock) {
+      tick++;
+      if (tick === 1) {
+        return {
+          messages: [
+            makeMsg(1, { nonce: 1 }),
+            makeMsg(2, { nonce: 2 }),
+            makeMsg(3, { nonce: 3 }),
+          ],
+          head: 3,
+        };
+      } else if (tick === 2) {
+        return {
+          messages: [
+            makeMsg(2, { nonce: 2 }),
+            makeMsg(3, { nonce: 3 }),
+          ],
+          head: 4,
+        };
+      } else if (tick === 3) {
+        return {
+          messages: [
+            makeMsg(3, { nonce: 3 }),
+          ],
+          head: 5,
+        };
+      }
+      return { messages: [], head: 10 };
+    },
+  };
+
+  const delivery: DestinationDelivery = {
+    async deliver() {
+      throw new Error("delivery fails");
+    },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, checkpoint, new InMemoryDeadLetterStore(), retry);
+
+  await relayer.tick(); // blocks 1, 2, 3 fail
+  const metricsAfterTick1 = relayer.metrics.failed;
+
+  await relayer.tick(); // block 1 left polling range, 2, 3 fail again
+  const metricsAfterTick2 = relayer.metrics.failed;
+
+  await relayer.tick(); // block 2 left polling range, 3 fails again
+  const metricsAfterTick3 = relayer.metrics.failed;
+
+  assert.ok(metricsAfterTick3 > metricsAfterTick2, "failures continue to be tracked");
+  assert.ok(metricsAfterTick2 > metricsAfterTick1, "failures are incremented");
+});
+
+test("message re-polled after prolonged absence receives fresh retry budget", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const retry: RetryPolicy = { maxAttempts: 2, baseBackoffMs: 0 };
+  let tick = 0;
+
+  const watcher: SourceWatcher = {
+    async poll() {
+      tick++;
+      if (tick === 1) {
+        return {
+          messages: [makeMsg(10, { nonce: 99 })],
+          head: 10,
+        };
+      } else if (tick === 2 || tick === 3 || tick === 4) {
+        return { messages: [], head: 10 };
+      } else if (tick === 5) {
+        return {
+          messages: [makeMsg(100, { nonce: 99 })],
+          head: 100,
+        };
+      }
+      return { messages: [], head: 200 };
+    },
+  };
+
+  let deliverCalls = 0;
+  const delivery: DestinationDelivery = {
+    async deliver() {
+      deliverCalls++;
+      throw new Error("permanent failure");
+    },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, checkpoint, new InMemoryDeadLetterStore(), retry);
+
+  await relayer.tick(); // attempt 1 for nonce 99
+  assert.equal(deliverCalls, 1);
+
+  await relayer.tick(); // attempt 2 for nonce 99 (should be dead-lettered)
+  assert.equal(deliverCalls, 2);
+  assert.equal(relayer.metrics.deadLettered, 1, "message dead-lettered after 2 attempts");
+
+  await relayer.tick(); // nonce 99 gone from polling
+  await relayer.tick(); // still gone
+  await relayer.tick(); // nonce 99 reappears but was already dead-lettered
+
+  assert.equal(relayer.metrics.deadLettered, 1, "dead-lettered message not retried even after re-appearing");
+  assert.equal(deliverCalls, 2, "no further delivery attempts for the dead-lettered message");
+});
+
+// ─── Issue #941: bidirectional relayer (Stellar → EVM leg) ──────────────────
+
+/**
+ * Minimal in-memory stand-in for the settlement contract's outbound message
+ * log. The SorobanSourceWatcher polls it via `fetchOutbound`.
+ */
+function fakeSorobanEndpoint() {
+  const outbound: SorobanOutboundMessage[] = [];
+  let ledger = 0;
+  return {
+    outbound,
+    push(msg: Omit<SorobanOutboundMessage, "ledger">) {
+      ledger += 1;
+      outbound.push({ ...msg, ledger });
+      return ledger;
+    },
+    async fetchOutbound(fromLedger: number) {
+      const messages = outbound.filter((m) => m.ledger >= fromLedger);
+      return { messages, head: ledger };
+    },
+  };
+}
+
+/**
+ * Minimal in-memory stand-in for the EVM escrow. Records the calls the
+ * EvmDestinationDelivery makes through the mock endpoint.
+ */
+function fakeEvmEscrow() {
+  const calls: Array<{ fn: "lzReceive"; messageType: string; intentHash: string }> = [];
+  const delivered = new Set<string>();
+  const client: EvmEscrowClient = {
+    async lzReceive(p) {
+      const k = messageKeyString({
+        intentHash: p.message.intentHash,
+        messageType: p.message.messageType,
+      });
+      calls.push({
+        fn: "lzReceive",
+        messageType: p.message.messageType,
+        intentHash: p.message.intentHash,
+      });
+      delivered.add(k);
+      return `0xevm${calls.length}`;
+    },
+    async isDelivered(key) {
+      return delivered.has(messageKeyString(key));
+    },
+  };
+  return { calls, client };
+}
+
+test("a Stellar fill produces Released on the EVM escrow (#941)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const soroban = fakeSorobanEndpoint();
+  const escrow = fakeEvmEscrow();
+
+  const intentHash = `0x${"ee".repeat(32)}`;
+  soroban.push({
+    srcTxHash: "0xsorobanfill",
+    message: {
+      srcEid: 40161,
+      dstEid: 30101,
+      intentHash,
+      messageType: "FillConfirmed",
+      solver: "0x0000000000000000000000000000000000000002",
+      recipient: "GUSER",
+      destAsset: "native",
+      amount: "1000000",
+      nonce: 1,
+    },
+  });
+
+  const watcher = new SorobanSourceWatcher({
+    fetchOutbound: soroban.fetchOutbound,
+  });
+  const delivery = new EvmDestinationDelivery({ client: escrow.client });
+
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, memCheckpoint());
+  await relayer.tick();
+
+  assert.equal(escrow.calls.length, 1, "escrow received exactly one message");
+  assert.equal(escrow.calls[0]?.fn, "lzReceive");
+  assert.equal(escrow.calls[0]?.messageType, "FillConfirmed");
+  assert.equal(escrow.calls[0]?.intentHash, intentHash);
+  assert.equal(relayer.metrics.delivered, 1);
+});
+
+test("a Stellar-side cancellation produces Refunded on the EVM escrow (#941)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const soroban = fakeSorobanEndpoint();
+  const escrow = fakeEvmEscrow();
+
+  const intentHash = `0x${"ff".repeat(32)}`;
+  soroban.push({
+    srcTxHash: "0xsorobancancel",
+    message: {
+      srcEid: 40161,
+      dstEid: 30101,
+      intentHash,
+      messageType: "CancelIntent",
+      solver: "0x0000000000000000000000000000000000000003",
+      recipient: "GUSER",
+      destAsset: "native",
+      amount: "1000000",
+      nonce: 1,
+    },
+  });
+
+  const watcher = new SorobanSourceWatcher({
+    fetchOutbound: soroban.fetchOutbound,
+  });
+  const delivery = new EvmDestinationDelivery({ client: escrow.client });
+
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, memCheckpoint());
+  await relayer.tick();
+
+  assert.equal(escrow.calls.length, 1, "escrow received exactly one message");
+  assert.equal(escrow.calls[0]?.messageType, "CancelIntent");
+  assert.equal(escrow.calls[0]?.intentHash, intentHash);
+});
+
+test("both directions run with separate checkpoints (#941)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+
+  // EVM → Stellar leg: watches Locked events, delivers to Soroban.
+  const evmWatcher: SourceWatcher = {
+    async poll() {
+      return { messages: [makeMsg(10, { messageType: "FillInstruction" })], head: 10 };
+    },
+  };
+  const sorobanDelivered: string[] = [];
+  const sorobanDelivery: DestinationDelivery = {
+    async deliver(p) {
+      sorobanDelivered.push(p.message.messageType);
+      return "0xsoroban";
+    },
+    async isDelivered() { return false; },
+  };
+
+  // Stellar → EVM leg: watches settlement outbound, delivers to the escrow.
+  const soroban = fakeSorobanEndpoint();
+  const escrow = fakeEvmEscrow();
+  soroban.push({
+    srcTxHash: "0xsorobanfill",
+    message: {
+      srcEid: 40161,
+      dstEid: 30101,
+      intentHash: `0x${"aa".repeat(32)}`,
+      messageType: "FillConfirmed",
+      solver: "0x0000000000000000000000000000000000000004",
+      recipient: "GUSER",
+      destAsset: "native",
+      amount: "1000000",
+      nonce: 1,
+    },
+  });
+  const sorobanWatcher = new SorobanSourceWatcher({
+    fetchOutbound: soroban.fetchOutbound,
+  });
+  const evmDelivery = new EvmDestinationDelivery({ client: escrow.client });
+
+  const evmToStellarCheckpoint = memCheckpoint();
+  const stellarToEvmCheckpoint = memCheckpoint();
+
+  const forward = new Relayer(
+    config,
+    evmWatcher,
+    sorobanDelivery,
+    silent,
+    0,
+    evmToStellarCheckpoint,
+  );
+  const backward = new Relayer(
+    config,
+    sorobanWatcher,
+    evmDelivery,
+    silent,
+    0,
+    stellarToEvmCheckpoint,
+  );
+
+  await forward.tick();
+  await backward.tick();
+
+  assert.deepEqual(sorobanDelivered, ["FillInstruction"], "forward leg delivered to Soroban");
+  assert.equal(escrow.calls.length, 1, "backward leg delivered to the EVM escrow");
+  assert.equal(escrow.calls[0]?.messageType, "FillConfirmed");
+
+  // Each direction persisted its own checkpoint independently.
+  assert.equal(await evmToStellarCheckpoint.load(), 11);
+  assert.equal(await stellarToEvmCheckpoint.load(), 2);
+});
+
+test("headers from a non-reorg tick are available for reorg detection on the next tick", async () => {
+  const config = { ...baseConfig(), confirmations: 2 };
+  let pollCount = 0;
+  const watcher: SourceWatcher = {
+    async poll() {
+      pollCount++;
+      if (pollCount === 1) {
+        // Non-reorg tick: no prior headers recorded, so this must not be a reorg.
+        return {
+          messages: [],
+          head: 10,
+          headHash: "0xHASH10",
+          parentHash: "0xHASH9",
+          blockHeaders: [
+            { number: 9, hash: "0xHASH9", parentHash: "0xHASH8" },
+            { number: 10, hash: "0xHASH10", parentHash: "0xHASH9" },
+          ],
+        };
+      }
+      // Next tick: block 9's hash changed, so the header recorded on the
+      // non-reorg tick must be available to detect the reorg.
+      return {
+        messages: [],
+        head: 10,
+        headHash: "0xHASH10_NEW",
+        parentHash: "0xHASH9_NEW",
+        blockHeaders: [
+          { number: 9, hash: "0xHASH9_NEW", parentHash: "0xHASH8" },
+          { number: 10, hash: "0xHASH10_NEW", parentHash: "0xHASH9_NEW" },
+        ],
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+
+  const checkpoint = memCheckpoint();
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, checkpoint);
+
+  await relayer.tick();
+  const firstCursor = relayer.readiness.cursor;
+
+  await relayer.tick();
+  const secondCursor = relayer.readiness.cursor;
+
+  assert.ok(
+    secondCursor < firstCursor,
+    "reorg detected using headers recorded on the previous non-reorg tick",
   );
 });
 

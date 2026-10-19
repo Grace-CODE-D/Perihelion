@@ -124,6 +124,10 @@ export interface HealthServerOptions {
    * Default: 500.
    */
   maxLagBlocks?: number;
+  /** Interface to bind. Default: 127.0.0.1. */
+  host?: string;
+  /** Bearer token required for `/metrics`, when set. */
+  metricsToken?: string;
 }
 
 /**
@@ -143,17 +147,12 @@ export class HealthServer {
     private readonly log: Logger,
     opts: HealthServerOptions = {},
   ) {
-    // Access pollIntervalMs through the public metrics/readiness interface.
-    // Default staleness: 3 × pollIntervalMs (read from env, fallback 15s).
-    const pollMs = Number(process.env.PERIHELION_POLL_INTERVAL_MS ?? 5_000);
-    this.stalenessThresholdMs =
-      opts.stalenessThresholdMs ??
-      Number(process.env.PERIHELION_READINESS_STALE_MS ?? pollMs * 3);
-    this.maxLagBlocks =
-      opts.maxLagBlocks ??
-      Number(process.env.PERIHELION_MAX_LAG_BLOCKS ?? 500);
-    this.host = process.env.PERIHELION_HEALTH_HOST ?? "127.0.0.1";
-    this.metricsToken = process.env.PERIHELION_METRICS_TOKEN || undefined;
+    // Defaults mirror the CLI's config defaults (3 × a 5s poll interval, 500 blocks).
+    // The CLI passes validated values from loadConfig, so env is never read here.
+    this.stalenessThresholdMs = opts.stalenessThresholdMs ?? 15_000;
+    this.maxLagBlocks = opts.maxLagBlocks ?? 500;
+    this.host = opts.host ?? "127.0.0.1";
+    this.metricsToken = opts.metricsToken;
   }
 
   /** Start the HTTP server. Resolves once the server is listening. */

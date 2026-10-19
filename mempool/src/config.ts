@@ -15,6 +15,16 @@ export interface MempoolConfig {
   readonly verifyingContract: Address;
   /** Shared bearer token for `PATCH /intents/:hash/status`, if configured. */
   readonly statusToken?: string;
+  /** Maximum number of intents retained in the store, if configured. */
+  readonly maxStoreSize?: number;
+  /** Grace period past expiry before an intent is pruned, in ms, if configured. */
+  readonly expiryGraceMs?: number;
+  /** Rate-limit window length in ms, if configured. */
+  readonly rateLimitWindowMs?: number;
+  /** Maximum writes per window per client, if configured. */
+  readonly writeRateLimit?: number;
+  /** Maximum reads per window per client, if configured. */
+  readonly readRateLimit?: number;
 }
 
 /**
@@ -26,6 +36,26 @@ export interface MempoolConfig {
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 const MAX_PORT = 65_535;
+
+/**
+ * Parse an optional positive-integer env var. Returns `undefined` when unset or
+ * empty; records an error and returns `undefined` when the value is not a
+ * positive integer.
+ */
+function optionalPositiveInt(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  errors: string[],
+): number | undefined {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    errors.push(`${name} must be a positive integer, got: "${raw}"`);
+    return undefined;
+  }
+  return value;
+}
 
 /**
  * Build config from `process.env`, applying defaults. Collects every problem
@@ -45,7 +75,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MempoolConfig 
     );
   }
 
-  const host = env.PERIHELION_MEMPOOL_HOST ?? "localhost";
+  // --- Bind host: mempool-specific name wins, then the shared names ---
+  const host =
+    env.PERIHELION_MEMPOOL_HOST ??
+    env.PERIHELION_METRICS_HOST ??
+    env.PERIHELION_HEALTH_HOST ??
+    "localhost";
 
   // --- Required: source chain ID ---
   const chainIdRaw = env.PERIHELION_SOURCE_CHAIN_ID;
@@ -70,6 +105,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MempoolConfig 
 
   const statusToken = env.PERIHELION_MEMPOOL_STATUS_TOKEN || undefined;
 
+  // --- Optional: store and rate-limit tuning ---
+  const maxStoreSize = optionalPositiveInt(
+    env,
+    "PERIHELION_MEMPOOL_MAX_STORE_SIZE",
+    errors,
+  );
+  const expiryGraceMs = optionalPositiveInt(
+    env,
+    "PERIHELION_MEMPOOL_EXPIRY_GRACE_MS",
+    errors,
+  );
+  const rateLimitWindowMs = optionalPositiveInt(
+    env,
+    "PERIHELION_MEMPOOL_RATE_LIMIT_WINDOW_MS",
+    errors,
+  );
+  const writeRateLimit = optionalPositiveInt(
+    env,
+    "PERIHELION_MEMPOOL_WRITE_RATE_LIMIT",
+    errors,
+  );
+  const readRateLimit = optionalPositiveInt(
+    env,
+    "PERIHELION_MEMPOOL_READ_RATE_LIMIT",
+    errors,
+  );
+
   if (errors.length > 0) {
     throw new Error(
       `Mempool configuration error — fix the following before starting:\n  • ${errors.join("\n  • ")}`,
@@ -82,5 +144,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MempoolConfig 
     chainId,
     verifyingContract: escrowAddress as Address,
     statusToken,
+    maxStoreSize,
+    expiryGraceMs,
+    rateLimitWindowMs,
+    writeRateLimit,
+    readRateLimit,
   };
 }

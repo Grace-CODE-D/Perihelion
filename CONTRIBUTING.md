@@ -71,7 +71,7 @@ results that differ from CI for reasons unrelated to your change.
 
 | Toolchain | Version                                            | Pinned in                                        |
 | --------- | -------------------------------------------------- | ------------------------------------------------ |
-| Rust      | `1.85.0` (target `wasm32-unknown-unknown`)         | [rust-toolchain.toml](./rust-toolchain.toml)      |
+| Rust      | `1.88.0` (target `wasm32-unknown-unknown`)         | [rust-toolchain.toml](./rust-toolchain.toml)      |
 | Foundry   | `stable`                                           | `FOUNDRY_VERSION` in each Foundry workflow        |
 | Node.js   | see [.nvmrc](./.nvmrc)                             | [.nvmrc](./.nvmrc)                                |
 
@@ -278,9 +278,13 @@ grep -rInE 'TODO|FIXME|[Pp]laceholder|[Nn]ot implemented|\bstubs?\b' sdk/src sol
 
 | Required check name | Source workflow | Blocks merge when… |
 |---|---|---|
-| `Required check` (CI / `ci.yml`) | `.github/workflows/ci.yml` | `npm run build` or `npm test` fails |
-| `Required check` (EVM / `evm.yml`) | `.github/workflows/evm.yml` | `forge build`, `forge test`, Slither, or NatSpec check fails |
-| `Required check` (Soroban / `soroban.yml`) | `.github/workflows/soroban.yml` | `cargo build`, `cargo test`, or `cargo clippy` fails |
+| `CI / required` | `.github/workflows/ci.yml` | `npm run build` or `npm test` fails |
+| `EVM / required` | `.github/workflows/evm.yml` | `forge build`, `forge test`, Slither, or NatSpec check fails |
+| `Soroban / required` | `.github/workflows/soroban.yml` | `cargo build`, `cargo test`, or `cargo clippy` fails |
+
+Each gate has a **unique** check name, so branch protection can require each one
+unambiguously — requiring the CI gate does not implicitly require the EVM or
+Soroban gate, and vice versa.
 
 Additional required settings:
 
@@ -292,12 +296,17 @@ Additional required settings:
 - **Require review from Code Owners** — enabled for the security-sensitive paths
   listed in the Security review policy below.
 
-> How the gate works: each workflow contains a terminal `check` job
-> (`needs: [<real-jobs>]`, `if: always()`) that asserts every upstream job
-> either passed or was skipped. Branch protection requires only those `check`
-> jobs, not the individual matrix jobs. This means a docs-only PR gets a green
-> gate without running the full build suite, while any build/test failure blocks
-> the merge.
+> How the gate works: every workflow runs on **all** pull requests to `main` —
+> there are no workflow-level `paths` filters. Instead, each workflow starts
+> with a `changes` job (`dorny/paths-filter`) that decides which of its real
+> jobs are relevant, and ends with a terminal `check` job
+> (`needs: [changes, <real-jobs>]`, `if: always()`) that asserts every upstream
+> job either passed or was skipped. Because the workflow always runs, the gate
+> always reports a conclusion: a docs-only PR gets a green gate without running
+> the full build suite, while any build/test failure blocks the merge. A
+> required status that never reports would leave the PR stuck in "Expected —
+> Waiting for status to be reported", which is exactly what workflow-level path
+> filtering used to cause.
 
 ## Reporting bugs & security issues
 

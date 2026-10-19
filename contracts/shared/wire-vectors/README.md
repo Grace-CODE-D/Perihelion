@@ -16,7 +16,7 @@ and corridor conversion rule, and
 [`docs/intent-spec.md`](../../../docs/intent-spec.md#amount-field-specification)
 for the 16-byte wire-field bounds.
 
-## `fill_instruction.hex` (219 bytes)
+## `fill_instruction.hex` (227 bytes)
 
 `version(1) | type(1) | intent_hash(32) | src_eid(4) | recipient(56) | dest_asset(69) | min_dest_amount(16) | deadline(8) | preferred_solver(32)`
 
@@ -53,7 +53,7 @@ fields to recover the strkey string, then converts it to a native `Address` via
 | `deadline`         | 179         | 8             | Big-endian `u64` (Unix timestamp, seconds)       | Soroban      |
 | `preferred_solver` | 187         | 32            | EVM address left-padded to 32 bytes; all zeros = "open" | Soroban (dropped) |
 
-**Total: 219 bytes.** All integer fields are big-endian. The `recipient` and
+**Total: 227 bytes.** All integer fields are big-endian. The `recipient` and
 `dest_asset` fields contain ASCII characters — not raw key material — and are
 decoded by stripping trailing zero bytes and calling `Address::from_string_bytes`
 on the resulting string.
@@ -87,7 +87,7 @@ the source chain.
 | `version`     | `0x01`                                                           |
 | `type`        | `0x02` (FillConfirmed)                                           |
 | `intent_hash` | 32 bytes of `0x11`                                               |
-| `solver_evm`  | 32-byte word; low 20 bytes = EVM address `0xAA…AA`               |
+| `solver_evm`  | 32-byte word; low 20 bytes (offsets 12–31) = EVM address `0xAA…AA`; high 12 bytes zero |
 | `amount`      | `1_000_000` (u128, big-endian) — informational, not used by EVM  |
 | `ledger`      | `42` (u64, big-endian) — informational                           |
 
@@ -118,13 +118,23 @@ inbound decoder tests (`test.rs`) each load these vectors and assert rejection.
 A new decoder implementation is conformant only if it rejects every vector here
 and accepts every golden vector above.
 
-### `solver_evm` address encoding (issue #60)
+### `solver_evm` address encoding (issues #60, #946)
 
 An EVM address occupies the **low 20 bytes** (160 bits) of the 32-byte
-`solver_evm` word. The high 12 bytes must be zero. A decoder that silently
-truncates a word with non-zero high bytes would redirect funds to a different
-address; decoders must therefore reject such words with a `MalformedPayload`
-error rather than truncating.
+`solver_evm` word — i.e. it is written at byte offsets 12–31 and the word is
+equivalent to `bytes32(uint256(uint160(addr)))`. The high 12 bytes (offsets
+0–11) must be zero. A decoder that silently truncates a word with non-zero high
+bytes would redirect funds to a different address; decoders must therefore
+reject such words with a `MalformedPayload` error rather than truncating.
+
+The canonical encoder for this field is the SDK helper
+`evmAddressToBytes32` from `@perihelion/sdk` (left-pads the 20 address bytes
+into offsets 12–31). Both the solver executor and the relayer must use it
+instead of hand-rolling the conversion; a left-justified encoding (address in
+offsets 0–19) is rejected by the EVM decoder and would leave the solver
+unrepaid (issue #946). The SDK helper is cross-checked in tests against
+`fill_confirmed.hex` above and against the EVM `_decodeFillConfirmed` decoder,
+so the encoder and decoder cannot drift apart.
 
 `neg/fill_confirmed_nonzero_high.hex` contains a valid-length FillConfirmed
 with the first byte of `solver_evm` set to `0xFF`. Both decoders must reject it.
@@ -156,7 +166,8 @@ FillInstruction, never decodes it, so rejection is a Soroban-side concern).
 
 | File | Length | Mutation | Expected error |
 | ---- | ------ | -------- | -------------- |
-| `fill_instruction_short.hex` | 218 | Last byte removed | `MalformedPayload` (length) |
-| `fill_instruction_long.hex` | 220 | Extra `0x00` appended | `MalformedPayload` (length) |
-| `fill_instruction_bad_version.hex` | 219 | `version` changed from `0x01` to `0x02` | `MalformedPayload` (version) |
-| `fill_instruction_bad_type.hex` | 219 | `type` changed from `0x01` to `0x04` | `UnknownMessageType` / `MalformedPayload` |
+| `fill_instruction_short.hex` | 226 | Last byte removed | `MalformedPayload` (length) |
+| `fill_instruction_long.hex` | 228 | Extra `0x00` appended | `MalformedPayload` (length) |
+| `fill_instruction_legacy_219.hex` | 219 | Trailing 8-byte `reservation_window` removed (the pre-#722 layout, same `version` `0x01`) | `MalformedPayload` (length) |
+| `fill_instruction_bad_version.hex` | 227 | `version` changed from `0x01` to `0x02` | `MalformedPayload` (version) |
+| `fill_instruction_bad_type.hex` | 227 | `type` changed from `0x01` to `0x04` | `UnknownMessageType` / `MalformedPayload` |

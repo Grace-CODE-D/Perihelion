@@ -28,6 +28,17 @@ check_rust() {
     exit 1
   fi
   echo "✔ rust toolchain matches rust-toolchain.toml"
+
+  # The workspace MSRV drives the MSRV-aware resolver; if it drifts from the
+  # pin, lock updates can select crates the pinned compiler cannot build.
+  local msrv
+  msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' "$REPO_ROOT/contracts/soroban/Cargo.toml")"
+  echo "workspace rust-version (contracts/soroban/Cargo.toml): ${msrv:-<unset>}"
+  if [ -z "$msrv" ] || [[ "$pinned" != "$msrv" && "$pinned" != "$msrv".* ]]; then
+    echo "error: workspace rust-version '$msrv' does not match pinned toolchain $pinned" >&2
+    exit 1
+  fi
+  echo "✔ workspace rust-version matches rust-toolchain.toml"
 }
 
 check_foundry() {
@@ -41,9 +52,25 @@ check_foundry() {
   fi
 
   echo "pinned (FOUNDRY_VERSION): $FOUNDRY_VERSION"
-  local sha="${FOUNDRY_VERSION#nightly-}"
-  if ! forge --version | grep -q "${sha:0:7}"; then
-    echo "error: forge is not the pinned build $FOUNDRY_VERSION" >&2
+
+  # Normalise the pin to a bare semantic version: drop a leading "v" and any
+  # "nightly-" prefix. A moving channel such as "stable" cannot be verified, so
+  # it is rejected rather than silently accepted.
+  local pinned="${FOUNDRY_VERSION#nightly-}"
+  pinned="${pinned#v}"
+  if ! [[ "$pinned" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "error: FOUNDRY_VERSION '$FOUNDRY_VERSION' is not an exact release version" >&2
+    exit 1
+  fi
+
+  # forge --version prints e.g. "forge 1.2.3 (abcdefg 2024-01-01T00:00:00Z)".
+  local actual
+  actual="$(forge --version | head -1 | awk '{print $2}')"
+  actual="${actual#v}"
+  echo "actual (forge --version): $actual"
+
+  if [ "$actual" != "$pinned" ]; then
+    echo "error: forge $actual is not the pinned version $pinned" >&2
     exit 1
   fi
   echo "✔ forge matches FOUNDRY_VERSION"

@@ -15,7 +15,7 @@ pre-commit:
       run: |
         STAGED=$(git diff --cached --name-only --diff-filter=ACMR -- 'contracts/soroban/**/*.rs')
         [ -z "$STAGED" ] && exit 0
-        cd contracts/soroban && cargo fmt --all &&
+        cargo fmt --manifest-path contracts/soroban/Cargo.toml -- $STAGED
         git add $STAGED
       skip:
         - merge
@@ -35,7 +35,7 @@ pre-commit:
       run: |
         STAGED=$(git diff --cached --name-only --diff-filter=ACMR -- 'contracts/evm/**/*.sol')
         [ -z "$STAGED" ] && exit 0
-        cd contracts/evm && forge fmt &&
+        forge fmt --root contracts/evm $STAGED
         git add $STAGED
       skip:
         - merge
@@ -67,6 +67,13 @@ pre-commit:
           echo ""
           exit 1
         fi
+
+    # ── Guard: SPDX license headers ─────────────────────────────
+    spdx-headers:
+      run: ./scripts/check-spdx-headers.sh
+      skip:
+        - merge
+        - rebase
 
     # ── Guard: debug logging ────────────────────────────────────
     no-debug-log:

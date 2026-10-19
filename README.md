@@ -112,8 +112,11 @@ which a user loses funds mid-bridge.
   instead of a single privileged operator.
 - 🔓 **Permissionless** — anyone can run a solver, a relayer, or a keeper. No
   allowlist gates liveness, and the refund path needs no privileged actor.
-- 🛰️ **LayerZero-secured messaging** — verified cross-chain delivery with a
-  multi-DVN trust model, plus a roadmap to ZK state proofs (Protocol 24).
+- 🛰️ **LayerZero-secured messaging** — the production design uses verified
+  cross-chain delivery with a multi-DVN trust model, plus a roadmap to ZK state
+  proofs (Protocol 24). The bundled reference relayer is a **development-only
+  stand-in** for the LayerZero executor and does not provide these guarantees
+  (see [Trust Assumptions](#trust-assumptions)).
 - 🪙 **Canonical assets** — users receive real Stellar assets sourced from solver
   liquidity, never a synthetic wrapper.
 - 🧱 **Built for contributors** — a clean monorepo with scoped, skill-tagged
@@ -133,10 +136,20 @@ Perihelion uses an **intent + solver** architecture:
    against a cryptographic commitment; the solver fronts liquidity on Stellar;
    the escrow releases the locked funds to the solver once settlement is verified
    over LayerZero. If the deadline passes without a fill, the user is refunded.
-4. **Trust-minimized messaging.** Cross-chain messages are carried by
-   [LayerZero](https://layerzero.network) with an independent multi-DVN verifier
-   set, and — on the roadmap — Stellar's native ZK proof support (Protocol 24)
-   for the most sensitive path.
+4. **Trust-minimized messaging.** In the production design, cross-chain messages
+   are carried by [LayerZero](https://layerzero.network) with an independent
+   multi-DVN verifier set, and — on the roadmap — Stellar's native ZK proof
+   support (Protocol 24) for the most sensitive path.
+
+> ⚠️ **The reference relayer in this repository is not that production
+> messenger.** It is a development-only shim that calls `lz_receive` directly
+> from a single hot key configured as the settlement contract's `Endpoint`
+> (endpoint-impersonation mode). In that mode there is no DVN verification: the
+> holder of the relayer secret can submit arbitrary fills and cancellations. The
+> relayer refuses to run in this mode against a public network unless
+> `PERIHELION_RELAYER_MODE=dev` is set explicitly. Production deployments must
+> use a real LayerZero endpoint/adapter on Stellar, with the relayer acting only
+> as a permissionless executor that delivers verified packets.
 
 ## Architecture
 
@@ -189,7 +202,7 @@ phased rollout — is in the
 | `contracts/` | Soroban (Rust) settlement contract + EVM (Solidity) escrow contract |
 | `sdk/`       | TypeScript SDK for intent construction, signing, and submission     |
 | `solver/`    | Reference solver node — monitors the mempool and fills intents      |
-| `relayer/`   | LayerZero message relayer for the Stellar ↔ EVM path                |
+| `relayer/`   | Reference relayer for the Stellar ↔ EVM path — **development-only** stand-in for the LayerZero executor (see [Trust Assumptions](#trust-assumptions)) |
 | `docs/`      | Protocol specifications and integration guides                      |
 
 This is an [npm workspaces](https://docs.npmjs.com/cli/using-npm/workspaces)
@@ -220,7 +233,7 @@ workspace for the Soroban contracts, and a Foundry project for the EVM contracts
 | -------------------------------------------------------------------- | -------------------- | ---------------- |
 | [Node.js](https://nodejs.org)                                        | SDK, solver, relayer | ≥ 20             |
 | [Rust](https://rustup.rs) + `wasm32-unknown-unknown` target          | Soroban contracts    | stable           |
-| [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) | Soroban build/deploy | latest           |
+| [Stellar CLI](https://developers.stellar.org/docs/tools/cli) | Soroban build/deploy | latest           |
 | [Foundry](https://book.getfoundry.sh)                                | EVM contracts        | latest           |
 
 > The TypeScript packages build and test with only Node.js installed; the Rust
@@ -350,12 +363,14 @@ fails if a row here links to a closed issue (`scripts/check-status-links.mjs`).
 | Component | Status | Details |
 | --- | --- | --- |
 | **LayerZero Endpoint (Soroban)** | Interface + Mock | `contracts/soroban/settlement/src/endpoint.rs` defines the `LzEndpoint` trait as a minimal, swappable abstraction. During this phase, a mock contract implements this surface; the real endpoint (or a thin adapter) will implement the same signature once the Soroban LayerZero stack is GA. The Soroban side does not yet communicate with a live LayerZero endpoint. |
-| **Inbound FillInstruction Codec** | Decoder implemented, not wired to production | `messages.rs` decodes `FillInstruction`, `CancelIntent`, and confirmation payloads from LayerZero bytes, and the format is pinned by the differential-fuzz harness (see [docs/differential-fuzzing.md](./docs/differential-fuzzing.md)). But `Perihelion::lz_receive` (`lib.rs`) takes an already-typed `LzMessage`, not raw `Bytes`, so `decode_message`/`decode_fill_instruction`/`decode_cancel_intent` are marked `#[allow(dead_code)]` and are exercised only by `messages.rs`'s test and fuzz modules, which the release `cdylib` does not compile. No component on the Stellar side currently parses raw inbound wire bytes in production; an adapter contract or a `Bytes`-taking `lz_receive` is still needed before this codec is load-bearing. |
+| **Inbound FillInstruction Codec** | Decoder implemented and reachable | `messages.rs` decodes `FillInstruction` and `CancelIntent` from LayerZero bytes, and `Perihelion::lz_receive_bytes` (`lib.rs`) is a raw-`Bytes` entrypoint that decodes and dispatches them: the call is authenticated against the endpoint and the registered peer, then decoded by the same `decode_message` the differential-fuzz harness fuzzes, then routed through the same pause gate, nonce guard and handlers as the typed `lz_receive`. The decoders are `pub` and compiled into the release `cdylib`. The LayerZero adapter that will deliver the bytes is still a mock (`endpoint.rs`), so nothing on the live network calls `lz_receive_bytes` yet, and the differential-fuzz harness verifies codec parity against the specification rather than against a live endpoint. |
 | **Relayer EVM Watcher** | Implemented | `relayer/src/evm-watcher.ts` polls source-chain logs through viem with bounded block ranges and concurrent transaction fetches. |
-| **Relayer Soroban Delivery** | Implemented, archived-entry restore incomplete | `relayer/src/soroban-delivery.ts` builds, simulates, and submits `lz_receive` calls against the settlement contract. Archived ledger entries are detected but the `RestoreFootprint` operation is not yet constructed from the simulation footprint, so delivery to an archived contract still fails. Tracked by the `TODO(#303)` in that file; [#303](https://github.com/Perihelion-Protocol/Perihelion/issues/303) is closed, no successor filed yet. |
-| **Solver Executor** | Stub | `solver/src/executor.ts` implements the orchestration flow, but `lockOnEvm`, `fillOnSoroban`, and `isSettled` all throw `Executor not implemented`. No solver can execute an intent end to end. |
-| **Value Caps / Circuit Breaker** | Implemented (rolling window only) | Rolling-window value caps and a latching breaker exist on both chains: `PerihelionEscrow.sol` (`rollingWindowCap`, `rollingWindowTriggered`, `resetRollingWindow`) and `lib.rs` (`set_rolling_window_cap`, `reset_rolling_window_cap`). Once tripped, the breaker stays tripped until an admin resets it. There is still **no per-intent maximum lock**: a single intent of any size passes as long as the window cap is not exceeded. |
-| **SDK Deployment Addresses** | Placeholder | `sdk/src/deployments.ts` ships placeholder addresses. The SDK cannot target a live deployment until they are filled in. |
+| **Relayer Soroban Delivery** | Implemented | `relayer/src/soroban-delivery.ts` builds, simulates, and submits `lz_receive` calls against the settlement contract. When simulation reports archived entries via a `restorePreamble`, the relayer submits a `RestoreFootprint` transaction with the provided footprint and resource fee, waits for it, then re-simulates and submits the invocation, so delivery to a contract with archived entries recovers automatically. The delivered FillInstruction also carries a hard-coded `deadline` of 0 ([#937](https://github.com/Perihelion-Protocol/Perihelion/issues/937)). |
+| **Solver Executor** | Implemented, settlement check broken | `solver/src/executor.ts` implements all three settlement legs: `lockOnEvm` calls `PerihelionEscrow.lock` via viem (quotes the LayerZero fee, submits the tx, waits for receipt); `fillOnSoroban` builds, simulates, signs, and submits a `fill_intent` call against the Soroban settlement contract, polling until confirmation; `isSettled` simulates a `status` view call and checks for a `Settled` variant, which `IntentStatus` does not have, so it always returns `false` ([#942](https://github.com/Perihelion-Protocol/Perihelion/issues/942)). `loadExecutorConfig` validates all required env vars at startup and throws a consolidated error before the solver loop begins, so misconfiguration fails loudly rather than per intent. |
+| **Value Caps / Circuit Breaker** | Implemented (rolling window only) | Rolling-window value caps and a latching breaker exist on both chains: `PerihelionEscrow.sol` (`rollingWindowCapPerAsset`, `rollingWindowTriggered`, `resetRollingWindowCap`) and `lib.rs` (`set_rolling_window_cap`, `reset_rolling_window_cap`). EVM accounting is isolated per asset, and a breach persists as an on-chain latch until an admin reset. Per-intent maximums exist on both chains: `PerihelionEscrow.setMaxIntentAmount` and `setMaxIntentAmountPerAsset` on EVM, and `set_max_intent_amount` on Soroban. On EVM, the protocol-wide maximum is overridden by a per-asset maximum where one is set. |
+| **Asset Allowlist** | Implemented | `PerihelionEscrow.sol` enforces an asset allowlist via `setAssetAllowed` (owner-only, timelocked). Every `lock` call checks `assetAllowed[token]` and reverts with `AssetNotAllowed` if false. A freshly deployed escrow accepts no assets until the owner populates the allowlist. This provides defense-in-depth against malicious or buggy tokens, but adds operational overhead (every new asset requires a timelock operation). |
+| **Dispatch Confirmation (split-fill path)** | Implemented, keeper incentive added | `dispatch_confirmation` (`lib.rs`) dispatches the FillConfirmed cross-chain message independently of the asset delivery step (`deliver_intent`), making the messaging leg retriable (Issue #12, closed). The entrypoint is permissionless and bypass-pause-safe (Issue #288, closed), so any party can push a stalled confirmation through. A configurable `DispatchKeeperReward` (set via `set_dispatch_keeper_reward`) compensates third-party keepers for the LayerZero fee, making the retry path economically self-sustaining. `list_undispatched_intents` provides a batch monitoring view for intents that are `Filled` (delivered) but not yet `ConfirmationSent`. See the [Solver Runbook](./docs/running-a-solver.md#filled-but-undispatched-the-split-entrypoint-stall) for the risk description and operator checklist. |
+| **SDK Deployment Addresses** | Not populated | `sdk/src/deployments.ts` registers no deployments: `DEPLOYMENTS` is empty. The SDK cannot target a live deployment until addresses are added. |
 
 This section is maintained as features land, and a PR that changes a component's
 status is expected to update the affected row. For an exhaustive implementation
@@ -389,13 +404,24 @@ Scoped honestly, per role:
 | Role | Can do | Cannot do | Bounding mechanism |
 |---|---|---|---|
 | **Solver / Relayer / Keeper** | Delay or decline to act | Steal funds, forge a fill, censor permanently (anyone can take over) | Permissionless; wire-format and signature checks |
-| **LayerZero DVN set** | — | — | Root of message authenticity; a colluding DVN set can forge a fill (see [T16](./docs/threat-model.md#t16--layerzero-endpoint-compromise--malicious-origin-spoofing)) |
+| **Reference relayer (dev mode only)** | Submit arbitrary fills and cancellations for any intent, with any recipient, amount and deadline | — | **None.** In endpoint-impersonation mode the relayer key *is* the contract's `Endpoint`, so it carries full authority over inbound messages. This is a development shim, not a production trust model ([#938](https://github.com/Perihelion-Protocol/Perihelion/issues/938)); it is gated behind `PERIHELION_RELAYER_MODE=dev` and refuses to run against a public network otherwise |
+| **LayerZero DVN set** | — | — | Root of message authenticity **in the production design**, where a real LayerZero endpoint/adapter on Stellar verifies packets and the relayer is only a permissionless executor. A colluding DVN set can forge a fill (see [T16](./docs/threat-model.md#t16--layerzero-endpoint-compromise--malicious-origin-spoofing)) |
 | **Guardian (EVM)** | Pause new locks, for up to 72h per 144h cycle | Move funds, change config, unpause, block local refunds | Auto-expiry + cooldown ([T11](./docs/threat-model.md#t11--guardian-key-dos-via-repeated-instant-pause)) |
-| **EVM timelock owner set** | Rotate the peer, guardian, or grace period; withdraw genuine surplus token balance via `skim` | Withdraw locked user deposits; bypass the timelock delay for peer/grace/guardian changes | M-of-N confirmation + public delay for config changes; `skim` is bounded on-chain by `totalLocked[token]` accounting (`balanceOf(this) - totalLocked[token]`) ([T17](./docs/threat-model.md#t17--governance-extractable-escrow-balance)) |
+| **EVM timelock owner set** | Rotate the peer, guardian, or grace period; withdraw genuine surplus token balance via `skim`; manage asset allowlist via `setAssetAllowed` | Withdraw locked user deposits; bypass the timelock delay for peer/grace/guardian changes | M-of-N confirmation + public delay for config changes; `skim` is bounded on-chain by `totalLocked[token]` accounting (`balanceOf(this) - totalLocked[token]`) ([T17](./docs/threat-model.md#t17--governance-extractable-escrow-balance)); asset allowlist is enforced in `lock` |
 | **A single EVM timelock owner** | Cancel any pending operation, including a legitimate unpause or guardian rotation | Execute an operation alone | None at present — this is a liveness single point of failure ([T20](./docs/threat-model.md#t20--governance-liveness)) |
 | **Soroban admin** | Rotate the LayerZero endpoint **instantly, with no delay** | — | `propose_peer`/`confirm_peer` have a 1-day delay; `set_endpoint` does not ([T18](./docs/threat-model.md#t18--instant-endpoint-rotation-on-soroban)) |
 
 **The practical implication:** `skim` is bounded on-chain by per-token liability accounting (`totalLocked`), preventing the owner set from extracting active user deposits. The residual governance risk is that the owner can withdraw genuine surplus (e.g. fee-on-transfer residue, accidentally sent / donated tokens, or upward rebase surplus), while single-owner cancellation remains a liveness single point of failure ([T20](./docs/threat-model.md#t20--governance-liveness)) and Soroban endpoint rotation is instant ([T18](./docs/threat-model.md#t18--instant-endpoint-rotation-on-soroban)) — see [`docs/threat-model.md`](./docs/threat-model.md) §0 and T17–T20 for the full trust model, likelihood/impact assessment, and tracked mitigation issues.
+
+**The messaging trust model is not yet implemented end to end.** The multi-DVN
+row above describes the production design. The reference relayer shipped in this
+repository does not use it: it signs `lz_receive` itself as the contract's
+`Endpoint`, so the relayer key carries the authority that a DVN set is supposed
+to hold. Treat the relayer as a development tool only, and do not run it against
+Pubnet or any other public network in endpoint-impersonation mode. See the
+[Relayer Runbook](./docs/relayer-runbook.md) and
+[`relayer/README.md`](./relayer/README.md) for the gating flag and the
+production design.
 
 ## Security
 
@@ -406,7 +432,7 @@ disclosure process in [`SECURITY.md`](./SECURITY.md).
 ## Community & Support
 
 - 🐛 **Bugs & features:** [open an issue](https://github.com/Perihelion-Protocol/Perihelion/issues)
-- 💬 **Questions & design discussion:** [GitHub Discussions](https://github.com/Perihelion-Protocol/Perihelion/discussions)
+- 💬 **Questions & design discussion:** [open an issue](https://github.com/Perihelion-Protocol/Perihelion/issues/new/choose)
 - 📣 **Updates:** watch the repository for releases
 
 ## License
@@ -429,3 +455,56 @@ bodies. The shortest, most efficient path between Stellar and the rest of the
 blockchain universe._
 
 </div>
+
+## Handsoff notes
+
+<!-- handsoff-issue-696 -->
+- #696: evm: the rolling-window circuit breaker sets `rollingWindowTriggered` and then reverts, discarding it
+
+<!-- handsoff-issue-697 -->
+- #697: evm: `resetRollingWindowCap` does not clear the accumulated bucket, so the cap re-trips immediately
+
+<!-- handsoff-issue-698 -->
+- #698: evm: `lock` truncates `minDestAmount` from `uint256` to `uint128` without checking, weakening the under-delivery guard
+
+<!-- handsoff-issue-699 -->
+- #699: evm: `lock` truncates `deadline` to `uint64` without checking, which can open the refund window early
+
+<!-- handsoff-issue-704 -->
+- #704: evm: `cancelOwnershipTransfer` reverts with `NotOwner` when there is no pending transfer
+
+<!-- handsoff-issue-705 -->
+- #705: evm: the contract-level event-shape table omits three events that the contract emits
+
+<!-- handsoff-issue-707 -->
+- #707: evm: `_encodeFillInstruction` copies 125 bytes one at a time in unbounded Solidity loops
+
+<!-- handsoff-issue-700 -->
+- #700: evm: `eip712Domain()` reports the live `block.chainid` while `DOMAIN_SEPARATOR` is frozen at deployment
+
+<!-- handsoff-issue-701 -->
+- #701: evm: no recovery path for native token stranded in the escrow
+
+<!-- handsoff-issue-702 -->
+- #702: evm: `cancelExpired` is `whenNotPaused`, so governance can hold the guaranteed refund path shut indefinitely
+
+<!-- handsoff-issue-703 -->
+- #703: evm: `setPeer` accepts `bytes32(0)`, silently disabling all inbound settlement
+
+<!-- handsoff-issue-685 -->
+- #685: soroban: two warnings in `lib.rs` will fail the `clippy -D warnings` CI gate once the crate compiles
+
+<!-- handsoff-issue-684 -->
+- #684: soroban: `addr.to_string().to_string()` calls a method that does not exist on `soroban_sdk::String`
+
+<!-- handsoff-issue-693 -->
+- #693: relayer: the reorg-rollback test fails, leaving reorg handling unverified
+
+<!-- handsoff-issue-694 -->
+- #694: solver: ten tests fail against the `{records}` mempool envelope, disabling the verification-cache suite
+
+<!-- handsoff-issue-691 -->
+- #691: sdk: two `buildIntent` V_min warning tests fail because the warning now requires `sourceDecimals`
+
+<!-- handsoff-issue-938 -->
+- #938: relayer: the reference relayer signs `lz_receive` as the trusted endpoint, collapsing the LayerZero/DVN trust model into a single hot key

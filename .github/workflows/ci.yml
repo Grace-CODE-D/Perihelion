@@ -2,22 +2,38 @@ name: CI
 
 # Triggering matrix
 # ─────────────────────────────────────────────────────────
-# Workflow     | Paths                                         | Purpose
+# Every workflow below runs on every PR to main; path filtering
+# happens INSIDE each workflow (a `changes` job using
+# dorny/paths-filter) so the required gate job always reports a
+# conclusion. Workflow-level `on.*.paths` filters are avoided
+# because a filtered-out PR never creates a run, leaving required
+# checks stuck in "Expected — Waiting for status to be reported".
+#
+# Workflow     | Internal filter (paths)                       | Purpose
 # ─────────────|───────────────────────────────────────────────|────────────────────
 # ci.yml       | sdk/, relayer/, solver/, mempool/,            | TypeScript build,
 #              | package.json, package-lock.json, .nvmrc,       | test, and lint
-#              | tsconfig.base.json, .github/workflows/ci.yml   |
+#              | tsconfig.base.json, .github/workflows/ci.yml,  |
+#              | scripts/check-spdx-headers.sh, docs/**, *.md   |
 # evm.yml      | contracts/evm/**                               | Solidity build,
 #              | .github/workflows/evm.yml                      | test, and Slither
 # soroban.yml  | contracts/soroban/**                           | Rust build, test,
 #              | .github/workflows/soroban.yml                  | and clippy
-# diff-fuzz.yml| (all paths; schedule + dispatch)               | Differential fuzz
-#              |                                                | + cross-validation
+# coverage.yml | sdk/, relayer/, solver/, mempool/,             | Per-stack coverage
+#              | contracts/soroban/**, contracts/evm/**,        | (ts/soroban/evm),
+#              | package.json, package-lock.json, .nvmrc,       | scoped per job via
+#              | tsconfig.base.json,                            | dorny/paths-filter
+#              | .github/workflows/coverage.yml                 |
+# diff-fuzz.yml| contracts/soroban/**, contracts/evm/**,       | Differential fuzz
+#              | contracts/shared/wire-vectors/**; schedule    | + cross-validation
+#              | + dispatch run unfiltered                      |
 # pr-lint.yml  | (all PRs)                                      | Conventional-
 #              |                                                | commit title check
 # ─────────────────────────────────────────────────────────
 # docs/ and root .md changes trigger the ci.yml check job so
 # branch protection sees a green gate — no heavy test suite runs.
+# The `changes` job (dorny/paths-filter) decides whether the heavy
+# `typescript` and `e2e` jobs run; `check` always reports.
 
 on:
   push:
@@ -27,12 +43,15 @@ on:
       - "relayer/**"
       - "solver/**"
       - "mempool/**"
+      - "test/**"
+      - "docker/**"
+      - "scripts/**"
+      - "Makefile"
       - "package.json"
       - "package-lock.json"
       - ".nvmrc"
       - "tsconfig.base.json"
       - ".github/workflows/ci.yml"
-      - "scripts/check-spdx-headers.sh"
       - "docs/**"
       - "*.md"
   pull_request:
@@ -42,12 +61,15 @@ on:
       - "relayer/**"
       - "solver/**"
       - "mempool/**"
+      - "test/**"
+      - "docker/**"
+      - "scripts/**"
+      - "Makefile"
       - "package.json"
       - "package-lock.json"
       - ".nvmrc"
       - "tsconfig.base.json"
       - ".github/workflows/ci.yml"
-      - "scripts/check-spdx-headers.sh"
       - "docs/**"
       - "*.md"
 
@@ -56,19 +78,58 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default; jobs only check out, build, and test.
+permissions:
+  contents: read
+
 jobs:
+  # Detect whether the heavy jobs need to run. Docs-only and root .md
+  # changes leave `typescript` false, so the build/test matrix is skipped
+  # while the `check` gate still reports green.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      typescript: ${{ steps.filter.outputs.typescript }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3.0.2
+        id: filter
+        with:
+          filters: |
+            typescript:
+              - "sdk/**"
+              - "relayer/**"
+              - "solver/**"
+              - "mempool/**"
+              - "test/**"
+              - "docker/**"
+              - "scripts/**"
+              - "Makefile"
+              - "package.json"
+              - "package-lock.json"
+              - ".nvmrc"
+              - "tsconfig.base.json"
+              - ".github/workflows/ci.yml"
+
   typescript:
     name: TypeScript (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22]
+        node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -82,37 +143,97 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify dependency tree is complete
+        run: |
+          # Fail fast if the lockfile has dangling dependency edges (e.g. a
+          # package listed as a dependency of another but with no entry of its
+          # own). `npm ci`'s sync check does not catch this.
+          npm ls --all > /dev/null
+          missing="$(npm query ':missing')"
+          if [ "$missing" != "[]" ]; then
+            echo "::error::Lockfile has missing packages:"
+            echo "$missing"
+            exit 1
+          fi
+
       - name: Check SPDX license headers
         run: ./scripts/check-spdx-headers.sh
 
       - name: Build all packages
         run: make build-ts
 
+      - name: Lint and typecheck
+        run: make lint-ts
+
       - name: Run tests
         run: make test-ts
 
-  # Required gate for branch protection.
-  #
-  # This job is the ONLY check registered in GitHub's required-status-checks.
-  # It deliberately gates on `typescript` so a build failure is always visible
-  # to branch protection, while still passing green when the path filter skips
-  # the typescript job entirely (e.g. a docs-only PR that doesn't touch sdk/**).
-  #
-  # Behaviour matrix:
-  #   typescript ran and passed  → check passes  ✅
-  #   typescript ran and failed  → check fails   ❌  (build broken, merge blocked)
-  #   typescript was skipped     → check passes  ✅  (path filter, docs-only PR)
-  check:
-    name: Required check
+  e2e:
+    name: End-to-end tests (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
-    needs: [typescript]
-    if: always()
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     steps:
-      - name: Assert typescript passed or was skipped
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify dependency tree is complete
         run: |
-          result="${{ needs.typescript.result }}"
-          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-            echo "::error::typescript job $result — merge is blocked."
+          # Fail fast if the lockfile has dangling dependency edges (e.g. a
+          # package listed as a dependency of another but with no entry of its
+          # own). `npm ci`'s sync check does not catch this.
+          npm ls --all > /dev/null
+          missing="$(npm query ':missing')"
+          if [ "$missing" != "[]" ]; then
+            echo "::error::Lockfile has missing packages:"
+            echo "$missing"
             exit 1
           fi
-          echo "typescript result: $result — gate passes."
+
+      - name: Build all packages
+        run: make build-ts
+
+      - name: Run end-to-end tests
+        run: make test-e2e
+
+  # Required gate for branch protection: `CI / required`.
+  #
+  # This job is the ONLY check from this workflow registered in GitHub's
+  # required-status-checks. It gates on `typescript` and `e2e` so a build
+  # failure is always visible to branch protection, while still passing green
+  # when the internal `changes` filter skips those jobs (e.g. a docs-only PR).
+  #
+  # Behaviour matrix (job-level skipping, not workflow-level):
+  #   typescript ran and passed  → gate passes  ✅
+  #   typescript ran and failed  → gate fails   ❌  (build broken, merge blocked)
+  #   typescript was skipped     → gate passes  ✅  (path filter, docs-only PR)
+  #   e2e ran and passed         → gate passes  ✅
+  #   e2e ran and failed         → gate fails   ❌  (e2e broken, merge blocked)
+  #   e2e was skipped            → gate passes  ✅  (path filter, docs-only PR)
+  required:
+    name: CI / required
+    runs-on: ubuntu-latest
+    needs: [changes, typescript, e2e]
+    if: always()
+    steps:
+      - name: Assert typescript, e2e, and lock-sync passed or were skipped
+        run: |
+          for result in "${{ needs.changes.result }}" "${{ needs.typescript.result }}" "${{ needs.e2e.result }}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "::error::A job $result — merge is blocked."
+              exit 1
+            fi
+          done
+          echo "All jobs passed or were skipped — gate passes."

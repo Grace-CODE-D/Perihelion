@@ -7,9 +7,15 @@ import { PerihelionEscrow } from "../src/PerihelionEscrow.sol";
 /// @dev Cross-language validation: decode Rust-generated payloads and assert
 /// the Solidity decoder produces identical results or rejects identically.
 ///
-/// This test reads payloads exported by the Rust proptest fuzzer from
-/// `contracts/shared/wire-vectors/fuzz-corpus/*.hex` and validates them
-/// against the Solidity decoder.
+/// This test reads payloads exported by the Rust proptest fuzzer from the
+/// generated (git-ignored) corpus directory and validates them against the
+/// Solidity decoder. The tracked `contracts/shared/wire-vectors/fuzz-corpus/`
+/// directory holds hand-curated regression inputs and is never written to by
+/// the fuzzer.
+///
+/// The corpus location defaults to `contracts/soroban/target/fuzz-corpus/`
+/// (relative to this test file) and can be overridden with the
+/// `PERIHELION_FUZZ_CORPUS_DIR` environment variable.
 ///
 /// Run after generating the Rust corpus:
 ///   cd contracts/soroban/settlement
@@ -19,17 +25,18 @@ import { PerihelionEscrow } from "../src/PerihelionEscrow.sol";
 contract CrossValidateTest is Test {
     DecoderHarness internal harness;
 
-    string internal constant CORPUS_DIR = "../shared/wire-vectors/fuzz-corpus/";
+    string internal corpusDir;
 
     function setUp() public {
         harness = new DecoderHarness(address(0x1), 30_316);
+        corpusDir = _resolveCorpusDir();
     }
 
     /// @dev Cross-validate Rust-generated FillConfirmed payloads with nonzero high bytes.
     /// The Rust encoder allows this (it's a pass-through), but the Solidity decoder
     /// MUST reject it to prevent address redirection.
     function testCrossValidateCorpus_FillConfirmedNonzeroHigh() public {
-        string memory path = string.concat(CORPUS_DIR, "fill_confirmed_nonzero_high.hex");
+        string memory path = string.concat(corpusDir, "fill_confirmed_nonzero_high.hex");
 
         // Skip if file doesn't exist (corpus not generated yet)
         try vm.readFile(path) returns (string memory hexData) {
@@ -47,7 +54,7 @@ contract CrossValidateTest is Test {
 
     /// @dev Cross-validate Rust-generated CancelIntent payloads with bad reason codes.
     function testCrossValidateCorpus_CancelIntentBadReason() public {
-        string memory path = string.concat(CORPUS_DIR, "cancel_intent_bad_reason.hex");
+        string memory path = string.concat(corpusDir, "cancel_intent_bad_reason.hex");
 
         try vm.readFile(path) returns (string memory hexData) {
             bytes memory payload = vm.parseBytes(hexData);
@@ -59,8 +66,8 @@ contract CrossValidateTest is Test {
         }
     }
 
-    /// @dev General corpus validation: read all .hex files in fuzz-corpus/
-    /// and attempt to decode. Log any unexpected results.
+    /// @dev General corpus validation: read all .hex files in the generated
+    /// corpus directory and attempt to decode. Log any unexpected results.
     function testCrossValidateCorpus() public {
         // List all .hex files in the corpus directory
         string[] memory files = _listCorpusFiles();
@@ -76,7 +83,7 @@ contract CrossValidateTest is Test {
         uint256 errors = 0;
 
         for (uint256 i = 0; i < files.length; i++) {
-            string memory path = string.concat(CORPUS_DIR, files[i]);
+            string memory path = string.concat(corpusDir, files[i]);
             bytes memory payload;
             try vm.readFile(path) returns (string memory hexData) {
                 payload = vm.parseBytes(hexData);
@@ -117,6 +124,23 @@ contract CrossValidateTest is Test {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /// @dev Resolve the generated corpus directory. Prefers the
+    /// `PERIHELION_FUZZ_CORPUS_DIR` environment variable (used by CI) and
+    /// otherwise falls back to the Rust target directory. The returned path
+    /// always ends with a trailing slash.
+    function _resolveCorpusDir() internal view returns (string memory) {
+        string memory dir = vm.envOr("PERIHELION_FUZZ_CORPUS_DIR", string(""));
+        if (bytes(dir).length == 0) {
+            dir = "../soroban/target/fuzz-corpus/";
+        }
+
+        bytes memory dirBytes = bytes(dir);
+        if (dirBytes.length > 0 && dirBytes[dirBytes.length - 1] != "/") {
+            dir = string.concat(dir, "/");
+        }
+        return dir;
+    }
 
     function _listCorpusFiles() internal view returns (string[] memory) {
         // In a real implementation, we'd read the directory.

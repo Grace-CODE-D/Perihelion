@@ -14,7 +14,7 @@
   },
   "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "repository": {
     "type": "git",
@@ -34,7 +34,7 @@
     "test": "node --test --import tsx test/*.test.ts",
     "test:coverage": "c8 --all --src src --include 'src/**' --exclude 'dist/**' --exclude 'test/**' --reporter=lcov --reporter=text --report-dir=coverage node --test --import tsx test/*.test.ts",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "viem": "^2.55.8"

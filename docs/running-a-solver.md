@@ -59,7 +59,7 @@ export PERIHELION_EVM_PRIVATE_KEY=0x...
 ### 3. Fund accounts
 
 **Stellar account:**
-- Obtain testnet XLM from the [Stellar Friendbot](https://developers.stellar.org/docs/tools/stellar-cli) or a faucet
+- Obtain testnet XLM with `stellar keys fund` ([Stellar CLI](https://developers.stellar.org/docs/tools/cli)) or a faucet
 - On mainnet, acquire XLM through an exchange
 
 **EVM account:**
@@ -80,7 +80,8 @@ cp solver/.env.example solver/.env
 | Parameter | Example | Notes |
 |-----------|---------|-------|
 | `PERIHELION_MEMPOOL_URL` | `http://localhost:8080` | Mempool API endpoint (local or remote) |
-| `PERIHELION_SOLVER_ADDRESS` | `0x1234...` | Your EVM address (for preferredSolver reserves) |
+| `PERIHELION_SOLVER_MODE` | `live` | `live` (default) or `watch`. In `watch` mode the solver evaluates intents and logs decisions but never invokes the executor, so no executor variables are required. See [Watch-only mode](#watch-only-mode). |
+| `PERIHELION_SOLVER_ADDRESS` | `0x1234...` | Your EVM address (for preferredSolver reserves). In `live` mode this is **optional**: if set, it must match the address derived from `PERIHELION_EVM_PRIVATE_KEY` or the solver refuses to start. In `watch` mode it is the only way to declare an identity. |
 | `PERIHELION_MIN_MARGIN_BPS` | `15` | Minimum profit margin in basis points (15 bps = 0.15%) |
 | `PERIHELION_SOURCE_NATIVE_FEE_FLOOR` | `3000000000000000` | Minimum source-chain native balance, in **wei**, the solver must hold to accept a fill (gas for `lock` + its LayerZero fee). `0` (default) disables the check unless a live estimator is wired. See [Native balance](#native-balance). |
 | `PERIHELION_STELLAR_NATIVE_FEE_FLOOR` | `20000000` | Minimum XLM balance, in **stroops**, the solver must hold to accept a fill (`deliver_intent` + `dispatch_confirmation`, incl. `lz_fee`). `0` (default) disables the check. |
@@ -93,9 +94,56 @@ cp solver/.env.example solver/.env
 | `PERIHELION_ESCROW_ADDRESS` | `0x5678...` | Deployed escrow contract address |
 | `PERIHELION_SETTLEMENT_CONTRACT_ID` | `ABC123...` | Soroban settlement contract ID |
 | `PERIHELION_SOURCE_CHAIN_ID` | `8453` | LayerZero EID of the source chain |
+| `STELLAR_NETWORK` | `testnet` | Stellar network the solver targets (`testnet` or `mainnet`). **Required** — the solver refuses to start without it. Must be set alongside the other executor variables (`PERIHELION_EVM_RPC_URL`, `PERIHELION_SOROBAN_RPC_URL`, keys, contract addresses) and must match the network your Soroban RPC endpoint and settlement contract are deployed on. |
 | `PERIHELION_METRICS_PORT` | `9090` | Port for the `/metrics` Prometheus endpoint |
-| `PERIHELION_HEALTH_HOST` | `127.0.0.1` | Bind address for `/metrics` — see [Network exposure](#network-exposure) before widening |
+| `PERIHELION_METRICS_HOST` | `127.0.0.1` | Bind address for `/metrics` — see [Network exposure](#network-exposure) before widening |
 | `PERIHELION_METRICS_TOKEN` | — | If set, `/metrics` requires `Authorization: Bearer <token>` |
+
+### Executor configuration is mandatory in live mode
+
+The solver will not start in `live` mode unless the full executor configuration
+is present: `PERIHELION_EVM_RPC_URL`, `PERIHELION_SOROBAN_RPC_URL`,
+`PERIHELION_EVM_PRIVATE_KEY`, `PERIHELION_SOROBAN_SECRET_KEY`,
+`PERIHELION_ESCROW_ADDRESS`, `PERIHELION_SETTLEMENT_CONTRACT_ID`,
+`PERIHELION_SOURCE_CHAIN_ID` and `STELLAR_NETWORK`. If any is missing the CLI
+exits with a configuration error naming the missing variables rather than
+starting an executor that cannot sign anything. There is no silent fallback to
+an empty executor.
+
+### Watch-only mode
+
+Set `PERIHELION_SOLVER_MODE=watch` to run the solver as a dry run. In this mode
+the solver polls the mempool, evaluates every intent (pricing, margin, inventory
+and native-balance checks) and logs the resulting decision, but it never
+constructs or calls an executor, so no fills are attempted and no capital is
+committed. Executor variables are not required; `PERIHELION_SOLVER_ADDRESS` is
+used only to decide which reserved intents would be eligible for you.
+
+Watch mode is the right way to validate pricing, fee estimators and inventory
+readers against a live mempool before funding keys. The startup log states
+explicitly that the solver is running in watch-only mode.
+
+### Solver address must match the signing key
+
+In `live` mode the solver's EVM identity is derived from
+`PERIHELION_EVM_PRIVATE_KEY` (`privateKeyToAccount(...)`). The escrow enforces
+`preferredSolver == msg.sender`, so if `PERIHELION_SOLVER_ADDRESS` disagreed with
+the key, the solver would accept intents reserved for one address and pay gas
+for `lock` transactions that revert with `ReservedForSolver` (or skip intents
+reserved for its real address). To prevent this, at startup the solver derives
+the address from the private key and **refuses to start** if
+`PERIHELION_SOLVER_ADDRESS` is set and differs from it. The error message prints
+both addresses. Either unset `PERIHELION_SOLVER_ADDRESS` (recommended — the
+derived address is used) or correct it to the derived value.
+
+### Split-fill dispatch deadline
+
+After `deliver_intent` marks an intent filled, the solver must dispatch
+`FillConfirmed` no later than `deadline + 30 minutes`. The Soroban settlement
+contract rejects later dispatches because the EVM escrow permits its local
+refund fallback from the protocol's minimum `confirmationGrace` boundary.
+Treat this as a hard monitoring deadline: a late dispatch is futile and must not
+be retried as if it could still release the escrow.
 
 ### Customization Points
 
@@ -142,6 +190,14 @@ The reservation is released in a `finally` block once the fill settles — wheth
 it succeeds or fails — so a failed fill immediately frees its capacity for retry
 or for another intent.
 
+Failures are classified by whether capital could have moved. *Definite*
+failures — a failed `fill_intent` simulation, `sendTransaction` returning
+`ERROR`, a transaction result with status `FAILED`, or a `writeContract` revert
+before broadcast — are wrapped in `DefiniteFailureError`, and the reservation is
+released in the same tick. *Indefinite* failures — timeouts and unknown errors,
+where the transaction may still land — keep the reservation until the next
+refresh, so the solver never over-commits against a fill that might confirm.
+
 This tracker is in-memory only and resets on restart, so it protects a single
 solver process's polling loop; it is not a substitute for your `InventoryProvider`
 reporting real, current balances.
@@ -158,7 +214,7 @@ covers one of them:
    cross-chain message.
 3. **XLM on Stellar** — `deliver_intent` and `dispatch_confirmation` each need a
    funded source account, and `dispatch_confirmation` takes an `lz_fee` the
-   caller supplies.
+   caller supplies. Use `quote_fill_confirmed_fee(dst_eid)` to quote this accurately; passing an empty payload to `quote_lz_fee` returns a lower bound that will revert.
 
 Running out of either native balance *after* a fill is committed is far worse
 than skipping it: the worst ordering is running out of XLM once the EVM `lock`
@@ -257,13 +313,13 @@ Set up alerts for:
 
 ### Network exposure
 
-`/metrics` (`solver/src/index.ts`) publishes `SolverMetrics`: fill attempts,
+`/metrics` (`solver/src/cli.ts`) publishes `SolverMetrics`: fill attempts,
 wins, losses, and realised profit in basis points. On a fill-race market,
 handing a competitor your realised margin is directly adversarial (see
 [ECONOMICS.md](./ECONOMICS.md) on the fill race) — it is a materially more
 sensitive exposure than the relayer's operational metrics.
 
-The endpoint therefore binds to `PERIHELION_HEALTH_HOST=127.0.0.1` by default,
+The endpoint therefore binds to `PERIHELION_METRICS_HOST=127.0.0.1` by default,
 with a startup log warning if bound anywhere else. If you need to scrape it
 from outside the host (a remote Prometheus, a shared monitoring VPC), set
 `PERIHELION_METRICS_TOKEN` to a random secret and configure the scraper with
@@ -278,6 +334,19 @@ from outside the host (a remote Prometheus, a shared monitoring VPC), set
 npm install
 npm run build
 ```
+
+**Error: missing executor configuration**
+- The solver is in `live` mode (the default) but one or more executor
+  variables are unset. The error names them.
+- Either set the full executor configuration (see
+  [Executor configuration is mandatory in live mode](#executor-configuration-is-mandatory-in-live-mode)),
+  or run with `PERIHELION_SOLVER_MODE=watch` to evaluate intents without
+  filling them.
+
+**Error: solver address does not match the EVM private key**
+- `PERIHELION_SOLVER_ADDRESS` differs from the address derived from
+  `PERIHELION_EVM_PRIVATE_KEY`. Unset `PERIHELION_SOLVER_ADDRESS` or set it to
+  the derived address printed in the error.
 
 **Error: `ECONNREFUSED` (mempool/RPC)**
 - Verify `PERIHELION_MEMPOOL_URL`, `PERIHELION_EVM_RPC_URL`, `PERIHELION_SOROBAN_RPC_URL` are reachable
@@ -301,7 +370,9 @@ npm run build
 1. Verify mempool is running and populated
    - Check `/intents` endpoint: `curl http://localhost:8080/intents`
 2. Check `PERIHELION_SOLVER_ADDRESS` — is it reserved by any intents?
-   - If solver address not set or wrong, only open intents will be visible
+   - In `live` mode the address is derived from `PERIHELION_EVM_PRIVATE_KEY`;
+     in `watch` mode it comes from `PERIHELION_SOLVER_ADDRESS`
+   - If the address is not set or wrong, only open intents will be visible
 3. Check deadline — intent must not be expired
    - Solver rejects intents with `deadline < now`
 
@@ -336,6 +407,98 @@ npm run build
 If you expect solver reputation tracking (Phase 3+):
 - Ensure `dispatch_confirmation` is called after `deliver_intent`
 - Wait for confirmation message to settle (LayerZero transport delay)
+
+### Filled-but-undispatched: the split-entrypoint stall
+
+**What it is.** `deliver_intent` and `dispatch_confirmation` are separate
+entrypoints by design (Issue #12) — delivery is the atomic, irreversible step;
+dispatch can be retried independently. The downside is that they can come apart:
+
+1. The solver calls `deliver_intent`: the user receives the destination asset on
+   Stellar, and the contract writes the `Settled` marker setting intent status
+   to `Filled`.
+2. The solver then fails to call `dispatch_confirmation` — out of XLM, a fee
+   under-quote, a node crash, or a misconfiguration.
+3. The intent sits in `Filled` state indefinitely. The source-chain escrow still
+   holds the user's locked funds with `released == false`; it does not know the
+   fill happened. `cancel_expired_intent` refuses to act because the `Settled`
+   marker is present. No other solver can step in.
+4. After `deadline + confirmationGrace`, the escrow's `cancelExpired` path
+   returns the user's source funds — user receives both the destination asset on
+   Stellar *and* a full refund — while the solver absorbs the entire loss.
+
+**How to detect it.** The `status()` view distinguishes `Filled` (delivered,
+undispatched) from `ConfirmationSent`. Use the `list_undispatched_intents`
+contract view to batch-query your known intent hashes and filter for the ones
+currently stuck in `Filled`:
+
+```typescript
+// Example using the Perihelion SDK / contract client
+const allHashes = await mempool.getAllKnownHashes();
+// Chunk to ≤50 hashes per call (instruction budget).
+const chunks = chunk(allHashes, 50);
+for (const batch of chunks) {
+  const stuck = await settlementClient.list_undispatched_intents(batch);
+  for (const hash of stuck) {
+    logger.error({ hash }, "STUCK: intent filled but confirmation not dispatched");
+    alerts.fire("dispatch_confirmation_stalled", { hash });
+  }
+}
+```
+
+Set up a cron or event-driven monitor that runs this query every few minutes
+(or on every confirmed `filled` event). Alert on any intent that has been in
+`Filled` state for more than 5 minutes; the clock is ticking toward `cancelExpired`
+on the source chain.
+
+**How to recover.** `dispatch_confirmation` is permissionless — any account can
+call it, not just the original solver. That is the designed recovery path:
+
+```typescript
+// Any keeper (including your own solver) can push a stalled confirmation.
+const lzFee = await settlementClient.quote_fill_confirmed_fee(srcEid);
+// Add a small buffer for fee fluctuation (~10%).
+await settlementClient.dispatch_confirmation(
+  callerAddress,
+  intentHash,
+  BigInt(Math.ceil(Number(lzFee) * 1.1)),
+);
+```
+
+**Keeper incentive.** The contract admin can configure `dispatch_keeper_reward`
+(independently of `keeper_reward` for cancellations) via
+`set_dispatch_keeper_reward`. When non-zero, a caller of `dispatch_confirmation`
+other than the solver receives that many stroops from the contract's native
+token balance, once the fill has been unconfirmed for about 30 minutes
+(`DISPATCH_REWARD_GRACE_LEDGERS`, 360 ledgers). This compensates the LayerZero
+fee for a stalled confirmation, making it economically rational for a
+third-party keeper service to push it through. The solver's own dispatch never
+earns the reward. See `docs/ECONOMICS.md` for the rationale.
+
+Check the current reward and whether it covers your expected `lz_fee`:
+
+```typescript
+const reward = await settlementClient.dispatch_keeper_reward();
+const fee    = await settlementClient.quote_fill_confirmed_fee(srcEid);
+if (reward >= fee) {
+  // Profitable for any keeper; rely on external keepers as backstop.
+} else {
+  // Self-serve only: your solver must ensure it remains funded.
+  logger.warn("dispatch_keeper_reward does not cover lz_fee — no external incentive");
+}
+```
+
+**Checklist for preventing this state:**
+1. Always call `dispatch_confirmation` immediately after `deliver_intent` in
+   your fill loop. Use `quote_fill_confirmed_fee` to size the fee; never pass
+   0 when targeting mainnet.
+2. Keep `PERIHELION_STELLAR_NATIVE_FEE_FLOOR` set to cover both `deliver_intent`
+   *and* `dispatch_confirmation` (see [Native balance](#native-balance)).
+   The worst position is running out of XLM between the two calls.
+3. Monitor `list_undispatched_intents` on a short interval. Treat any alert as
+   critical — you are racing the source chain's `cancelExpired` grace period.
+4. Keep a funded fallback account that can call `dispatch_confirmation` as a
+   keeper, independent of your main solver keypair.
 
 ## Performance Tips
 

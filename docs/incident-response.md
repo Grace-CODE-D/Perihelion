@@ -162,6 +162,16 @@ remain locked or unresolved beyond the deadline.
    ```
    - **Logging:** Log this action with timestamp, intent hash, and reason in an
      audit log. Post to #incidents on Slack with details.
+   - **Reason codes:** The settlement contract records the cancellation reason
+     carried end-to-end from the source message. The relayer preserves the
+     `CancelIntent` reason rather than defaulting it, so the recorded value
+     distinguishes operator action from expiry:
+     - `EXPIRED = 0x00` — intent cancelled because its deadline passed
+     - `ADMIN = 0x01` — intent cancelled by an admin/operator action
+     - `INVALID = 0x02` — intent cancelled because the message was invalid
+     When auditing a cancellation, confirm the recorded reason matches the
+     source event. An admin cancellation recorded as `EXPIRED` (or vice versa)
+     indicates a delivery bug and must be escalated.
 
 4. **If deadline has passed and funds are locked on EVM:**
    - User has a local-fallback refund available (`cancelExpired` on EVM)
@@ -757,6 +767,13 @@ This is a **forensic investigation.** Every step must be documented.
    # - [STUCK] EVM released but Soroban still pending — message loss
    # - [FORGED] Soroban released but EVM has no lock — impossible state
    ```
+
+   When a cancellation is involved, also compare the recorded cancellation
+   reason against the source message. The relayer carries the `CancelIntent`
+   reason through to the settlement contract, so the recorded code must match:
+   `EXPIRED = 0x00`, `ADMIN = 0x01`, `INVALID = 0x02`. A mismatch (for example,
+   an operator cancellation recorded as `EXPIRED`) means the reason was lost in
+   delivery and should be treated as a relayer defect.
 
 2. **For each BAD / FORGED intent, trace the message:**
    ```bash

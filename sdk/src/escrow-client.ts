@@ -20,8 +20,6 @@ import type {
   PublicClient,
   WalletClient,
   Address,
-  Chain,
-  Account,
 } from "viem";
 import type { Intent, Hex } from "./types.js";
 import { ESCROW_ABI } from "./escrow-abi.js";
@@ -68,8 +66,8 @@ export class PerihelionEscrowClient {
       payer ??
       this.walletClient.account?.address ??
       (intent.preferredSolver !== "0x0000000000000000000000000000000000000000"
-        ? (intent.preferredSolver as Address)
-        : (intent.user as Address));
+        ? (intent.preferredSolver)
+        : (intent.user));
 
     const fee = await this.publicClient.readContract({
       address: this.escrowAddress,

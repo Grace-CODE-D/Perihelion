@@ -67,6 +67,11 @@ comment:
   require_changes: false    # post comment even when coverage is unchanged
   require_base: false       # post comment even on the first PR to a branch
   require_head: true        # do not post without a head upload
+  # Wait for all six per-flag uploads (ts-sdk, ts-solver, ts-relayer,
+  # ts-mempool, soroban, evm) before posting the PR comment. This replaces the
+  # removed `coverage-summary` job that re-invoked the Codecov action with no
+  # coverage files.
+  after_n_builds: 6
 
 # ── Paths to exclude from coverage ───────────────────────────────────────────
 # Test files, generated artifacts, and scripts do not need coverage themselves.

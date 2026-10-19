@@ -28,7 +28,7 @@ including cross-layer synonyms (e.g., "release" vs. "settle") used throughout th
 | Component | Status | Current state | Target |
 |-----------|--------|-----------------|---------|
 | **Soroban LayerZero Endpoint** | Interface + Mock | `contracts/soroban/settlement/src/endpoint.rs` defines `LzEndpoint` as a swappable abstraction; a mock implements it locally | Real endpoint or thin adapter once Soroban LayerZero stack is GA |
-| **Inbound FillInstruction Codec** | Pending | Typed stub; deserialization deferred | Full implementation after cross-chain message format is finalized (#2) |
+| **Inbound FillInstruction Codec** | Implemented and reachable | `messages.rs` decodes FillInstruction/CancelIntent from raw wire bytes and `Perihelion::lz_receive_bytes` puts that decoder on a callable path alongside the typed `lz_receive` (see §3.3.2) | LayerZero adapter contract that delivers raw bytes; field-level fixes tracked separately (#271) |
 | **Relayer Watcher & Delivery** | Stubs | Message watcher and delivery in `relayer/` are stubbed for local testing | Production relayer implementations in active development |
 | **Solver Executor** | Unimplemented | Not yet implemented in `solver/` | Required for Phase 1 (#5) |
 | **Value Caps & Circuit Breaker** | Pending | No per-intent maxima or rolling-window caps yet | Per-intent and window-based limits, timelock-governed (#145) |
@@ -131,11 +131,13 @@ exceed worst-case cross-chain latency (LayerZero relay + Stellar finality). A
 `cancelExpired` call that lands before the grace window opens reverts with
 `DeadlineNotPassed()`.
 
-**Soroban preferred-solver reservation:**
-If an intent has a `preferred_solver`, only that solver may fill during the
-`reservation_window` seconds after `FillInstruction` is received. After the
-window lapses (`reservation_expires`), any solver may fill — preventing a
-preferred solver from indefinitely blocking settlement.
+**Preferred-solver reservation is EVM-lock-only:**
+The EVM escrow enforces `preferredSolver` when the user locks funds. The
+wire-format words remain reserved for compatibility, but an EVM address cannot
+be represented as a Soroban `Address`; the Stellar settlement contract drops
+the value, keeps `reservation_window` at zero, and allows any solver to fill
+after registration. Cross-chain solver identity requires a future explicit
+mapping and must not be inferred from the current payload.
 
 ### Nonce-degradation path
 
@@ -652,7 +654,8 @@ impl Perihelion {
                 dst_eid: rec.src_eid,
                 receiver: peer,
                 message,
-                options: default_options(&env),
+                options: Bytes::new(&env),
+                pay_in_lz_token: false,
             },
             &caller,
             &lz_fee,
@@ -956,20 +959,31 @@ fields. Amounts are unsigned 128-bit in the asset's smallest unit.
 | 94 | 69 | `dest_asset` | Canonical Stellar asset text, including `CODE:ISSUER`, right-zero-padded if needed. |
 | 163 | 16 | `min_dest_amount` | u128 slippage floor. |
 | 179 | 8 | `deadline` | u64 unix seconds. |
-| 187 | 32 | `preferred_solver` | EVM address in a 32-byte word, or 32 zero bytes for open. |
-| **219** | | **total** | |
+| 187 | 32 | `locked_solver` | EVM address that called `lock`, left-padded to 32 bytes. Mandatory in canonical release payloads and exclusive until the reservation window expires. |
+| 219 | 8 | `reservation_window` | Exclusive duration in seconds, bounded by `deadline`; after expiry another solver may fill before the source refund grace period closes. |
+| **227** | | **total** | |
 
 **`FillConfirmed` (Stellar → source)** — authorizes solver payout on source.
 
 | Offset | Size | Field | Consumer | Description |
 |--------|------|-------|----------|-------------|
 | 2 | 32 | `intent_hash` | **EVM escrow** | Identifies the lock to release. Must match a live, unfinalized lock. |
-| 34 | 32 | `solver_evm` | **EVM escrow** | Left-padded EVM payout address. The escrow transfers `l.amount` to this address. May differ from the locking solver key (hot lock / cold payout). |
+| 34 | 32 | `solver_evm` | **EVM escrow** | Left-padded EVM payout identity. It must equal `locked_solver` while the reservation window is active; after expiry it may identify the solver that completed the permissionless fill. |
 | 66 | 16 | `fill_amount` | **Off-chain / event log** | u128 Stellar-side delivery amount — **informational only**. Does not control the EVM release; the escrow releases `l.amount` (the measured-delta locked value). Decoded and emitted in the `Released` event for off-chain reconciliation without a separate RPC call. Encoding as u128 matches the `min_dest_amount` width in FillInstruction. |
 | 82 | 8 | `fill_ledger` | **Off-chain / event log** | u64 Stellar ledger sequence at fill time — **informational only**. Sourced from `u32 env.ledger().sequence()` and widened to u64 on the wire: (1) future-proofs against the eventual Stellar u32 overflow (~136 years at current rates) without a breaking wire change; (2) matches the EVM `uint64` receiver width. Decoded and emitted in `Released` for dispute resolution and explorer display. |
 | **90** | | **total** | | |
 
-**`CancelIntent` (either direction)** — instructs the receiver to unwind.
+**`CancelIntent` (Soroban → EVM only)** — instructs the EVM escrow to refund the user.
+
+The EVM escrow never sends `CancelIntent` to Stellar. An EVM-originated cancel
+cannot be made safe: Stellar can fill an intent after the EVM refund boundary, so
+a cancel that reached Stellar after a local refund would not stop the fill and
+would pay the user and the solver for the same intent. Instead the protocol relies
+on timing. Stellar refuses fills within `MIN_DISPATCH_WINDOW` of the deadline, and
+the EVM `cancelExpired` opens only after `deadline + confirmationGrace`, so the two
+paths cannot both complete. The Soroban inbound `CancelIntent` handler is retained
+and tested, and it tombstones an intent whose cancel overtakes its FillInstruction
+(unordered delivery). No EVM code path produces it.
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -1072,6 +1086,47 @@ When introducing version `N+1`:
 - [ ] Update this section and the conformance-vector README to reflect the new
       current version and retired version.
 
+### 3.3.2 Where raw-bytes decoding lives (issue #722)
+
+The contract exposes **two** inbound entrypoints that share one trust boundary and
+one dispatch path:
+
+| Entrypoint | Argument | When to use it |
+|------------|----------|----------------|
+| `lz_receive` | `message: LzMessage` | The endpoint (or adapter) already decoded the payload and marshals a typed `LzMessage` through the Soroban ABI. |
+| `lz_receive_bytes` | `message: Bytes` | The endpoint hands over the unmodified LayerZero `message` bytes. The contract decodes them itself. |
+
+Release builds expose one production inbound message entrypoint: `lz_receive_bytes`.
+It authenticates the endpoint and peer, parses the canonical LayerZero message bytes,
+and applies nonce/pause/handler checks. The former typed `lz_receive` adapter is
+compiled only for tests or when the explicitly opt-in `typed-inbound` feature is
+enabled; it is never a release bypass.
+
+The relayer submits the raw canonical payload observed/generated for the EVM
+LayerZero packet and never reconstructs a typed Soroban enum.
+
+`lz_receive_bytes` runs this sequence:
+
+1. **Authenticate** — `authorize_inbound` requires the configured endpoint's
+   authorization and that `origin.sender` equals `Peer(origin.src_eid)`. No byte
+   is parsed before this passes, so malformed payloads from anyone but the
+   registered peer are rejected as `UntrustedPeer` rather than as a decode error.
+2. **Decode (raw path only)** — `messages::decode_message` validates the version
+   byte and message type, then routes to `decode_fill_instruction` /
+   `decode_cancel_intent`. This is the same function the differential-fuzz
+   harness (`fuzz.rs`) calls, so the fuzzed codec *is* the live codec.
+3. **Dispatch** — `apply_inbound` applies the pause gate (FillInstruction is
+   blocked while paused; CancelIntent stays available as an exit path), consumes
+   the transport nonce exactly once, and calls `on_fill_instruction` /
+   `on_cancel_inbound`.
+
+The decoders are `pub` and compiled into the release `cdylib`; they are no longer
+`#[allow(dead_code)]` helpers reachable only from tests. `endpoint.rs` is still a
+mock, so the adapter that will actually deliver raw bytes — and the DVN
+verification in front of it — remains unimplemented (§3.2); the differential-fuzz
+harness verifies **codec parity against the specification**, not parity against a
+live endpoint.
+
 ### 3.4 Nonce management — LayerZero vs. Perihelion
 
 There are **two distinct nonce systems**, intentionally separate:
@@ -1153,12 +1208,12 @@ interface IPerihelionEscrow {
         uint256 minDestAmount;   // slippage floor on Stellar
         uint256 deadline;        // unix seconds; refundable after
         uint256 nonce;           // intent uniqueness (commits into hash)
-        address preferredSolver; // exclusive solver, or address(0)
+        address preferredSolver; // preferred solver during its reservation window, or address(0)
     }
 
     /// @notice Emitted when a solver locks a user's funds against an intent.
     /// @param intentHash EIP-712 id (I5).
-    /// @param solver     Address that will be repaid on confirmed fill.
+    /// @param solver     Address that is exclusive during the reservation window and is repaid on fill.
     /// @param user       Funds owner.
     /// @param asset      ERC-20 locked.
     /// @param amount     Amount actually received by escrow (post-transfer delta).

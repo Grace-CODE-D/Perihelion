@@ -1,10 +1,15 @@
 [workspace]
-resolver = "2"
+# Resolver 3 is MSRV-aware: `cargo update` (including Dependabot) prefers
+# versions whose `rust-version` fits `[workspace.package].rust-version`.
+resolver = "3"
 members = ["settlement"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Keep in step with `channel` in /rust-toolchain.toml (checked by
+# scripts/check-toolchain.sh).
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/Perihelion-Protocol/Perihelion"
 

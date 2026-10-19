@@ -15,14 +15,17 @@
 
 #![cfg(test)]
 
+use crate::types::{CANCEL_INTENT_LENGTH, FILL_CONFIRMED_LENGTH, FILL_INSTRUCTION_LENGTH};
+
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env};
+use soroban_sdk::{Address, Bytes, BytesN, Env};
 
 use crate::messages::{decode_message, encode_cancel_intent, encode_fill_confirmed};
 use crate::types::{
-    CANCEL_REASON_ADMIN, CANCEL_REASON_EXPIRED, CANCEL_REASON_INVALID, MSG_CANCEL_INTENT,
-    MSG_FILL_CONFIRMED, MSG_FILL_INSTRUCTION, PROTOCOL_VERSION,
+    CANCEL_INTENT_LENGTH, CANCEL_REASON_ADMIN, CANCEL_REASON_EXPIRED, CANCEL_REASON_INVALID,
+    FILL_CONFIRMED_LENGTH, FILL_INSTRUCTION_LENGTH, MSG_CANCEL_INTENT, MSG_FILL_CONFIRMED,
+    MSG_FILL_INSTRUCTION, PROTOCOL_VERSION,
 };
 
 use proptest::prelude::*;
@@ -101,7 +104,11 @@ proptest! {
         );
 
         // Assert layout: version(1) | type(1) | hash(32) | solver(32) | amount(16) | ledger(8)
-        assert_eq!(encoded.len(), 90, "FillConfirmed must be 90 bytes");
+        assert_eq!(
+            encoded.len(),
+            FILL_CONFIRMED_LENGTH,
+            "FillConfirmed must use its shared wire width"
+        );
         assert_eq!(encoded.get(0).unwrap(), PROTOCOL_VERSION);
         assert_eq!(encoded.get(1).unwrap(), MSG_FILL_CONFIRMED);
 
@@ -159,7 +166,7 @@ proptest! {
         // The Rust encoder does not validate solver_evm high bits (it's a pass-through).
         // The rejection happens on the Solidity decode side — this test ensures
         // we generate the adversarial case for cross-validation.
-        assert_eq!(encoded.len(), 90);
+        assert_eq!(encoded.len(), FILL_CONFIRMED_LENGTH);
     }
 }
 
@@ -205,6 +212,7 @@ fn fill_instruction_matches_golden_vector() {
         // encode_fill_instruction writes [0u8; 32] for preferred_solver regardless
         // of this field — "open" (no reservation) is the canonical wire value.
         preferred_solver: None,
+        locked_solver: None,
         reservation_window: 0,
     };
     let encoded = crate::messages::encode_fill_instruction(&env, &fi);
@@ -215,7 +223,13 @@ fn fill_instruction_matches_golden_vector() {
         crate::types::FILL_INSTRUCTION_LENGTH,
         "golden FillInstruction vector has the wrong length"
     );
-    assert_eq!(encoded.len() as usize, expected.len(), "length mismatch: encoder produced {} bytes, golden vector is {} bytes", encoded.len(), expected.len());
+    assert_eq!(
+        encoded.len() as usize,
+        expected.len(),
+        "length mismatch: encoder produced {} bytes, golden vector is {} bytes",
+        encoded.len(),
+        expected.len()
+    );
     for (i, b) in expected.iter().enumerate() {
         assert_eq!(encoded.get(i as u32).unwrap(), *b, "byte {} mismatch", i);
     }
@@ -224,7 +238,7 @@ fn fill_instruction_matches_golden_vector() {
 /// Minimal `0x`-prefixed hex decoder (mirrors `test.rs::decode_vector`, kept
 /// local here since `fuzz.rs` and `test.rs` are compiled as siblings, not a
 /// shared module).
-fn decode_hex(s: &str) -> std::vec::Vec<u8> {
+pub(crate) fn decode_hex(s: &str) -> std::vec::Vec<u8> {
     let s = s.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
     let bytes = s.as_bytes();
@@ -278,11 +292,12 @@ fn fill_instruction_recipient_round_trips_with_227_byte_format() {
     payload.push_back(MSG_FILL_INSTRUCTION);
     payload.append(&Bytes::from_array(&env, &[0xAAu8; 32])); // intent_hash
     payload.append(&Bytes::from_array(&env, &30316u32.to_be_bytes())); // src_eid
-    payload.append(&Bytes::from_array(&env, &strkey_bytes));    // recipient (56 bytes, full strkey text)
+    payload.append(&Bytes::from_array(&env, &strkey_bytes)); // recipient (56 bytes, full strkey text)
     payload.append(&Bytes::from_array(&env, &dest_asset_bytes)); // dest_asset (69 bytes)
     payload.append(&Bytes::from_array(&env, &1_000_000_000u128.to_be_bytes()));
     payload.append(&Bytes::from_array(&env, &9_999_999_999u64.to_be_bytes()));
     payload.append(&Bytes::from_array(&env, &[0u8; 32])); // preferred_solver: open
+    payload.append(&Bytes::from_array(&env, &0u64.to_be_bytes())); // reservation_window: none
 
     assert_eq!(
         payload.len(),
@@ -318,7 +333,7 @@ proptest! {
         let encoded = encode_cancel_intent(&env, &intent_hash_bytes, reason);
 
         // Assert layout: version(1) | type(1) | hash(32) | reason(1)
-        assert_eq!(encoded.len(), 35, "CancelIntent must be 35 bytes");
+        assert_eq!(encoded.len(), CANCEL_INTENT_LENGTH, "CancelIntent must be 35 bytes");
         assert_eq!(encoded.get(0).unwrap(), PROTOCOL_VERSION);
         assert_eq!(encoded.get(1).unwrap(), MSG_CANCEL_INTENT);
 
@@ -351,7 +366,7 @@ proptest! {
         encoded.append(&Bytes::from_array(&env, &intent_hash));
         encoded.push_back(bad_reason);
 
-        assert_eq!(encoded.len(), 35);
+        assert_eq!(encoded.len(), CANCEL_INTENT_LENGTH);
         export_to_corpus("cancel_intent_bad_reason", &encoded);
 
         // Verify the Rust decoder also rejects the bad reason code.
@@ -372,10 +387,32 @@ proptest! {
 // Corpus export for cross-language validation
 // -------------------------------------------------------------------------
 
-/// Export a payload to the shared fuzz corpus directory for Solidity to consume.
+/// Resolve the directory where generated corpus files are written.
+///
+/// Generated payloads are *not* written into the tracked
+/// `contracts/shared/wire-vectors/fuzz-corpus/` directory (that directory holds
+/// hand-curated regression inputs and is read-only for tests). Instead they go
+/// to an ignored location:
+///
+/// 1. `$PERIHELION_FUZZ_CORPUS_DIR` if set (used by the CI cross-validation job
+///    to point at a directory it can upload as an artifact), otherwise
+/// 2. `target/fuzz-corpus/` under the Cargo target directory.
+fn corpus_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("PERIHELION_FUZZ_CORPUS_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    // `CARGO_TARGET_DIR` is honoured by Cargo; fall back to the conventional
+    // `target/` directory next to the workspace root.
+    let target_dir = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target"),
+    };
+    target_dir.join("fuzz-corpus")
+}
+
+/// Export a payload to the generated fuzz corpus directory for Solidity to consume.
 fn export_to_corpus(name: &str, payload: &Bytes) {
-    let corpus_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shared/wire-vectors/fuzz-corpus");
+    let corpus_dir = corpus_dir();
     fs::create_dir_all(&corpus_dir).expect("Failed to create corpus dir");
 
     let mut hex = String::with_capacity(payload.len() as usize * 2 + 2);
@@ -399,14 +436,19 @@ mod tests {
         let solver = BytesN::from_array(&env, &[0xAAu8; 32]);
         let encoded = encode_fill_confirmed(&env, &hash, &solver, 1_000_000, 42);
         export_to_corpus("test_export", &encoded);
-        // Verify file exists
-        let corpus_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shared/wire-vectors/fuzz-corpus");
-        let file_path = corpus_dir.join("test_export.hex");
+        // Verify file exists in the generated (ignored) corpus directory, not
+        // in the tracked `contracts/shared/wire-vectors/fuzz-corpus/` directory.
+        let file_path = corpus_dir().join("test_export.hex");
         assert!(file_path.exists(), "Corpus file should exist");
+        assert!(
+            !file_path.starts_with(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shared/wire-vectors")
+            ),
+            "generated corpus must not be written into the tracked wire-vectors directory"
+        );
     }
 
-    /// Regression: the 218-byte FillInstruction negative vector must be rejected
+    /// Regression: the 226-byte FillInstruction negative vector must be rejected
     /// by the Soroban decoder with MalformedPayload (length check: expects 227).
     #[test]
     fn fill_instruction_short_neg_vector_is_rejected() {
@@ -414,7 +456,11 @@ mod tests {
             include_str!("../../../shared/wire-vectors/neg/fill_instruction_short.hex");
         let env = Env::default();
         let bytes = decode_hex(SHORT);
-        assert_eq!(bytes.len(), 218, "fill_instruction_short.hex must be 218 bytes");
+        assert_eq!(
+            bytes.len(),
+            FILL_INSTRUCTION_LENGTH as usize - 1,
+            "fill_instruction_short.hex must be one byte shorter than FILL_INSTRUCTION_LENGTH"
+        );
         let mut payload = Bytes::new(&env);
         for b in bytes {
             payload.push_back(b);
@@ -422,19 +468,18 @@ mod tests {
         let result = crate::messages::decode_message(&env, &payload);
         assert!(
             result.is_err(),
-            "decoder must reject a 218-byte FillInstruction (expects 227)"
+            "decoder must reject a 226-byte FillInstruction (expects 227)"
         );
     }
 
-    /// Regression: the 220-byte FillInstruction negative vector must be rejected
-    /// by the Soroban decoder with MalformedPayload (length check: expects 227).
+    /// Regression: the 227-byte FillInstruction negative vector with bad version must be rejected.
     #[test]
     fn fill_instruction_bad_version_neg_vector_is_rejected() {
         const BAD_VERSION: &str =
             include_str!("../../../shared/wire-vectors/neg/fill_instruction_bad_version.hex");
         let env = Env::default();
         let bytes = decode_hex(BAD_VERSION);
-        assert_eq!(bytes.len(), 219);
+        assert_eq!(bytes.len(), FILL_INSTRUCTION_LENGTH as usize);
         let mut payload = Bytes::new(&env);
         for b in bytes {
             payload.push_back(b);
@@ -451,7 +496,7 @@ mod tests {
             include_str!("../../../shared/wire-vectors/neg/fill_instruction_bad_type.hex");
         let env = Env::default();
         let bytes = decode_hex(BAD_TYPE);
-        assert_eq!(bytes.len(), 219);
+        assert_eq!(bytes.len(), FILL_INSTRUCTION_LENGTH as usize);
         let mut payload = Bytes::new(&env);
         for b in bytes {
             payload.push_back(b);
@@ -468,7 +513,11 @@ mod tests {
             include_str!("../../../shared/wire-vectors/neg/fill_instruction_long.hex");
         let env = Env::default();
         let bytes = decode_hex(LONG);
-        assert_eq!(bytes.len(), 220, "fill_instruction_long.hex must be 220 bytes");
+        assert_eq!(
+            bytes.len(),
+            FILL_INSTRUCTION_LENGTH as usize + 1,
+            "fill_instruction_long.hex must be one byte longer than FILL_INSTRUCTION_LENGTH"
+        );
         let mut payload = Bytes::new(&env);
         for b in bytes {
             payload.push_back(b);
@@ -476,7 +525,7 @@ mod tests {
         let result = crate::messages::decode_message(&env, &payload);
         assert!(
             result.is_err(),
-            "decoder must reject a 220-byte FillInstruction (expects 227)"
+            "decoder must reject a 228-byte FillInstruction (expects 227)"
         );
     }
 }

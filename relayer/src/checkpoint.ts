@@ -16,6 +16,24 @@ export interface CheckpointStore {
   load(): Promise<number | undefined>;
   /** Persist the cursor. Called after each tick that advances it. */
   save(block: number): Promise<void>;
+
+  /**
+   * Load the last emitted LayerZero nonce for a given path, or `undefined`
+   * if none has been emitted yet. The path is identified by the source
+   * endpoint id and the destination endpoint id.
+   *
+   * Used when the relayer impersonates the LayerZero endpoint during
+   * development (issue #936): the nonce must be strictly increasing per
+   * path and survive restarts, otherwise the settlement contract's replay
+   * guard rejects deliveries as `StaleNonce`.
+   */
+  loadNonce(srcEid: number, dstEid: number): Promise<number | undefined>;
+  /**
+   * Persist the last emitted LayerZero nonce for a given path. Must be
+   * durable enough to survive a process crash, since reusing a nonce after
+   * a restart would be rejected as a replay by the settlement contract.
+   */
+  saveNonce(srcEid: number, dstEid: number, nonce: number): Promise<void>;
 }
 
 /** A checkpoint store that never persists; cursor resets to the start block on restart. */
@@ -24,4 +42,9 @@ export class NoopCheckpointStore implements CheckpointStore {
     return undefined;
   }
   async save(): Promise<void> {}
+
+  async loadNonce(): Promise<number | undefined> {
+    return undefined;
+  }
+  async saveNonce(): Promise<void> {}
 }

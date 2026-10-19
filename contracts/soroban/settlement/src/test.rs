@@ -46,9 +46,24 @@ impl MockEndpoint {
         BytesN::from_array(&env, &[0u8; 32])
     }
 
-    /// Returns 0 so that any non-negative lz_fee passes the pre-check in tests.
-    pub fn quote(_env: Env, _params: MessagingParams) -> i128 {
+    /// Returns 0 by default so that any non-negative lz_fee passes the pre-check in tests.
+    /// If `quote_dyn` flag is set, returns a fee dependent on message length.
+    pub fn quote(env: Env, params: MessagingParams) -> i128 {
+        let is_dynamic: bool = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("quote_dyn"))
+            .unwrap_or(false);
+        if is_dynamic {
+            return params.message.len() as i128;
+        }
         0
+    }
+
+    pub fn set_dynamic_quote(env: Env, is_dynamic: bool) {
+        env.storage()
+            .instance()
+            .set(&symbol_short!("quote_dyn"), &is_dynamic);
     }
 
     pub fn sent(env: Env) -> u32 {
@@ -68,14 +83,14 @@ impl MockEndpoint {
 
 // --- Test harness -------------------------------------------------------------
 
-struct Setup {
-    env: Env,
-    client: PerihelionClient<'static>,
-    mock: MockEndpointClient<'static>,
-    asset: Address,
-    asset_admin: token::StellarAssetClient<'static>,
-    src_eid: u32,
-    peer: BytesN<32>,
+pub(crate) struct Setup {
+    pub(crate) env: Env,
+    pub(crate) client: PerihelionClient<'static>,
+    pub(crate) mock: MockEndpointClient<'static>,
+    pub(crate) asset: Address,
+    pub(crate) asset_admin: token::StellarAssetClient<'static>,
+    pub(crate) src_eid: u32,
+    pub(crate) peer: BytesN<32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +101,9 @@ struct ResourceThreshold {
 
 #[derive(Debug, Deserialize)]
 struct ResourceBaselines {
+    // Deserialized to validate the baseline file; the wasm size itself is
+    // checked by the release build step, not in unit tests.
+    #[allow(dead_code)]
     max_wasm_size_bytes: u64,
     tolerance_percent: u64,
     entrypoints: BTreeMap<String, ResourceThreshold>,
@@ -146,7 +164,24 @@ fn assert_budget_within(
     );
 }
 
-fn setup() -> Setup {
+/// Register `peer` as the trusted counterparty for `eid` through the delayed
+/// peer-governance flow (issue #165): propose with the minimum delay, advance
+/// the clock past it, confirm, then restore the clock. Every test that just
+/// needs a configured peer goes through here, so the next change to the
+/// `propose_peer` / `confirm_peer` signatures touches one function.
+fn register_peer(env: &Env, client: &PerihelionClient, eid: u32, peer: &BytesN<32>) {
+    let now = env.ledger().timestamp();
+    client.propose_peer(&eid, peer, &MIN_PEER_CHANGE_DELAY);
+    env.ledger().with_mut(|li| {
+        li.timestamp = now + MIN_PEER_CHANGE_DELAY + 1;
+    });
+    client.confirm_peer(&eid);
+    env.ledger().with_mut(|li| {
+        li.timestamp = now;
+    });
+}
+
+pub(crate) fn setup() -> Setup {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|li| {
@@ -158,32 +193,21 @@ fn setup() -> Setup {
     let endpoint = env.register(MockEndpoint, ());
     let mock = MockEndpointClient::new(&env, &endpoint);
 
-    let id = env.register(Perihelion, ());
-    let client = PerihelionClient::new(&env, &id);
-
     // Create a mock native token for testing keeper rewards
     let issuer = Address::generate(&env);
     let native_sac = env.register_stellar_asset_contract_v2(issuer);
     let native_token = native_sac.address();
 
-    client.initialize(&admin, &endpoint, &native_token);
+    let id = env.register(Perihelion, (&admin, &endpoint, &native_token));
+    let client = PerihelionClient::new(&env, &id);
 
     let src_eid = 30101u32;
     let peer = BytesN::from_array(&env, &[0xEE; 32]);
-    // Peer governance (issue #165): propose, advance time, confirm
-    client.propose_peer(&src_eid, &peer);
-    env.ledger().with_mut(|li| {
-        li.timestamp = 1_000 + MIN_PEER_CHANGE_DELAY + 1;
-    });
-    client.confirm_peer(&src_eid);
-    // confirm_peer only requires that the delay has elapsed since propose_peer;
-    // nothing about the confirmed peer depends on the clock staying advanced.
-    // Reset it back to the setup() baseline so every test's `deadline` fixture
-    // values (written against a ~1_000 clock) aren't already expired the
-    // moment setup() returns.
-    env.ledger().with_mut(|li| {
-        li.timestamp = 1_000;
-    });
+    // Peer governance (issue #165): propose, advance time, confirm. The helper
+    // resets the clock to the setup() baseline afterwards so every test's
+    // `deadline` fixture values (written against a ~1_000 clock) aren't
+    // already expired the moment setup() returns.
+    register_peer(&env, &client, src_eid, &peer);
 
     let issuer = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(issuer);
@@ -201,12 +225,24 @@ fn setup() -> Setup {
     }
 }
 
-fn hash(env: &Env, b: u8) -> BytesN<32> {
+pub(crate) fn hash(env: &Env, b: u8) -> BytesN<32> {
     BytesN::from_array(env, &[b; 32])
 }
 
+/// A solver EVM identity in the shape the EVM escrow decodes: a 20-byte
+/// address left-padded with 12 zero bytes to 32.
+pub(crate) fn evm_solver(env: &Env, b: u8) -> BytesN<32> {
+    let mut raw = [0u8; 32];
+    raw[12..].fill(b);
+    BytesN::from_array(env, &raw)
+}
+
+fn advance_ledgers(s: &Setup, ledgers: u32) {
+    s.env.ledger().with_mut(|li| li.sequence_number += ledgers);
+}
+
 #[allow(clippy::too_many_arguments)]
-fn register_intent(
+pub(crate) fn register_intent(
     s: &Setup,
     h: &BytesN<32>,
     recipient: &Address,
@@ -237,6 +273,7 @@ fn register_intent_with_window(
         min_dest_amount: min,
         deadline,
         preferred_solver: preferred,
+        locked_solver: None,
         reservation_window,
     };
     let origin = Origin {
@@ -282,7 +319,7 @@ fn resource_budget_baselines_are_within_thresholds() {
         .get("fill_intent")
         .expect("fill_intent baseline missing");
     register_intent(&s, &h2, &recipient, 100_000, 5_000, 2, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let solver_evm = evm_solver(&s.env, 0x11);
     let (fill_cpu, fill_mem) = measure_entrypoint_budget(&s, |s| {
         s.client
             .fill_intent(&solver, &solver_evm, &h2, &250_000, &0);
@@ -328,7 +365,7 @@ fn registers_and_fills() {
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
     assert!(s.client.get_intent(&h).is_some());
 
-    let solver_evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let solver_evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &solver_evm, &h, &250_000, &0);
 
     let tok = token::TokenClient::new(&s.env, &s.asset);
@@ -361,6 +398,94 @@ fn cancel_after_deadline_notifies_source() {
     );
 }
 
+/// Issue 915: inbound delivery is unordered, so a CancelIntent can overtake the
+/// FillInstruction it refers to. The late registration must be ignored, so an
+/// intent the source chain already cancelled can never be filled.
+#[test]
+fn cancel_before_fill_instruction_blocks_late_registration() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let h = hash(&s.env, 0xC1);
+    let ci = CancelInstruction {
+        intent_hash: h.clone(),
+        reason: CANCEL_REASON_EXPIRED as u32,
+    };
+    let origin = Origin {
+        src_eid: s.src_eid,
+        sender: s.peer.clone(),
+        nonce: 1,
+    };
+    let guid = BytesN::from_array(&s.env, &[0u8; 32]);
+    s.client
+        .lz_receive(&origin, &guid, &LzMessage::Cancel(ci));
+
+    // The FillInstruction arrives afterwards on a later nonce.
+    register_intent(&s, &h, &recipient, 100_000, 9_000, 2, None);
+
+    assert!(
+        s.client.get_intent(&h).is_none(),
+        "late FillInstruction must not register a cancelled intent"
+    );
+    assert_eq!(s.client.status(&h), Some(IntentStatus::Cancelled));
+
+    let solver_evm = evm_solver(&s.env, 0xAB);
+    let fill = s
+        .client
+        .try_deliver_intent(&solver, &solver_evm, &h, &100_000);
+    assert!(fill.is_err(), "a cancelled intent must not be fillable");
+    assert_eq!(
+        token::TokenClient::new(&s.env, &s.asset).balance(&recipient),
+        0,
+        "no destination asset may move for a cancelled intent"
+    );
+}
+
+/// Issue 917: a solver_evm the EVM escrow cannot decode must be rejected before
+/// any token moves. Otherwise the destination transfer settles on Stellar and
+/// the FillConfirmed then reverts on EVM, stranding the fill.
+#[test]
+fn rejects_malformed_solver_evm_before_any_transfer() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let h = hash(&s.env, 0xD1);
+    register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
+
+    // A left-justified 20-byte address: its bytes sit in the high 12 positions.
+    let mut left_justified = [0u8; 32];
+    left_justified[..20].fill(0xAB);
+    let malformed = [
+        BytesN::from_array(&s.env, &left_justified),
+        BytesN::from_array(&s.env, &[0u8; 32]),
+    ];
+
+    for solver_evm in malformed {
+        let err = s
+            .client
+            .try_deliver_intent(&solver, &solver_evm, &h, &100_000)
+            .expect_err("malformed solver_evm must be rejected")
+            .unwrap();
+        assert_eq!(err, PerihelionError::InvalidSolverEvm);
+
+        let err = s
+            .client
+            .try_fill_intent(&solver, &solver_evm, &h, &100_000, &0)
+            .expect_err("malformed solver_evm must be rejected")
+            .unwrap();
+        assert_eq!(err, PerihelionError::InvalidSolverEvm);
+    }
+
+    let token = token::TokenClient::new(&s.env, &s.asset);
+    assert_eq!(token.balance(&solver), 1_000_000, "solver must keep its funds");
+    assert_eq!(token.balance(&recipient), 0, "no destination asset may move");
+    assert_eq!(s.client.status(&h), Some(IntentStatus::Locked));
+}
+
 // --- Invariant guards ---------------------------------------------------------
 
 #[test]
@@ -372,7 +497,7 @@ fn rejects_double_fill() {
     s.asset_admin.mint(&solver, &1_000_000);
     let h = hash(&s.env, 3);
     register_intent(&s, &h, &recipient, 1, 5_000, 1, None);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &100, &0);
     s.client.fill_intent(&solver, &evm, &h, &100, &0); // already settled
 }
@@ -386,7 +511,7 @@ fn rejects_fill_below_floor() {
     s.asset_admin.mint(&solver, &1_000_000);
     let h = hash(&s.env, 4);
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &99_999, &0);
 }
 
@@ -400,7 +525,7 @@ fn rejects_fill_after_deadline() {
     let h = hash(&s.env, 5);
     register_intent(&s, &h, &recipient, 1, 5_000, 1, None);
     s.env.ledger().with_mut(|li| li.timestamp = 5_000); // == deadline
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &100, &0);
 }
 
@@ -420,23 +545,9 @@ fn rejects_cancel_before_deadline() {
 fn rejects_fill_of_unknown_intent() {
     let s = setup();
     let solver = Address::generate(&s.env);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client
         .fill_intent(&solver, &evm, &hash(&s.env, 99), &100, &0);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #132)")] // ReservedForSolver
-fn rejects_fill_by_non_preferred_solver() {
-    let s = setup();
-    let recipient = Address::generate(&s.env);
-    let preferred = Address::generate(&s.env);
-    let solver = Address::generate(&s.env);
-    s.asset_admin.mint(&solver, &1_000_000);
-    let h = hash(&s.env, 7);
-    register_intent(&s, &h, &recipient, 1, 5_000, 1, Some(preferred));
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
-    s.client.fill_intent(&solver, &evm, &h, &100, &0);
 }
 
 #[test]
@@ -452,6 +563,7 @@ fn rejects_message_from_untrusted_peer() {
         min_dest_amount: 1,
         deadline: 5_000,
         preferred_solver: None,
+        locked_solver: None,
         reservation_window: 0,
     };
     let bad_sender = BytesN::from_array(&s.env, &[0xAB; 32]);
@@ -495,19 +607,28 @@ fn nonce_unbounded_accepts_wide_gap_and_backfill() {
     // Nonce 1 — first message on a fresh channel.
     let h1 = hash(&s.env, 0xB1);
     register_intent(&s, &h1, &recipient, 1, 5_000, 1, None);
-    assert!(s.client.get_intent(&h1).is_some(), "nonce 1 must be accepted");
+    assert!(
+        s.client.get_intent(&h1).is_some(),
+        "nonce 1 must be accepted"
+    );
 
     // Nonce 100 — far ahead of nonce 1 (gap = 99, previously would have
     // advanced the base and thrown away [2, 99]).
     let h100 = hash(&s.env, 0xB2);
     register_intent(&s, &h100, &recipient, 1, 5_000, 100, None);
-    assert!(s.client.get_intent(&h100).is_some(), "nonce 100 must be accepted");
+    assert!(
+        s.client.get_intent(&h100).is_some(),
+        "nonce 100 must be accepted"
+    );
 
     // Nonce 50 — a back-fill that falls between the two already-delivered nonces.
     // This is the nonce the windowed bitmap would have silently dropped.
     let h50 = hash(&s.env, 0xB3);
     register_intent(&s, &h50, &recipient, 1, 5_000, 50, None);
-    assert!(s.client.get_intent(&h50).is_some(), "nonce 50 must be accepted after the gap");
+    assert!(
+        s.client.get_intent(&h50).is_some(),
+        "nonce 50 must be accepted after the gap"
+    );
 
     // Belt-and-suspenders: all three intents registered.
     assert!(s.client.get_intent(&h1).is_some());
@@ -547,6 +668,7 @@ fn nonce_unbounded_replay_returns_stale_nonce() {
             min_dest_amount: 1,
             deadline: 5_000,
             preferred_solver: None,
+            locked_solver: None,
             reservation_window: 0,
         };
         let origin = Origin {
@@ -557,11 +679,9 @@ fn nonce_unbounded_replay_returns_stale_nonce() {
         let guid = BytesN::from_array(&s.env, &[0u8; 32]);
         // on_fill_instruction will skip re-registration (idempotent), but
         // accept_nonce must still fire StaleNonce before we get there.
-        let result = s.client.try_lz_receive(
-            &origin,
-            &guid,
-            &LzMessage::FillInstruction(fi),
-        );
+        let result = s
+            .client
+            .try_lz_receive(&origin, &guid, &LzMessage::FillInstruction(fi));
         assert!(
             result.is_err(),
             "re-delivery of nonce {} must be rejected as StaleNonce",
@@ -590,7 +710,9 @@ fn nonce_unbounded_random_permutation_all_consumed_exactly_once() {
     let mut seed: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
     for i in (1..nonces.len()).rev() {
         // Knuth / Fisher–Yates with an LCG.
-        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let j = (seed >> 33) as usize % (i + 1);
         nonces.swap(i, j);
     }
@@ -610,6 +732,7 @@ fn nonce_unbounded_random_permutation_all_consumed_exactly_once() {
             min_dest_amount: 1,
             deadline: 5_000,
             preferred_solver: None,
+            locked_solver: None,
             reservation_window: 0,
         };
         let origin = Origin {
@@ -649,6 +772,7 @@ fn nonce_unbounded_random_permutation_all_consumed_exactly_once() {
             min_dest_amount: 1,
             deadline: 5_000,
             preferred_solver: None,
+            locked_solver: None,
             reservation_window: 0,
         };
         let origin = Origin {
@@ -660,11 +784,7 @@ fn nonce_unbounded_random_permutation_all_consumed_exactly_once() {
         let result = s
             .client
             .try_lz_receive(&origin, &guid, &LzMessage::FillInstruction(fi));
-        assert!(
-            result.is_err(),
-            "replay of nonce {} must be rejected",
-            n
-        );
+        assert!(result.is_err(), "replay of nonce {} must be rejected", n);
     }
 }
 
@@ -678,7 +798,224 @@ fn nonce_zero_always_rejected() {
     register_intent(&s, &hash(&s.env, 0xF0), &recipient, 1, 5_000, 0, None);
 }
 
+// --- Issue #718: nonce-word pruning (bounded storage footprint) ---------------
 
+/// Attempt to deliver an intent for `nonce` via lz_receive without panicking.
+/// The intent hash is derived from the nonce (unique per nonce). Used to assert
+/// accept/reject decisions around the pruned floor.
+fn try_deliver_nonce(
+    s: &Setup,
+    eid: u32,
+    nonce: u64,
+    deadline: u64,
+) -> Result<(), PerihelionError> {
+    let mut hb = [0u8; 32];
+    hb[24..32].copy_from_slice(&nonce.to_be_bytes());
+    let h = BytesN::from_array(&s.env, &hb);
+    let fi = FillInstruction {
+        intent_hash: h,
+        src_eid: eid,
+        recipient: Address::generate(&s.env),
+        dest_asset: s.asset.clone(),
+        min_dest_amount: 1,
+        deadline,
+        preferred_solver: None,
+        locked_solver: None,
+        reservation_window: 0,
+    };
+    let origin = Origin {
+        src_eid: eid,
+        sender: s.peer.clone(),
+        nonce,
+    };
+    let guid = BytesN::from_array(&s.env, &[0u8; 32]);
+    let res = s
+        .client
+        .try_lz_receive(&origin, &guid, &LzMessage::FillInstruction(fi));
+    // A contract revert surfaces as Err(Ok(PerihelionError)) on the outer
+    // layer (same shape the other try_* assertions in this file rely on).
+    // The inner `Ok(Err(_))` is a host-side conversion failure of the return
+    // value, not a contract error, so it is a test bug rather than a verdict.
+    match res {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => panic!("lz_receive return value failed to convert: {e:?}"),
+        Err(e) => Err(e.expect("lz_receive aborted with a non-contract error")),
+    }
+}
+
+/// Consume `nonce` through the public lz_receive entrypoint (panics on error).
+fn deliver_nonce(s: &Setup, eid: u32, nonce: u64, deadline: u64) {
+    try_deliver_nonce(s, eid, nonce, deadline).expect("nonce must be accepted");
+}
+
+fn nonce_pruned_event_count(env: &Env) -> usize {
+    let expected = Symbol::new(env, "nonce_words_pruned");
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| {
+            topics.iter().any(|t| {
+                Symbol::try_from_val(env, &t)
+                    .map(|s| s == expected)
+                    .unwrap_or(false)
+            })
+        })
+        .count()
+}
+
+/// AC1 (issue #718): consuming several thousand nonces and pruning reclaims
+/// every fully-consumed word — the entry count falls — while every consumed
+/// nonce, including ones whose word was removed, is still rejected as stale.
+#[test]
+fn prune_reclaims_words_and_keeps_replay_protection() {
+    let s = setup();
+    let eid = s.src_eid;
+    let deadline = 5_000;
+
+    // Consume nonces 1..=3,200: words 0..=49 fully consumed. Word 0 is
+    // complete with only nonces 1..=63 (nonce 0 is invalid), words 1..=49
+    // need all 64 bits (nonce 3,199 is word 49's last). Nonce 3,200 opens
+    // word 50, leaving it partially consumed.
+    const LAST_NONCE: u64 = 3_200;
+    for n in 1u64..=LAST_NONCE {
+        deliver_nonce(&s, eid, n, deadline);
+    }
+    assert_eq!(s.client.get_inbound_nonce_floor(&eid), 0);
+
+    // Prune repeatedly until the floor stops advancing (work per call is
+    // capped by MAX_PRUNE_WORDS_PER_CALL; repeat calls advance further).
+    let mut rounds = 0u32;
+    loop {
+        let before = s.client.get_inbound_nonce_floor(&eid);
+        s.client.prune_nonce_words(&eid);
+        let after = s.client.get_inbound_nonce_floor(&eid);
+        if after == before {
+            break;
+        }
+        rounds += 1;
+        assert!(rounds <= 10, "pruning failed to converge");
+    }
+
+    // The floor now sits at the first nonce NOT covered by a reclaimed word:
+    // words 0..=49 were pruned (their rent recovered), only word 50 remains —
+    // steady-state storage no longer grows with total message volume.
+    let expected_floor = LAST_NONCE;
+    assert_eq!(
+        s.client.get_inbound_nonce_floor(&eid),
+        expected_floor,
+        "floor must advance past every fully-consumed word"
+    );
+
+    // Every consumed nonce below the floor — including ones whose bitmap word
+    // was deleted — is still rejected as stale, by the floor check alone.
+    for n in [1u64, 63, 64, 1000, 3199] {
+        let err = try_deliver_nonce(&s, eid, n, deadline)
+            .expect_err("replay of a consumed nonce must be rejected");
+        assert_eq!(err, PerihelionError::StaleNonce);
+    }
+}
+
+/// AC2 (issue #718): a partially-consumed word blocks the floor. Only fully
+/// consumed words are reclaimed; the incomplete word's nonces stay
+/// bitmap-tracked and fresh nonces from it are still accepted.
+#[test]
+fn prune_stops_at_partially_consumed_word() {
+    let s = setup();
+    let eid = s.src_eid;
+    let deadline = 5_000;
+
+    // Fully consume word 0 (nonces 1..=63), then only nonce 100 of word 1.
+    for n in 1u64..=63 {
+        deliver_nonce(&s, eid, n, deadline);
+    }
+    deliver_nonce(&s, eid, 100, deadline);
+
+    s.client.prune_nonce_words(&eid);
+
+    // Word 0 reclaimed: floor = first nonce of word 1.
+    assert_eq!(s.client.get_inbound_nonce_floor(&eid), 64);
+
+    // A late-arriving nonce below the floor (word pruned) is rejected...
+    let err = try_deliver_nonce(&s, eid, 5, deadline)
+        .expect_err("nonce below the floor must be rejected");
+    assert_eq!(err, PerihelionError::StaleNonce);
+
+    // ...while a fresh nonce from the partially-consumed word is accepted.
+    deliver_nonce(&s, eid, 99, deadline);
+}
+
+/// AC3 (issue #718): a gap in consumption blocks the floor at the gap. Words
+/// before the gap are reclaimed; once stragglers fill the gap word, the next
+/// prune reclaims it too and late replays stay rejected.
+#[test]
+fn prune_blocked_by_gap_until_stragglers_arrive() {
+    let s = setup();
+    let eid = s.src_eid;
+    let deadline = 5_000;
+
+    // Word 0 fully consumed (nonces 1..=63 suffice: nonce 0 is invalid).
+    // Word 1: only nonce 70 so far. Word 2+: empty.
+    for n in 1u64..=63 {
+        deliver_nonce(&s, eid, n, deadline);
+    }
+    deliver_nonce(&s, eid, 70, deadline);
+
+    s.client.prune_nonce_words(&eid);
+    assert_eq!(s.client.get_inbound_nonce_floor(&eid), 64);
+
+    // Stragglers of word 1 arrive (out of order; 70 was already consumed).
+    // Once all 64 bits are set the next prune reclaims the word and advances
+    // the floor past it.
+    for n in 64u64..=127 {
+        if n != 70 {
+            deliver_nonce(&s, eid, n, deadline);
+        }
+    }
+    s.client.prune_nonce_words(&eid);
+    assert_eq!(s.client.get_inbound_nonce_floor(&eid), 128);
+
+    // A late replay of anything from the pruned words stays rejected.
+    for n in [1u64, 63, 64, 70, 127] {
+        let err = try_deliver_nonce(&s, eid, n, deadline)
+            .expect_err("replay of a consumed nonce must be rejected");
+        assert_eq!(err, PerihelionError::StaleNonce);
+    }
+}
+
+/// Permissionless: pruning requires no admin, and a floor advance emits
+/// `nonce_words_pruned(eid, old_floor, new_floor)`.
+#[test]
+fn prune_is_permissionless_and_emits_event() {
+    let s = setup();
+    let eid = s.src_eid;
+    let deadline = 5_000;
+
+    for n in 1u64..=64 {
+        deliver_nonce(&s, eid, n, deadline);
+    }
+    assert_eq!(nonce_pruned_event_count(&s.env), 0);
+
+    // Any account may call it; no admin auth is involved.
+    s.client.prune_nonce_words(&eid);
+
+    assert_eq!(s.client.get_inbound_nonce_floor(&eid), 64);
+    assert_eq!(nonce_pruned_event_count(&s.env), 1);
+}
+
+/// Pruning when there is nothing fully consumed is a no-op: no floor change,
+/// no event.
+#[test]
+fn prune_noop_when_nothing_to_reclaim() {
+    let s = setup();
+    let other_eid = 40404u32;
+
+    s.client.prune_nonce_words(&other_eid);
+
+    assert_eq!(s.client.get_inbound_nonce_floor(&other_eid), 0);
+    assert_eq!(nonce_pruned_event_count(&s.env), 0);
+}
+
+#[test]
 fn fill_instruction_body_src_eid_overridden_by_transport_eid() {
     let s = setup();
     let recipient = Address::generate(&s.env);
@@ -694,16 +1031,9 @@ fn fill_instruction_body_src_eid_overridden_by_transport_eid() {
     // the body-declared eid is itself a trusted peer.
     let attacker_eid = 99999u32;
     let attacker_peer = BytesN::from_array(&s.env, &[0xAA; 32]);
-    s.client.propose_peer(&attacker_eid, &attacker_peer);
-    s.env.ledger().with_mut(|li| {
-        li.timestamp += MIN_PEER_CHANGE_DELAY + 1;
-    });
-    s.client.confirm_peer(&attacker_eid);
-    // Reset the clock back to the setup() baseline so this test's own
+    // The helper restores the clock afterwards so this test's own
     // `deadline: 5_000` fixture isn't already expired.
-    s.env.ledger().with_mut(|li| {
-        li.timestamp = 1_000;
-    });
+    register_peer(&s.env, &s.client, attacker_eid, &attacker_peer);
 
     let fi = FillInstruction {
         intent_hash: h.clone(),
@@ -713,6 +1043,7 @@ fn fill_instruction_body_src_eid_overridden_by_transport_eid() {
         min_dest_amount: 1,
         deadline: 5_000,
         preferred_solver: None,
+        locked_solver: None,
         reservation_window: 0,
     };
     let origin = Origin {
@@ -730,33 +1061,44 @@ fn fill_instruction_body_src_eid_overridden_by_transport_eid() {
         "src_eid must be overridden to transport origin.src_eid, not the body-declared attacker_eid");
 }
 
-#[test]
-#[should_panic(expected = "Error(Contract, #100)")] // AlreadyInitialized
-fn rejects_double_initialize() {
-    let s = setup();
-    let admin = Address::generate(&s.env);
-    let endpoint = Address::generate(&s.env);
-    let native_token = Address::generate(&s.env);
-    s.client.initialize(&admin, &endpoint, &native_token);
-}
-
-// --- Issue #18: initialize validation ----------------------------------------
+// --- Issue #910: configuration is set by the constructor, not a separate call ---
 
 #[test]
-#[should_panic(expected = "Error(Contract, #134)")] // AdminEndpointCollision
-fn rejects_initialize_with_admin_eq_endpoint() {
+fn constructor_sets_endpoint_and_native_token_at_deploy() {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|li| {
         li.timestamp = 1_000;
         li.max_entry_ttl = 3_110_400;
     });
-    let id = env.register(Perihelion, ());
+    let admin = Address::generate(&env);
+    let endpoint = env.register(MockEndpoint, ());
+    let native_token = Address::generate(&env);
+
+    // Deploying with arguments is the only way to create the contract, so there
+    // is no window in which a third party can name its admin or endpoint first.
+    let id = env.register(Perihelion, (&admin, &endpoint, &native_token));
     let client = PerihelionClient::new(&env, &id);
+
+    assert_eq!(client.endpoint(), endpoint);
+    assert_eq!(client.native_token(), Some(native_token));
+}
+
+// --- Issue #18: constructor validation ----------------------------------------
+
+#[test]
+#[should_panic(expected = "Error(Contract, #134)")] // AdminEndpointCollision
+fn rejects_constructor_with_admin_eq_endpoint() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1_000;
+        li.max_entry_ttl = 3_110_400;
+    });
     let addr = Address::generate(&env);
     let native_token = Address::generate(&env);
-    // admin == endpoint must be rejected
-    client.initialize(&addr, &addr, &native_token);
+    // admin == endpoint must abort deployment
+    env.register(Perihelion, (&addr, &addr, &native_token));
 }
 
 #[test]
@@ -768,11 +1110,9 @@ fn initialize_emits_event() {
         li.max_entry_ttl = 3_110_400;
     });
     let endpoint_addr = env.register(MockEndpoint, ());
-    let id = env.register(Perihelion, ());
-    let client = PerihelionClient::new(&env, &id);
     let admin = Address::generate(&env);
     let native_token = Address::generate(&env);
-    client.initialize(&admin, &endpoint_addr, &native_token);
+    env.register(Perihelion, (&admin, &endpoint_addr, &native_token));
     // Verify the initialized event was published (env records all events).
     let events = env.events().all();
     let expected = Symbol::new(&env, "initialized");
@@ -858,7 +1198,8 @@ fn set_endpoint_emits_event() {
 fn peer_governance_propose_emits_event() {
     let s = setup();
     let new_peer = BytesN::from_array(&s.env, &[0xFF; 32]);
-    s.client.propose_peer(&s.src_eid, &new_peer);
+    s.client
+        .propose_peer(&s.src_eid, &new_peer, &MIN_PEER_CHANGE_DELAY);
     let events = s.env.events().all();
     assert!(!events.is_empty(), "expected peer_change_proposed event");
 }
@@ -867,7 +1208,8 @@ fn peer_governance_propose_emits_event() {
 fn peer_governance_confirm_requires_delay() {
     let s = setup();
     let new_peer = BytesN::from_array(&s.env, &[0xFF; 32]);
-    s.client.propose_peer(&s.src_eid, &new_peer);
+    s.client
+        .propose_peer(&s.src_eid, &new_peer, &MIN_PEER_CHANGE_DELAY);
 
     // Should fail if called before the delay
     assert!(s.client.try_confirm_peer(&s.src_eid).is_err());
@@ -883,7 +1225,8 @@ fn peer_governance_confirm_requires_delay() {
 fn peer_governance_cancel_clears_pending() {
     let s = setup();
     let new_peer = BytesN::from_array(&s.env, &[0xFF; 32]);
-    s.client.propose_peer(&s.src_eid, &new_peer);
+    s.client
+        .propose_peer(&s.src_eid, &new_peer, &MIN_PEER_CHANGE_DELAY);
 
     // Cancel the pending peer change
     assert!(s.client.try_cancel_pending_peer(&s.src_eid).is_ok());
@@ -906,10 +1249,11 @@ fn peer_governance_get_pending_peer() {
     assert!(pending.unwrap().unwrap().is_none());
 
     // After propose, should return the pending peer
-    s.client.propose_peer(&s.src_eid, &new_peer);
+    s.client
+        .propose_peer(&s.src_eid, &new_peer, &MIN_PEER_CHANGE_DELAY);
     let pending = s.client.try_get_pending_peer(&s.src_eid);
     assert!(pending.is_ok());
-    let (peer, _time) = pending.unwrap().unwrap().unwrap();
+    let (peer, _proposed_at, _ready_at, _expires_at) = pending.unwrap().unwrap().unwrap();
     assert_eq!(peer, new_peer);
 }
 
@@ -980,7 +1324,7 @@ fn filled_event_shape() {
 
     let h = hash(&s.env, 2);
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    let solver_evm = evm_solver(&s.env, 0xAB);
     let fill_amount = 250_000;
     s.client
         .fill_intent(&solver, &solver_evm, &h, &fill_amount, &0);
@@ -1043,7 +1387,7 @@ fn confirmation_sent_event_shape() {
 
     let h = hash(&s.env, 5);
     register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    let solver_evm = evm_solver(&s.env, 0xAB);
     // Fill without dispatch via deliver_intent
     s.client.deliver_intent(&solver, &solver_evm, &h, &250_000);
 
@@ -1071,11 +1415,14 @@ fn status_filled_after_deliver_without_dispatch() {
 
     let h = hash(&s.env, 0xD1);
     register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    let solver_evm = evm_solver(&s.env, 0xAB);
     s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
 
     // Settled marker is set but ConfirmationSent is not.
-    assert!(s.client.is_settled(&h), "Settled marker must be set after deliver_intent");
+    assert!(
+        s.client.is_settled(&h),
+        "Settled marker must be set after deliver_intent"
+    );
     assert_eq!(
         s.client.status(&h),
         Some(IntentStatus::Filled),
@@ -1098,7 +1445,7 @@ fn status_confirmation_sent_after_dispatch() {
 
     let h = hash(&s.env, 0xD2);
     register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    let solver_evm = evm_solver(&s.env, 0xAB);
     s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
 
     let caller = Address::generate(&s.env);
@@ -1121,7 +1468,7 @@ fn status_confirmation_sent_after_fill_intent() {
 
     let h = hash(&s.env, 0xD3);
     register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    let solver_evm = evm_solver(&s.env, 0xAB);
     s.client.fill_intent(&solver, &solver_evm, &h, &100_000, &0);
 
     assert_eq!(
@@ -1151,7 +1498,7 @@ fn status_uses_markers_independently_of_record() {
     // Path A: only Settled marker (deliver_intent, no dispatch).
     let ha = hash(&s.env, 0xD4);
     register_intent(&s, &ha, &recipient, 100_000, 9_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    let solver_evm = evm_solver(&s.env, 0xAB);
     s.client.deliver_intent(&solver, &solver_evm, &ha, &100_000);
     assert_eq!(s.client.status(&ha), Some(IntentStatus::Filled));
 
@@ -1164,7 +1511,6 @@ fn status_uses_markers_independently_of_record() {
     assert_eq!(s.client.status(&hb), Some(IntentStatus::ConfirmationSent));
 }
 
-
 #[test]
 fn initialized_event_shape() {
     let env = Env::default();
@@ -1174,11 +1520,9 @@ fn initialized_event_shape() {
         li.max_entry_ttl = 3_110_400;
     });
     let endpoint_addr = env.register(MockEndpoint, ());
-    let id = env.register(Perihelion, ());
-    let client = PerihelionClient::new(&env, &id);
     let admin = Address::generate(&env);
     let native_token = Address::generate(&env);
-    client.initialize(&admin, &endpoint_addr, &native_token);
+    env.register(Perihelion, (&admin, &endpoint_addr, &native_token));
 
     let events = env.events().all();
     // Event: ("initialized",) -> (admin, endpoint)
@@ -1207,7 +1551,8 @@ fn peer_set_event_shape() {
     let new_peer: BytesN<32> = BytesN::from_array(&s.env, &[0xFF; 32]);
 
     // Propose the new peer
-    s.client.propose_peer(&s.src_eid, &new_peer);
+    s.client
+        .propose_peer(&s.src_eid, &new_peer, &MIN_PEER_CHANGE_DELAY);
 
     // Advance time past the minimum delay
     s.env.ledger().with_mut(|li| {
@@ -1231,6 +1576,46 @@ fn paused_set_event_shape() {
     let events = s.env.events().all();
     // Event: ("paused_set",) -> (paused,)
     assert_event_with_symbol(&s.env, &events, "paused_set", 1);
+}
+
+/// Assert `max_ttl_set` event: topics = ("max_ttl_set",), data = (old, new),
+/// and that the accepted `[MIN_MAX_TTL, MAX_TTL_CEILING]` range is enforced
+/// (issue #719).
+#[test]
+fn max_ttl_set_event_and_bounds() {
+    let s = setup();
+
+    // Effective clamp before any set is the documented default.
+    assert_eq!(s.client.get_max_ttl(), MAX_TTL_DEFAULT);
+
+    // In-range values are accepted and persisted; the event carries (old, new).
+    let new_ttl = MAX_TTL_DEFAULT + 100_000;
+    s.client.set_max_ttl(&new_ttl);
+    let events = s.env.events().all();
+    // Event: ("max_ttl_set",) -> (old, new)
+    assert_event_with_symbol(&s.env, &events, "max_ttl_set", 2);
+    assert_eq!(s.client.get_max_ttl(), new_ttl);
+
+    // Below the contract's own MAX_TTL extension target.
+    assert_eq!(
+        s.client.try_set_max_ttl(&(MIN_MAX_TTL - 1)),
+        Err(Ok(PerihelionError::InvalidAmount))
+    );
+    // Zero would disable the clamp entirely.
+    assert_eq!(
+        s.client.try_set_max_ttl(&0),
+        Err(Ok(PerihelionError::InvalidAmount))
+    );
+    // Above the protocol's max_entry_ttl ceiling.
+    assert_eq!(
+        s.client.try_set_max_ttl(&(MAX_TTL_CEILING + 1)),
+        Err(Ok(PerihelionError::InvalidAmount))
+    );
+
+    // Both bounds are inclusive.
+    assert!(s.client.try_set_max_ttl(&MIN_MAX_TTL).is_ok());
+    assert!(s.client.try_set_max_ttl(&MAX_TTL_CEILING).is_ok());
+    assert_eq!(s.client.get_max_ttl(), MAX_TTL_CEILING);
 }
 
 /// Assert `admin_transfer_started` event: topics = ("admin_transfer_started",), data = (old, new)
@@ -1267,7 +1652,7 @@ fn cancel_ignored_event_shape() {
     s.asset_admin.mint(&solver, &1_000_000);
     let h = hash(&s.env, 7);
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &100_000, &0); // intent now Filled
 
     // Send a cancel after it's already filled
@@ -1304,6 +1689,7 @@ fn registration_rejected_when_no_peer_for_src_eid() {
         min_dest_amount: 1,
         deadline: 5_000,
         preferred_solver: None,
+        locked_solver: None,
         reservation_window: 0,
     };
     // Deliver via the registered peer for s.src_eid (transport origin is fine),
@@ -1345,7 +1731,7 @@ fn rejects_fill_while_paused() {
     let s = setup();
     s.client.set_paused(&true);
     let solver = Address::generate(&s.env);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client
         .fill_intent(&solver, &evm, &hash(&s.env, 11), &100, &0);
 }
@@ -1378,7 +1764,7 @@ fn pause_blocks_fill_intent() {
     let h = hash(&s.env, 20);
     // Register via lz_receive (not pause-gated) so there is an intent to fill.
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     // fill_intent must revert.
     s.client.fill_intent(&solver, &evm, &h, &100_000, &0);
 }
@@ -1398,7 +1784,7 @@ fn pause_blocks_fill_intent_moves_no_tokens() {
     let solver_before = tok.balance(&solver);
     let recipient_before = tok.balance(&recipient);
 
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     let result = s.client.try_fill_intent(&solver, &evm, &h, &100_000, &0);
     assert!(result.is_err());
     // No tokens moved.
@@ -1452,7 +1838,7 @@ fn pause_blocks_dispatch_confirmation() {
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
 
     // Fill without dispatch (deliver_intent path); then pause.
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.deliver_intent(&solver, &evm, &h, &100_000);
     s.client.set_paused(&true);
 
@@ -1513,7 +1899,7 @@ fn unpause_restores_fill_intent() {
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
 
     s.client.set_paused(&true);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     assert!(s
         .client
         .try_fill_intent(&solver, &evm, &h, &100_000, &0)
@@ -1553,7 +1939,7 @@ fn fill_confirmed_payload_layout() {
     let h = BytesN::from_array(&env, &[1u8; 32]);
     let solver = BytesN::from_array(&env, &[2u8; 32]);
     let b = crate::messages::encode_fill_confirmed(&env, &h, &solver, 1234, 7);
-    assert_eq!(b.len(), 90);
+    assert_eq!(b.len(), FILL_CONFIRMED_LENGTH);
     assert_eq!(b.get(0).unwrap(), PROTOCOL_VERSION);
     assert_eq!(b.get(1).unwrap(), MSG_FILL_CONFIRMED);
 }
@@ -1563,7 +1949,7 @@ fn cancel_intent_payload_layout() {
     let env = Env::default();
     let h = BytesN::from_array(&env, &[9u8; 32]);
     let b = crate::messages::encode_cancel_intent(&env, &h, CANCEL_REASON_EXPIRED);
-    assert_eq!(b.len(), 35);
+    assert_eq!(b.len(), CANCEL_INTENT_LENGTH);
     assert_eq!(b.get(0).unwrap(), PROTOCOL_VERSION);
     assert_eq!(b.get(1).unwrap(), MSG_CANCEL_INTENT);
     assert_eq!(b.get(34).unwrap(), CANCEL_REASON_EXPIRED);
@@ -1622,7 +2008,10 @@ fn fill_confirmed_matches_golden_vector() {
     }
     let solver = BytesN::from_array(&env, &solver_word);
     let b = crate::messages::encode_fill_confirmed(&env, &h, &solver, 1_000_000, 42);
-    assert_bytes_eq(&b, &decode_vector::<90>(FILL_CONFIRMED_GOLDEN));
+    assert_bytes_eq(
+        &b,
+        &decode_vector::<{ FILL_CONFIRMED_LENGTH as usize }>(FILL_CONFIRMED_GOLDEN),
+    );
 }
 
 #[test]
@@ -1630,7 +2019,10 @@ fn cancel_intent_matches_golden_vector() {
     let env = Env::default();
     let h = BytesN::from_array(&env, &[0x22u8; 32]);
     let b = crate::messages::encode_cancel_intent(&env, &h, CANCEL_REASON_EXPIRED);
-    assert_bytes_eq(&b, &decode_vector::<35>(CANCEL_INTENT_GOLDEN));
+    assert_bytes_eq(
+        &b,
+        &decode_vector::<{ CANCEL_INTENT_LENGTH as usize }>(CANCEL_INTENT_GOLDEN),
+    );
 }
 
 // --- Lifecycle -> wire integration --------------------------------------------
@@ -1650,11 +2042,11 @@ fn fill_dispatches_evm_decodable_confirmation() {
 
     let h = hash(&s.env, 1);
     register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
-    let solver_evm = BytesN::from_array(&s.env, &[0xAB; 32]);
+    let solver_evm = evm_solver(&s.env, 0xAB);
     s.client.fill_intent(&solver, &solver_evm, &h, &250_000, &0);
 
     let msg = s.mock.last().message;
-    assert_eq!(msg.len(), 90);
+    assert_eq!(msg.len(), FILL_CONFIRMED_LENGTH);
     assert_eq!(msg.get(0).unwrap(), PROTOCOL_VERSION);
     assert_eq!(msg.get(1).unwrap(), MSG_FILL_CONFIRMED);
     let hb = h.to_array();
@@ -1678,7 +2070,7 @@ fn cancel_dispatches_evm_decodable_cancel() {
     s.client.cancel_expired_intent(&caller, &h, &0);
 
     let msg = s.mock.last().message;
-    assert_eq!(msg.len(), 35);
+    assert_eq!(msg.len(), CANCEL_INTENT_LENGTH);
     assert_eq!(msg.get(0).unwrap(), PROTOCOL_VERSION);
     assert_eq!(msg.get(1).unwrap(), MSG_CANCEL_INTENT);
     let hb = h.to_array();
@@ -1734,7 +2126,7 @@ fn cancel_filled_intent_returns_already_filled() {
     // deadline far in future so fill succeeds
     register_intent(&s, &h, &recipient, 1, 9_000, 1, None);
     // Deliver (fill) without dispatching confirmation, leaving status = Filled.
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.deliver_intent(&solver, &evm, &h, &100);
     assert_eq!(
         s.client.get_intent(&h).unwrap().status,
@@ -1755,7 +2147,7 @@ fn cancel_confirmation_sent_intent_returns_already_filled() {
     s.asset_admin.mint(&solver, &1_000_000);
     let h = hash(&s.env, 21);
     register_intent(&s, &h, &recipient, 1, 9_000, 1, None);
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &100, &0);
     assert_eq!(
         s.client.get_intent(&h).unwrap().status,
@@ -1843,7 +2235,7 @@ fn amount_boundary_i128_max_fills() {
     let h = hash(&s.env, 0xA1);
     register_intent(&s, &h, &recipient, max_amount, 5_000, 1, None);
 
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &max_amount, &0);
 
     let tok = token::TokenClient::new(&s.env, &s.asset);
@@ -1862,7 +2254,7 @@ fn amount_boundary_fill_amount_one() {
     let h = hash(&s.env, 0xA2);
     register_intent(&s, &h, &recipient, 1, 5_000, 1, None);
 
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &1, &0);
     assert!(s.client.is_settled(&h));
 }
@@ -1879,7 +2271,7 @@ fn amount_boundary_fill_amount_zero_rejected() {
     let h = hash(&s.env, 0xA3);
     register_intent(&s, &h, &recipient, 1, 5_000, 1, None);
 
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &0, &0);
 }
 
@@ -1895,7 +2287,7 @@ fn amount_boundary_fill_amount_negative_rejected() {
     let h = hash(&s.env, 0xA4);
     register_intent(&s, &h, &recipient, 1, 5_000, 1, None);
 
-    let evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let evm = evm_solver(&s.env, 0x11);
     s.client.fill_intent(&solver, &evm, &h, &-1, &0);
 }
 
@@ -1928,7 +2320,7 @@ fn amount_boundary_i128_max_wire_encoding() {
     let max: i128 = i128::MAX;
 
     let b = crate::messages::encode_fill_confirmed(&env, &h, &solver, max, 0);
-    assert_eq!(b.len(), 90);
+    assert_eq!(b.len(), FILL_CONFIRMED_LENGTH);
 
     // Decode the 16-byte amount field at offset 66.
     let mut amount_bytes = [0u8; 16];
@@ -1950,7 +2342,7 @@ fn amount_boundary_one_wire_encoding() {
     let solver = BytesN::from_array(&env, &[0xAAu8; 32]);
 
     let b = crate::messages::encode_fill_confirmed(&env, &h, &solver, 1, 0);
-    assert_eq!(b.len(), 90);
+    assert_eq!(b.len(), FILL_CONFIRMED_LENGTH);
 
     let mut amount_bytes = [0u8; 16];
     for i in 0..16u32 {
@@ -2129,18 +2521,16 @@ fn cancel_succeeds_without_native_token_configured() {
     let endpoint = env.register(MockEndpoint, ());
     let _mock = MockEndpointClient::new(&env, &endpoint);
 
-    let id = env.register(Perihelion, ());
-    let client = PerihelionClient::new(&env, &id);
-
-    // Initialize with a native token that we'll use initially
+    // Configure with a native token that we'll use initially
     let issuer = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(issuer);
     let initial_token = sac.address();
-    client.initialize(&admin, &endpoint, &initial_token);
+    let id = env.register(Perihelion, (&admin, &endpoint, &initial_token));
+    let client = PerihelionClient::new(&env, &id);
 
     let src_eid = 30101u32;
     let peer = BytesN::from_array(&env, &[0xEE; 32]);
-    client.propose_peer(&src_eid, &peer);
+    client.propose_peer(&src_eid, &peer, &MIN_PEER_CHANGE_DELAY);
     env.ledger().with_mut(|li| {
         li.timestamp = 1_000 + MIN_PEER_CHANGE_DELAY + 1;
     });
@@ -2163,6 +2553,7 @@ fn cancel_succeeds_without_native_token_configured() {
         min_dest_amount: 100_000,
         deadline: 5_000,
         preferred_solver: None,
+        locked_solver: None,
         reservation_window: 0,
     };
     let origin = Origin {
@@ -2212,93 +2603,744 @@ fn fill_and_deliver_reject_identical_inputs_identically() {
     // Verify that both fill_intent and deliver_intent share identical validation
     // logic and reject the same invalid inputs with the same error variant.
     // This is a regression test to prevent the two paths from diverging.
+    //
+    // Each case pins the expected variant, so weakening a guard in
+    // validate_and_stage_fill turns the case red instead of letting both
+    // entrypoints drift to the same (wrong) outcome.
     let s = setup();
     let recipient = Address::generate(&s.env);
     let solver = Address::generate(&s.env);
-    let solver_evm = BytesN::from_array(&s.env, &[0x11; 32]);
+    let solver_evm = evm_solver(&s.env, 0x11);
     s.asset_admin.mint(&solver, &5_000_000);
+
+    let assert_parity = |h: &BytesN<32>, amount: i128, expected: PerihelionError, case: &str| {
+        let deliver = s
+            .client
+            .try_deliver_intent(&solver, &solver_evm, h, &amount);
+        let fill = s
+            .client
+            .try_fill_intent(&solver, &solver_evm, h, &amount, &0);
+        assert_eq!(deliver, Err(Ok(expected)), "{}: deliver_intent", case);
+        assert_eq!(fill, Err(Ok(expected)), "{}: fill_intent", case);
+    };
 
     // Test 1: expired intent
     {
-        let h = hash(&s.env, 1001);
+        let h = hash(&s.env, 201);
         register_intent(&s, &h, &recipient, 100_000, 5_000, 1, None);
         s.env.ledger().with_mut(|li| li.timestamp = 6_000); // past deadline
 
-        let deliver_err = s.client.deliver_intent(&solver, &solver_evm, &h, &250_000);
-        let fill_err = s.client.fill_intent(&solver, &solver_evm, &h, &250_000, &0);
-
-        match (deliver_err, fill_err) {
-            (Err(e1), Err(e2)) => {
-                assert_eq!(
-                    format!("{:?}", e1),
-                    format!("{:?}", e2),
-                    "expired intent: deliver and fill should reject with same error"
-                );
-            }
-            _ => panic!("both should error on expired intent"),
-        }
+        assert_parity(
+            &h,
+            250_000,
+            PerihelionError::IntentExpired,
+            "expired intent",
+        );
 
         s.env.ledger().with_mut(|li| li.timestamp = 1_000); // reset for next test
     }
 
     // Test 2: amount below minimum
     {
-        let h = hash(&s.env, 1002);
+        let h = hash(&s.env, 202);
         register_intent(&s, &h, &recipient, 100_000, 5_000, 2, None);
 
-        let deliver_err = s.client.deliver_intent(&solver, &solver_evm, &h, &50_000); // below 100_000
-        let fill_err = s.client.fill_intent(&solver, &solver_evm, &h, &50_000, &0);
-
-        match (deliver_err, fill_err) {
-            (Err(e1), Err(e2)) => {
-                assert_eq!(
-                    format!("{:?}", e1),
-                    format!("{:?}", e2),
-                    "insufficient amount: deliver and fill should reject with same error"
-                );
-            }
-            _ => panic!("both should error on insufficient fill amount"),
-        }
+        // below the 100_000 minimum
+        assert_parity(
+            &h,
+            50_000,
+            PerihelionError::InsufficientFillAmount,
+            "insufficient amount",
+        );
     }
 
     // Test 3: already filled
     {
-        let h = hash(&s.env, 1003);
+        let h = hash(&s.env, 203);
         register_intent(&s, &h, &recipient, 100_000, 5_000, 3, None);
         s.client.deliver_intent(&solver, &solver_evm, &h, &250_000);
 
-        let deliver_err = s.client.deliver_intent(&solver, &solver_evm, &h, &250_000);
-        let fill_err = s.client.fill_intent(&solver, &solver_evm, &h, &250_000, &0);
-
-        match (deliver_err, fill_err) {
-            (Err(e1), Err(e2)) => {
-                assert_eq!(
-                    format!("{:?}", e1),
-                    format!("{:?}", e2),
-                    "already filled: deliver and fill should reject with same error"
-                );
-            }
-            _ => panic!("both should error on already filled intent"),
-        }
+        assert_parity(
+            &h,
+            250_000,
+            PerihelionError::IntentFinalized,
+            "already filled",
+        );
     }
 
     // Test 4: invalid amount (zero)
     {
-        let h = hash(&s.env, 1004);
+        let h = hash(&s.env, 204);
         register_intent(&s, &h, &recipient, 100_000, 5_000, 4, None);
 
-        let deliver_err = s.client.deliver_intent(&solver, &solver_evm, &h, &0);
-        let fill_err = s.client.fill_intent(&solver, &solver_evm, &h, &0, &0);
-
-        match (deliver_err, fill_err) {
-            (Err(e1), Err(e2)) => {
-                assert_eq!(
-                    format!("{:?}", e1),
-                    format!("{:?}", e2),
-                    "zero amount: deliver and fill should reject with same error"
-                );
-            }
-            _ => panic!("both should error on zero fill amount"),
-        }
+        assert_parity(&h, 0, PerihelionError::InvalidAmount, "zero amount");
     }
+}
+
+// --- Rolling-window accessors (issue #680) -----------------------------------
+
+/// Deliver a FillInstruction as raw LayerZero bytes through `lz_receive_bytes`,
+/// the inbound path the endpoint uses in production. Used by the rolling-window
+/// breaker tests, which must exercise the real `Ok`/`Err` outcome of a breach.
+fn try_deliver_fill_bytes(
+    s: &Setup,
+    h: &BytesN<32>,
+    recipient: &Address,
+    min: i128,
+    nonce: u64,
+) -> Result<(), PerihelionError> {
+    let fi = FillInstruction {
+        intent_hash: h.clone(),
+        src_eid: s.src_eid,
+        recipient: recipient.clone(),
+        dest_asset: s.asset.clone(),
+        min_dest_amount: min,
+        deadline: 20_000,
+        preferred_solver: None,
+        locked_solver: Some(BytesN::from_array(&s.env, &[0x22; 32])),
+        reservation_window: 0,
+    };
+    let message = crate::messages::encode_fill_instruction(&s.env, &fi);
+    let origin = Origin {
+        src_eid: s.src_eid,
+        sender: s.peer.clone(),
+        nonce,
+    };
+    let guid = BytesN::from_array(&s.env, &[0u8; 32]);
+    match s.client.try_lz_receive_bytes(&origin, &guid, &message) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => panic!("lz_receive_bytes return value failed to convert: {e:?}"),
+        Err(e) => Err(e.expect("lz_receive_bytes aborted with a non-contract error")),
+    }
+}
+
+#[test]
+fn get_rolling_window_reset_at_reports_latched_reset_time() {
+    let s = setup();
+    // One-hour window with a 1_000 cap.
+    s.client.set_rolling_window_cap(&3_600, &1_000);
+    let recipient = Address::generate(&s.env);
+
+    // Nothing latched while the window is under the cap.
+    assert_eq!(s.client.get_rolling_window_reset_at(), None);
+    try_deliver_fill_bytes(&s, &hash(&s.env, 1), &recipient, 600, 1)
+        .expect("600 is within the 1_000 cap");
+    assert_eq!(s.client.get_rolling_window_reset_at(), None);
+
+    // The breaching message is acknowledged (Ok) but registers no intent,
+    // and the latch and its reset time persist (#904).
+    try_deliver_fill_bytes(&s, &hash(&s.env, 2), &recipient, 600, 2)
+        .expect("a breach must be acknowledged, not rolled back");
+    assert!(s.client.is_rolling_window_cap_triggered());
+    assert!(s.client.get_intent(&hash(&s.env, 2)).is_none());
+    assert_eq!(
+        s.client.get_rolling_window_reset_at(),
+        Some(s.env.ledger().timestamp() + 3_600)
+    );
+}
+
+#[test]
+fn rolling_window_keeps_one_bucket_across_quiet_windows() {
+    let s = setup();
+    s.client.set_rolling_window_cap(&3_600, &1_000_000);
+    let recipient = Address::generate(&s.env);
+
+    // Traffic in window 0, then in window 2 after a quiet window 1, then in
+    // window 5 after two more quiet windows. Each advance must drop the bucket
+    // of the window it leaves (#905).
+    for (nonce, ts) in [(1u64, 1_000u64), (2, 7_300), (3, 18_100)] {
+        s.env.ledger().with_mut(|li| li.timestamp = ts);
+        try_deliver_fill_bytes(&s, &hash(&s.env, nonce as u8), &recipient, 10, nonce)
+            .expect("within cap");
+    }
+
+    let windows = [0u64, 3_600, 7_200, 10_800, 14_400, 18_000];
+    for w in windows {
+        let present = s.env.as_contract(&s.client.address, || {
+            s.env
+                .storage()
+                .instance()
+                .has(&DataKey::RollingWindowBucket(w))
+        });
+        assert_eq!(present, w == 18_000, "bucket for window {w}");
+    }
+}
+
+#[test]
+fn rolling_window_latch_rejects_until_admin_reset() {
+    let s = setup();
+    s.client.set_rolling_window_cap(&3_600, &1_000);
+    let recipient = Address::generate(&s.env);
+    let reset_at = s.env.ledger().timestamp() + 3_600;
+
+    try_deliver_fill_bytes(&s, &hash(&s.env, 1), &recipient, 1_200, 1)
+        .expect("breach is acknowledged");
+    assert!(s.client.is_rolling_window_cap_triggered());
+
+    // A below-cap message is still rejected while latched: the breaker holds
+    // even though this amount would fit in a fresh window.
+    let err = try_deliver_fill_bytes(&s, &hash(&s.env, 2), &recipient, 1, 2)
+        .expect_err("latched breaker must reject new intents");
+    assert_eq!(err, PerihelionError::RollingWindowCapTriggered);
+    assert!(s.client.get_intent(&hash(&s.env, 2)).is_none());
+
+    // Once the reset time passes and the admin resets, the same message registers.
+    s.env.ledger().with_mut(|li| li.timestamp = reset_at);
+    s.client.reset_rolling_window_cap();
+    assert!(!s.client.is_rolling_window_cap_triggered());
+    try_deliver_fill_bytes(&s, &hash(&s.env, 3), &recipient, 1, 3)
+        .expect("after reset a below-cap message registers");
+    assert!(s.client.get_intent(&hash(&s.env, 3)).is_some());
+}
+
+#[test]
+fn test_quote_lz_fee_empty_vs_correct_size() {
+    let s = setup();
+    s.mock.set_dynamic_quote(&true);
+
+    let empty_payload = soroban_sdk::Bytes::new(&s.env);
+    let floor_quote = s.client.quote_lz_fee(&s.src_eid, &empty_payload);
+
+    let correct_quote = s.client.quote_fill_confirmed_fee(&s.src_eid);
+
+    // empty quote should be strictly less than correct quote
+    assert!(floor_quote < correct_quote);
+
+    let h = hash(&s.env, 1);
+    let recipient = Address::generate(&s.env);
+    register_intent(&s, &h, &recipient, 200_000, 5_000, 1, None);
+
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &250_000);
+    let solver_evm = evm_solver(&s.env, 7);
+
+    // Using floor quote should fail
+    let err = s
+        .client
+        .try_fill_intent(&solver, &solver_evm, &h, &250_000, &floor_quote)
+        .expect_err("floor quote should fail")
+        .unwrap();
+    assert_eq!(err, PerihelionError::InsufficientLzFee);
+
+    // Using correct quote should succeed
+    s.client
+        .fill_intent(&solver, &solver_evm, &h, &250_000, &correct_quote);
+}
+
+// --- dispatch_confirmation keeper reward (stalled-dispatch recovery path) -----
+//
+// Acceptance criteria from the issue:
+//  AC1: A keeper calls dispatch_confirmation after the solver fails to do so,
+//       receives the dispatch_keeper_reward, and the intent reaches ConfirmationSent.
+//  AC2: dispatch_keeper_reward view returns the configured value.
+//  AC3: keeper_reward_paid event is emitted with the correct caller + reward.
+//  AC4: When native_token is not configured, reward is skipped (not reverted),
+//       keeper_reward_skipped event is emitted.
+//  AC5: list_undispatched_intents returns only Filled-but-undispatched hashes.
+//  AC6: The intent is NOT recoverable by cancel_expired_intent once Settled —
+//       a keeper must dispatch, not cancel.
+
+/// AC2: dispatch_keeper_reward view returns the configured value; defaults to 0.
+#[test]
+fn dispatch_keeper_reward_view_defaults_to_zero() {
+    let s = setup();
+    assert_eq!(s.client.dispatch_keeper_reward(), 0i128);
+}
+
+#[test]
+fn set_dispatch_keeper_reward_persists_and_emits_event() {
+    let s = setup();
+    let reward = 75_000i128;
+    s.client.set_dispatch_keeper_reward(&reward);
+    assert_eq!(s.client.dispatch_keeper_reward(), reward);
+
+    let events = s.env.events().all();
+    let expected = Symbol::new(&s.env, "dispatch_keeper_reward_set");
+    let found = events.iter().any(|(_, topics, _)| {
+        topics.iter().any(|t| {
+            Symbol::try_from_val(&s.env, &t)
+                .map(|sym| sym == expected)
+                .unwrap_or(false)
+        })
+    });
+    assert!(found, "dispatch_keeper_reward_set event not emitted");
+}
+
+#[test]
+fn set_dispatch_keeper_reward_rejects_negative() {
+    let s = setup();
+    let err = s
+        .client
+        .try_set_dispatch_keeper_reward(&-1i128)
+        .expect_err("negative reward should fail")
+        .unwrap();
+    assert_eq!(err, PerihelionError::InvalidAmount);
+}
+
+/// AC1 + AC3: Keeper dispatches a stalled confirmation and earns the reward.
+///
+/// Timeline:
+///   1. Solver calls deliver_intent (asset delivered, no confirmation dispatched).
+///   2. Third-party keeper calls dispatch_confirmation, supplying lz_fee.
+///   3. Keeper receives dispatch_keeper_reward from contract balance.
+///   4. Intent reaches ConfirmationSent; FillConfirmed is dispatched (mock sent count = 1).
+#[test]
+fn keeper_dispatches_stalled_confirmation_and_earns_reward() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    let keeper = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let native_token = s
+        .client
+        .native_token()
+        .expect("native_token should be configured");
+    let native_admin = token::StellarAssetClient::new(&s.env, &native_token);
+    let native_client = token::TokenClient::new(&s.env, &native_token);
+
+    // Fund the contract with enough XLM to pay the reward.
+    let reward_amount = 80_000i128;
+    native_admin.mint(&s.client.address, &(reward_amount * 10));
+
+    s.client.set_dispatch_keeper_reward(&reward_amount);
+
+    let h = hash(&s.env, 0xE1);
+    register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
+    let solver_evm = evm_solver(&s.env, 0xAB);
+
+    // Solver delivers but does NOT dispatch.
+    s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
+
+    // State: Filled, mock sent 0.
+    assert_eq!(s.client.status(&h), Some(IntentStatus::Filled));
+    assert_eq!(s.mock.sent(), 0, "no confirmation sent yet");
+
+    let keeper_balance_before = native_client.balance(&keeper);
+
+    // The confirmation has stalled for the full grace period.
+    advance_ledgers(&s, DISPATCH_REWARD_GRACE_LEDGERS);
+
+    // Keeper dispatches the stalled confirmation.
+    s.client.dispatch_confirmation(&keeper, &h, &0);
+
+    // Collect events before making additional reads that would reset the log.
+    let events = s.env.events().all();
+
+    // State: ConfirmationSent, mock sent 1.
+    assert_eq!(
+        s.client.status(&h),
+        Some(IntentStatus::ConfirmationSent),
+        "intent must reach ConfirmationSent"
+    );
+    assert_eq!(s.mock.sent(), 1, "FillConfirmed must be dispatched");
+
+    // Keeper received the reward.
+    let keeper_balance_after = native_client.balance(&keeper);
+    assert_eq!(
+        keeper_balance_after,
+        keeper_balance_before + reward_amount,
+        "keeper must receive the dispatch reward"
+    );
+
+    // keeper_reward_paid event must be emitted.
+    let expected_paid = Symbol::new(&s.env, "keeper_reward_paid");
+    let paid_found = events.iter().any(|(_, topics, _)| {
+        topics.iter().any(|t| {
+            Symbol::try_from_val(&s.env, &t)
+                .map(|sym| sym == expected_paid)
+                .unwrap_or(false)
+        })
+    });
+    assert!(paid_found, "keeper_reward_paid event not emitted");
+
+    // confirmation_sent event must also be emitted.
+    let expected_sent = Symbol::new(&s.env, "confirmation_sent");
+    let sent_found = events.iter().any(|(_, topics, _)| {
+        topics.iter().any(|t| {
+            Symbol::try_from_val(&s.env, &t)
+                .map(|sym| sym == expected_sent)
+                .unwrap_or(false)
+        })
+    });
+    assert!(sent_found, "confirmation_sent event not emitted");
+}
+
+/// Issue 914: the solver dispatching its own fill earns nothing, even after the
+/// grace period, so the reserve is not drained by every normal fill.
+#[test]
+fn solver_self_dispatch_after_grace_earns_no_reward() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let native_token = s.client.native_token().expect("native_token configured");
+    let native_admin = token::StellarAssetClient::new(&s.env, &native_token);
+    let native_client = token::TokenClient::new(&s.env, &native_token);
+    native_admin.mint(&s.client.address, &1_000_000i128);
+    s.client.set_dispatch_keeper_reward(&80_000i128);
+
+    let h = hash(&s.env, 0xE4);
+    register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
+    let solver_evm = evm_solver(&s.env, 0xAB);
+    s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
+    advance_ledgers(&s, DISPATCH_REWARD_GRACE_LEDGERS);
+
+    let solver_balance_before = native_client.balance(&solver);
+    s.client.dispatch_confirmation(&solver, &h, &0);
+
+    assert_eq!(s.client.status(&h), Some(IntentStatus::ConfirmationSent));
+    assert_eq!(s.mock.sent(), 1, "FillConfirmed must still be dispatched");
+    assert_eq!(
+        native_client.balance(&solver),
+        solver_balance_before,
+        "solver must not receive the dispatch reward for its own fill"
+    );
+}
+
+/// Issue 914: a third party dispatching before the fill has been unconfirmed
+/// for the grace period is not paid, so solvers cannot farm the reward by
+/// racing their own fill.
+#[test]
+fn third_party_dispatch_before_grace_earns_no_reward() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    let keeper = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let native_token = s.client.native_token().expect("native_token configured");
+    let native_admin = token::StellarAssetClient::new(&s.env, &native_token);
+    let native_client = token::TokenClient::new(&s.env, &native_token);
+    native_admin.mint(&s.client.address, &1_000_000i128);
+    s.client.set_dispatch_keeper_reward(&80_000i128);
+
+    let h = hash(&s.env, 0xE5);
+    register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
+    let solver_evm = evm_solver(&s.env, 0xAB);
+    s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
+    advance_ledgers(&s, DISPATCH_REWARD_GRACE_LEDGERS - 1);
+
+    let keeper_balance_before = native_client.balance(&keeper);
+    s.client.dispatch_confirmation(&keeper, &h, &0);
+
+    assert_eq!(s.client.status(&h), Some(IntentStatus::ConfirmationSent));
+    assert_eq!(
+        native_client.balance(&keeper),
+        keeper_balance_before,
+        "reward must not be paid before the grace period elapses"
+    );
+}
+
+/// AC3 variant: When dispatch_keeper_reward is 0, no reward is paid and
+/// dispatch still succeeds (zero-reward is the default / opt-out path).
+#[test]
+fn dispatch_confirmation_with_zero_reward_still_succeeds() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    let keeper = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    // dispatch_keeper_reward left at default 0.
+    let h = hash(&s.env, 0xE2);
+    register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
+    let solver_evm = evm_solver(&s.env, 0xAB);
+    s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
+
+    s.client.dispatch_confirmation(&keeper, &h, &0);
+
+    assert_eq!(s.client.status(&h), Some(IntentStatus::ConfirmationSent));
+    assert_eq!(s.mock.sent(), 1);
+}
+
+/// AC4: When dispatch_keeper_reward > 0 but native_token is not configured,
+/// the confirmation is dispatched and keeper_reward_skipped is emitted instead
+/// of reverting (matches cancel_expired_intent behaviour).
+#[test]
+fn dispatch_confirmation_skips_reward_when_native_token_unset() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    let keeper = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    // Set a non-zero reward, then wipe the native_token config to simulate
+    // a deployment where the admin forgot to call set_native_token.
+    s.client.set_dispatch_keeper_reward(&50_000i128);
+    s.env.as_contract(&s.client.address, || {
+        s.env.storage().instance().remove(&DataKey::NativeToken);
+    });
+
+    let h = hash(&s.env, 0xE3);
+    register_intent(&s, &h, &recipient, 100_000, 9_000, 1, None);
+    let solver_evm = evm_solver(&s.env, 0xAB);
+    s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
+    advance_ledgers(&s, DISPATCH_REWARD_GRACE_LEDGERS);
+
+    // Should not revert despite missing native_token.
+    s.client.dispatch_confirmation(&keeper, &h, &0);
+    let events = s.env.events().all();
+
+    assert_eq!(s.client.status(&h), Some(IntentStatus::ConfirmationSent));
+
+    // keeper_reward_skipped event emitted.
+    let expected = Symbol::new(&s.env, "keeper_reward_skipped");
+    let found = events.iter().any(|(_, topics, _)| {
+        topics.iter().any(|t| {
+            Symbol::try_from_val(&s.env, &t)
+                .map(|sym| sym == expected)
+                .unwrap_or(false)
+        })
+    });
+    assert!(found, "keeper_reward_skipped event not emitted");
+}
+
+/// AC5: list_undispatched_intents returns only hashes in Filled-but-undispatched state.
+#[test]
+fn list_undispatched_intents_filters_correctly() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &5_000_000);
+    let solver_evm = evm_solver(&s.env, 0xAB);
+
+    // h1: Locked (never filled).
+    let h1 = hash(&s.env, 0xF1);
+    register_intent(&s, &h1, &recipient, 100_000, 9_000, 1, None);
+
+    // h2: Filled via deliver_intent (undispatched) — should appear in output.
+    let h2 = hash(&s.env, 0xF2);
+    register_intent(&s, &h2, &recipient, 100_000, 9_000, 2, None);
+    s.client.deliver_intent(&solver, &solver_evm, &h2, &100_000);
+
+    // h3: Fully confirmed via fill_intent — should NOT appear.
+    let h3 = hash(&s.env, 0xF3);
+    register_intent(&s, &h3, &recipient, 100_000, 9_000, 3, None);
+    s.client
+        .fill_intent(&solver, &solver_evm, &h3, &100_000, &0);
+
+    // h4: Filled via deliver_intent, then dispatched — should NOT appear.
+    let h4 = hash(&s.env, 0xF4);
+    register_intent(&s, &h4, &recipient, 100_000, 9_000, 4, None);
+    s.client.deliver_intent(&solver, &solver_evm, &h4, &100_000);
+    let caller = Address::generate(&s.env);
+    s.client.dispatch_confirmation(&caller, &h4, &0);
+
+    let mut input = soroban_sdk::Vec::new(&s.env);
+    input.push_back(h1.clone());
+    input.push_back(h2.clone());
+    input.push_back(h3.clone());
+    input.push_back(h4.clone());
+
+    let undispatched = s.client.list_undispatched_intents(&input);
+
+    assert_eq!(undispatched.len(), 1, "only h2 should be undispatched");
+    assert_eq!(undispatched.get(0), Some(h2), "h2 must be the result");
+}
+
+/// AC6: After deliver_intent, cancel_expired_intent refuses to act (AlreadyFilled).
+/// The only recovery path is dispatch_confirmation, not cancellation.
+///
+/// This confirms that once a solver has delivered the asset, the intent is
+/// permanently locked from the cancel path — the keeper-dispatch incentive is
+/// the designed recovery mechanism.
+#[test]
+fn cancel_expired_intent_blocked_after_deliver_intent() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    let solver = Address::generate(&s.env);
+    s.asset_admin.mint(&solver, &1_000_000);
+
+    let h = hash(&s.env, 0xE4);
+    // Set a tight deadline so we can advance past it.
+    register_intent(&s, &h, &recipient, 100_000, 3_000, 1, None);
+    let solver_evm = evm_solver(&s.env, 0xAB);
+
+    // Deliver asset but do not dispatch confirmation.
+    s.client.deliver_intent(&solver, &solver_evm, &h, &100_000);
+
+    // Advance time past the deadline.
+    s.env.ledger().with_mut(|li| li.timestamp = 4_000);
+
+    // cancel_expired_intent must be refused.
+    let keeper = Address::generate(&s.env);
+    let err = s
+        .client
+        .try_cancel_expired_intent(&keeper, &h, &0)
+        .expect_err("cancel must fail on a Filled intent")
+        .unwrap();
+    assert_eq!(
+        err,
+        PerihelionError::AlreadyFilled,
+        "must return AlreadyFilled, not let the cancel proceed"
+    );
+
+    // The user still received the asset.
+    let tok = token::TokenClient::new(&s.env, &s.asset);
+    assert_eq!(tok.balance(&recipient), 100_000);
+
+    // The keeper can still dispatch to recover the solver's capital.
+    s.env.ledger().with_mut(|li| li.timestamp = 1_000); // reset to before-deadline for dispatch
+                                                        // (dispatch_confirmation has no deadline restriction — it's the recovery path)
+    s.client.dispatch_confirmation(&keeper, &h, &0);
+    assert_eq!(s.client.status(&h), Some(IntentStatus::ConfirmationSent));
+}
+
+// --- Issue #906: value caps must not sum across destination assets ---------
+
+#[test]
+fn rolling_window_cap_does_not_sum_across_destination_assets() {
+    let s = setup();
+    // One window cap of 1_000 units, shared by every intent that reaches
+    // `enforce_value_caps`. Each asset should get its own budget, so 800 of
+    // asset A and 800 of asset B must both be accepted in the same window.
+    s.client.set_rolling_window_cap(&3_600u64, &1_000i128);
+
+    register_intent(
+        &s,
+        &hash(&s.env, 0x91),
+        &Address::generate(&s.env),
+        800,
+        5_000,
+        1,
+        None,
+    );
+
+    let other_issuer = Address::generate(&s.env);
+    let other_asset = s
+        .env
+        .register_stellar_asset_contract_v2(other_issuer)
+        .address();
+    let fi = FillInstruction {
+        intent_hash: hash(&s.env, 0x92),
+        src_eid: s.src_eid,
+        recipient: Address::generate(&s.env),
+        dest_asset: other_asset,
+        min_dest_amount: 800,
+        deadline: 5_000,
+        preferred_solver: None,
+        locked_solver: None,
+        reservation_window: 0,
+    };
+    let origin = Origin {
+        src_eid: s.src_eid,
+        sender: s.peer.clone(),
+        nonce: 2,
+    };
+    let guid = BytesN::from_array(&s.env, &[0u8; 32]);
+    assert!(
+        s.client
+            .try_lz_receive(&origin, &guid, &LzMessage::FillInstruction(fi))
+            .is_ok(),
+        "a breach-free amount on a second asset must not be rejected by the first asset's window"
+    );
+    assert!(!s.client.is_rolling_window_cap_triggered());
+}
+
+// --- Issue #907: expired peer proposals must be cleared, not rolled back ---
+
+#[test]
+fn expired_peer_proposal_is_cleared_and_allows_new_proposal() {
+    let s = setup();
+    let stale_peer = BytesN::from_array(&s.env, &[0xFF; 32]);
+    let corrected_peer = BytesN::from_array(&s.env, &[0xFE; 32]);
+    s.client
+        .propose_peer(&s.src_eid, &stale_peer, &MIN_PEER_CHANGE_DELAY);
+
+    // Move past delay + grace so the proposal is expired.
+    s.env.ledger().with_mut(|li| {
+        li.timestamp += MIN_PEER_CHANGE_DELAY + PEER_CHANGE_GRACE + 1;
+    });
+    // The confirm attempt must not leave the stale proposal behind. An `Err`
+    // return would roll back the cleanup, so the pending entry has to be gone
+    // on its own merits.
+    let _ = s.client.try_confirm_peer(&s.src_eid);
+
+    assert!(matches!(
+        s.client.try_get_pending_peer(&s.src_eid),
+        Ok(Ok(None))
+    ));
+    assert!(
+        s.client
+            .try_propose_peer(&s.src_eid, &corrected_peer, &MIN_PEER_CHANGE_DELAY)
+            .is_ok(),
+        "a corrected peer must be proposable immediately after an expired proposal"
+    );
+}
+
+// --- Issue #908: the endpoint must only rotate through the delayed path -----
+
+#[test]
+fn set_endpoint_cannot_rotate_endpoint_instantly() {
+    let s = setup();
+    let original = s.client.endpoint();
+    let new_ep = Address::generate(&s.env);
+
+    assert!(
+        s.client.try_set_endpoint(&new_ep).is_err(),
+        "set_endpoint must not rotate the trusted endpoint in one transaction"
+    );
+    assert_eq!(s.client.endpoint(), original);
+}
+
+#[test]
+fn endpoint_rotates_only_after_delayed_propose_and_confirm() {
+    let s = setup();
+    let new_ep = Address::generate(&s.env);
+
+    s.client.propose_endpoint(&new_ep);
+    assert!(
+        s.client.try_confirm_endpoint().is_err(),
+        "confirm_endpoint must wait for MIN_PEER_CHANGE_DELAY"
+    );
+
+    s.env.ledger().with_mut(|li| {
+        li.timestamp += MIN_PEER_CHANGE_DELAY + 1;
+    });
+    assert!(s.client.try_confirm_endpoint().is_ok());
+    assert_eq!(s.client.endpoint(), new_ep);
+}
+
+// --- Issue #909: propose_endpoint must refuse to overwrite a pending proposal
+
+#[test]
+fn propose_endpoint_rejects_overwriting_pending_proposal() {
+    let s = setup();
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+    let original_proposed_at = s.env.ledger().timestamp();
+
+    s.client.propose_endpoint(&first);
+    s.env.ledger().with_mut(|li| {
+        li.timestamp += MIN_PEER_CHANGE_DELAY / 2;
+    });
+
+    assert!(
+        s.client.try_propose_endpoint(&second).is_err(),
+        "a second propose_endpoint while one is pending must be rejected"
+    );
+
+    // The pending proposal and its original timer must be untouched.
+    let (pending, proposed_at, _, _) = s
+        .client
+        .try_get_pending_endpoint()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending, first);
+    assert_eq!(proposed_at, original_proposed_at);
+}
+
+#[test]
+fn propose_endpoint_succeeds_after_cancel_of_pending_proposal() {
+    let s = setup();
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+
+    s.client.propose_endpoint(&first);
+    s.client.cancel_pending_endpoint();
+
+    assert!(s.client.try_propose_endpoint(&second).is_ok());
 }

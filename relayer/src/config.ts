@@ -37,7 +37,47 @@ export interface RelayerConfig {
    * best-effort `"refunded"` reporting after `CancelIntent` delivery.
    */
   readonly mempoolStatusToken?: string;
+  /** Stellar transaction timeout in seconds. Defaults to 30. */
+  readonly txTimeoutSeconds?: number;
+  /** Path of the JSON file that persists the relay cursor. */
+  readonly checkpointFile: string;
+  /** Path of the JSON file that persists dead-lettered messages. */
+  readonly deadLetterFile: string;
+  /** TCP port of the health / readiness / metrics server. Defaults to 8080. */
+  readonly healthPort: number;
+  /** Interface the health server binds to. Defaults to 127.0.0.1. */
+  readonly healthHost: string;
+  /** Bearer token required for `/metrics`, when set. */
+  readonly metricsToken?: string;
+  /** Milliseconds since the last successful tick before `/readyz` fails. Defaults to 3 × pollIntervalMs. */
+  readonly readinessStaleMs: number;
+  /** Maximum cursor lag, in blocks, before `/readyz` fails. Defaults to 500. */
+  readonly maxLagBlocks: number;
+  /**
+   * Relayer operating mode.  `"dev"` (the default) runs the development-only
+   * stand-in for the LayerZero executor, which signs `lz_receive` directly as
+   * the settlement contract's configured `Endpoint`.  `"executor"` is reserved
+   * for the production design, where the relayer is a permissionless executor
+   * calling a real LayerZero endpoint/adapter and its key carries no authority.
+   */
+  readonly relayerMode: RelayerMode;
+  /**
+   * Explicit override that permits endpoint-impersonation mode (`"dev"`)
+   * against a public network (Pubnet).  Without it, the relayer refuses to
+   * start in `"dev"` mode when {@link stellarNetwork} is Pubnet.
+   */
+  readonly allowEndpointImpersonation: boolean;
 }
+
+/** Supported relayer operating modes. */
+export type RelayerMode = "dev" | "executor";
+
+/** Stellar Pubnet network passphrase. */
+export const PUBNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+
+/** Accepted truthy values for boolean environment flags. */
+const TRUTHY_RE = /^(1|true|yes|on)$/i;
+=======
 
 /** 0x-prefixed 20-byte EVM address. */
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
@@ -59,6 +99,16 @@ function validateUrl(value: string, name: string): URL {
 }
 
 /**
+ * Emit a one-time deprecation warning for an environment variable that has
+ * been renamed.  The old name keeps working for one release.
+ */
+function warnDeprecated(oldName: string, newName: string): void {
+  console.warn(
+    `[perihelion] ${oldName} is deprecated and will be removed in a future release; use ${newName} instead.`,
+  );
+}
+
+/**
  * Build config from `process.env`, applying sensible defaults.
  * Throws a descriptive error and exits if required vars are missing or
  * any value is malformed/NaN.
@@ -77,13 +127,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
   }
 
   // --- Required: settlement contract id ---
-  const settlementContractId = env.PERIHELION_SETTLEMENT_CONTRACT ?? "";
+  // Preferred name is PERIHELION_SETTLEMENT_CONTRACT_ID; the old
+  // PERIHELION_SETTLEMENT_CONTRACT is accepted as a deprecated alias.
+  const settlementContractId =
+    env.PERIHELION_SETTLEMENT_CONTRACT_ID ?? env.PERIHELION_SETTLEMENT_CONTRACT ?? "";
   if (!settlementContractId) {
-    errors.push("PERIHELION_SETTLEMENT_CONTRACT is required");
+    errors.push(
+      "PERIHELION_SETTLEMENT_CONTRACT_ID is required (deprecated alias: PERIHELION_SETTLEMENT_CONTRACT)",
+    );
   } else if (!SOROBAN_CONTRACT_RE.test(settlementContractId)) {
     errors.push(
-      `PERIHELION_SETTLEMENT_CONTRACT must be a valid Soroban contract id (C…, 56 chars), got: "${settlementContractId}"`,
+      `PERIHELION_SETTLEMENT_CONTRACT_ID must be a valid Soroban contract id (C…, 56 chars), got: "${settlementContractId}"`,
     );
+  }
+  if (!env.PERIHELION_SETTLEMENT_CONTRACT_ID && env.PERIHELION_SETTLEMENT_CONTRACT) {
+    warnDeprecated("PERIHELION_SETTLEMENT_CONTRACT", "PERIHELION_SETTLEMENT_CONTRACT_ID");
   }
 
   // --- Required: EVM RPC URL ---
@@ -99,15 +157,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
   }
 
   // --- Required: Stellar RPC URL ---
-  const stellarRpcUrl = env.PERIHELION_STELLAR_RPC_URL ?? "";
+  // Preferred name is PERIHELION_SOROBAN_RPC_URL; the old
+  // PERIHELION_STELLAR_RPC_URL is accepted as a deprecated alias.
+  const stellarRpcUrl =
+    env.PERIHELION_SOROBAN_RPC_URL ?? env.PERIHELION_STELLAR_RPC_URL ?? "";
   if (!stellarRpcUrl) {
-    errors.push("PERIHELION_STELLAR_RPC_URL is required");
+    errors.push(
+      "PERIHELION_SOROBAN_RPC_URL is required (deprecated alias: PERIHELION_STELLAR_RPC_URL)",
+    );
   } else {
     try {
-      validateUrl(stellarRpcUrl, "PERIHELION_STELLAR_RPC_URL");
+      validateUrl(stellarRpcUrl, "PERIHELION_SOROBAN_RPC_URL");
     } catch (err) {
       errors.push(String(err));
     }
+  }
+  if (!env.PERIHELION_SOROBAN_RPC_URL && env.PERIHELION_STELLAR_RPC_URL) {
+    warnDeprecated("PERIHELION_STELLAR_RPC_URL", "PERIHELION_SOROBAN_RPC_URL");
   }
 
   // --- Required: source EID (positive integer) ---
@@ -134,7 +200,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
     errors.push("SIGNER_SECRET is required");
   } else if (!STELLAR_SECRET_RE.test(signerSecret)) {
     errors.push(
-      `SIGNER_SECRET must be a valid Stellar secret key (S…, 56 chars), got: "${signerSecret.substring(0, 5)}…"`,
+      "SIGNER_SECRET must be a valid Stellar secret key (S…, 56 chars)",
     );
   }
 
@@ -157,6 +223,70 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
   if (Number.isNaN(startBlock) || startBlock < 0) {
     errors.push(
       `PERIHELION_START_BLOCK must be a non-negative integer, got: "${env.PERIHELION_START_BLOCK}"`,
+    );
+  }
+
+  const txTimeoutSeconds = Number(env.PERIHELION_TX_TIMEOUT_SECONDS ?? 30);
+  if (Number.isNaN(txTimeoutSeconds) || txTimeoutSeconds <= 0 || !Number.isInteger(txTimeoutSeconds)) {
+    errors.push(
+      `PERIHELION_TX_TIMEOUT_SECONDS must be a positive integer, got: "${env.PERIHELION_TX_TIMEOUT_SECONDS}"`,
+    );
+  }
+
+  const checkpointFile = env.PERIHELION_CHECKPOINT_FILE || "./.perihelion-relayer-checkpoint.json";
+  const deadLetterFile = env.PERIHELION_DEAD_LETTER_FILE || "./.perihelion-relayer-dead-letter.json";
+
+  const healthPort = Number(env.PERIHELION_HEALTH_PORT ?? 8080);
+  if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65_535) {
+    errors.push(
+      `PERIHELION_HEALTH_PORT must be an integer between 1 and 65535, got: "${env.PERIHELION_HEALTH_PORT}"`,
+    );
+  }
+
+  const healthHost = env.PERIHELION_HEALTH_HOST || "127.0.0.1";
+  const metricsToken = env.PERIHELION_METRICS_TOKEN || undefined;
+
+  const readinessStaleMs = Number(env.PERIHELION_READINESS_STALE_MS ?? pollIntervalMs * 3);
+  if (!Number.isInteger(readinessStaleMs) || readinessStaleMs <= 0) {
+    errors.push(
+      `PERIHELION_READINESS_STALE_MS must be a positive integer, got: "${env.PERIHELION_READINESS_STALE_MS}"`,
+    );
+  }
+
+  const maxLagBlocks = Number(env.PERIHELION_MAX_LAG_BLOCKS ?? 500);
+  if (!Number.isInteger(maxLagBlocks) || maxLagBlocks < 0) {
+    errors.push(
+      `PERIHELION_MAX_LAG_BLOCKS must be a non-negative integer, got: "${env.PERIHELION_MAX_LAG_BLOCKS}"`,
+    );
+  }
+
+  // --- Relayer mode (defaults to the development-only stand-in) ---
+  const rawRelayerMode = (env.PERIHELION_RELAYER_MODE ?? "dev").trim().toLowerCase();
+  let relayerMode: RelayerMode = "dev";
+  if (rawRelayerMode === "dev" || rawRelayerMode === "executor") {
+    relayerMode = rawRelayerMode;
+  } else {
+    errors.push(
+      `PERIHELION_RELAYER_MODE must be "dev" or "executor", got: "${env.PERIHELION_RELAYER_MODE}"`,
+    );
+  }
+
+  // --- Explicit override for endpoint impersonation on a public network ---
+  const allowEndpointImpersonation = TRUTHY_RE.test(
+    (env.PERIHELION_ALLOW_ENDPOINT_IMPERSONATION ?? "").trim(),
+  );
+
+  // --- Network gate: refuse endpoint impersonation against Pubnet ---
+  if (
+    relayerMode === "dev" &&
+    stellarNetwork === PUBNET_PASSPHRASE &&
+    !allowEndpointImpersonation
+  ) {
+    errors.push(
+      "PERIHELION_RELAYER_MODE=dev impersonates the settlement contract's Endpoint and is " +
+        "development-only; refusing to start against Pubnet. Set " +
+        "PERIHELION_ALLOW_ENDPOINT_IMPERSONATION=true to override (unsafe), or use a real " +
+        "LayerZero endpoint/adapter (PERIHELION_RELAYER_MODE=executor).",
     );
   }
 
@@ -184,5 +314,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig 
     signerSecret,
     mempoolUrl,
     mempoolStatusToken,
+    txTimeoutSeconds,
+    checkpointFile,
+    deadLetterFile,
+    healthPort,
+    healthHost,
+    metricsToken,
+    readinessStaleMs,
+    maxLagBlocks,
+    relayerMode,
+    allowEndpointImpersonation,
   };
 }

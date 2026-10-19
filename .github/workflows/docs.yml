@@ -10,51 +10,59 @@ on:
     paths:
       - 'docs/**'
       - '*.md'
+      - 'contracts/**/*.md'
       - '.spectral.yaml'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE.md'
       - '.github/workflows/docs.yml'
       - 'scripts/check-status-links.mjs'
       - '.github/fixtures/**'
+      - '.mlc-config.json'
   pull_request:
     branches: [main]
     paths:
       - 'docs/**'
       - '*.md'
+      - 'contracts/**/*.md'
       - '.spectral.yaml'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE.md'
       - '.github/workflows/docs.yml'
       - 'scripts/check-status-links.mjs'
       - '.github/fixtures/**'
+      - '.mlc-config.json'
 
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: true
+
+# Least-privilege default; jobs only check out and lint docs.
+permissions:
+  contents: read
 
 jobs:
   openapi-lint:
     name: Lint mempool OpenAPI spec
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version-file: '.nvmrc'
 
       - name: Lint docs/api/mempool-api.yaml with Spectral
-        run: npx --yes @stoplight/spectral-cli lint docs/api/mempool-api.yaml
+        run: npx --yes @stoplight/spectral-cli@6.16.3 lint docs/api/mempool-api.yaml
 
   validate-templates:
     name: Validate issue/PR templates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
 
@@ -71,6 +79,23 @@ jobs:
           errors = []
           template_dir = Path(".github/ISSUE_TEMPLATE")
 
+          def check_chooser_config(path, doc):
+              # config.yml configures GitHub's template chooser; it is not an
+              # issue form, so it has no name/description/body to validate.
+              if "blank_issues_enabled" in doc and not isinstance(doc["blank_issues_enabled"], bool):
+                  errors.append(f"{path}: 'blank_issues_enabled' must be a boolean")
+              links = doc.get("contact_links", [])
+              if not isinstance(links, list):
+                  errors.append(f"{path}: 'contact_links' must be a list")
+                  return
+              for i, link in enumerate(links):
+                  if not isinstance(link, dict):
+                      errors.append(f"{path}: contact_links[{i}] must be a mapping")
+                      continue
+                  for key in ("name", "url", "about"):
+                      if key not in link:
+                          errors.append(f"{path}: contact_links[{i}] missing required field '{key}'")
+
           for path in sorted(template_dir.glob("*.yml")):
               try:
                   with open(path) as f:
@@ -81,6 +106,10 @@ jobs:
 
               if not isinstance(doc, dict):
                   errors.append(f"{path}: expected a YAML mapping at the top level")
+                  continue
+
+              if path.name == "config.yml":
+                  check_chooser_config(path, doc)
                   continue
 
               for required in ("name", "description"):
@@ -107,10 +136,10 @@ jobs:
     name: Implementation Status links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version-file: '.nvmrc'
 
@@ -136,10 +165,10 @@ jobs:
     name: Markdown link check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version-file: '.nvmrc'
 
@@ -149,15 +178,15 @@ jobs:
       - name: Check relative links
         run: |
           set -e
-          FILES=$(find . -name '*.md' \
+          FAILED=0
+          while IFS= read -r -d '' f; do
+            markdown-link-check "$f" --config .mlc-config.json || FAILED=1
+          done < <(find . -name '*.md' \
             -not -path './node_modules/*' \
             -not -path './.git/*' \
             -not -path '*/target/*' \
-            -not -path '*/contracts/*')
-          FAILED=0
-          for f in $FILES; do
-            markdown-link-check "$f" --config .mlc-config.json || FAILED=1
-          done
+            -not -path './contracts/evm/lib/*' \
+            -print0)
           exit $FAILED
 
   markdown-links-external:
@@ -165,10 +194,10 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version-file: '.nvmrc'
 
@@ -178,13 +207,13 @@ jobs:
       - name: Check all links including external
         run: |
           set -e
-          FILES=$(find . -name '*.md' \
+          FAILED=0
+          while IFS= read -r -d '' f; do
+            markdown-link-check "$f" --config .mlc-config.json || FAILED=1
+          done < <(find . -name '*.md' \
             -not -path './node_modules/*' \
             -not -path './.git/*' \
             -not -path '*/target/*' \
-            -not -path '*/contracts/*')
-          FAILED=0
-          for f in $FILES; do
-            markdown-link-check "$f" --config .mlc-config.json || FAILED=1
-          done
+            -not -path './contracts/evm/lib/*' \
+            -print0)
           exit $FAILED

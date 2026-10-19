@@ -5,7 +5,7 @@ Perihelion keeps dependency updates and security triage explicit so that the bri
 ## Lockfiles and vendored dependencies
 
 - The repository commits the npm lockfile at [package-lock.json](../package-lock.json) and the Soroban Rust lockfile at [contracts/soroban/Cargo.lock](../contracts/soroban/Cargo.lock).
-- The repository does not commit [node_modules](../node_modules) or other generated install trees. Those directories are ignored and should be recreated with `npm ci`.
+- The repository does not commit `node_modules` or other generated install trees. Those directories are ignored and should be recreated with `npm ci`.
 - The Soroban lockfile is committed because the contract workspace is part of the audited release artifact and must remain reproducible.
 
 ## Update cadence

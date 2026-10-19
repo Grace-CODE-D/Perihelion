@@ -29,6 +29,7 @@ Closes #
 - [ ] Docs updated if interfaces or on-chain formats changed
 - [ ] CI is green
 - [ ] Reviewed against the [design invariants](../docs/TECHNICAL-ARCHITECTURE.md#0-design-invariants-read-first) (I1–I5) — this change cannot violate any of them
+- [ ] NatSpec reviewed if this change touches modifiers (e.g. pause gating) or fee handling — the documented pause and fee-refund behaviour matches the implementation
 
 ## Resource / security impact
 

@@ -7,7 +7,8 @@ import {
     Origin,
     MessagingParams,
     MessagingFee,
-    ILayerZeroEndpoint
+    MessagingReceipt,
+    ILayerZeroEndpointV2
 } from "../src/interfaces/ILayerZero.sol";
 import { MockERC20 } from "./PerihelionEscrow.t.sol";
 
@@ -21,7 +22,9 @@ import { MockERC20 } from "./PerihelionEscrow.t.sol";
 ///      This makes the round trip a true integration: the escrow's send and
 ///      receive legs, peer/nonce authentication, and the terminal-state guards
 ///      are all exercised against a counterparty that speaks the pinned protocol.
-contract StellarRelay is ILayerZeroEndpoint {
+contract StellarRelay is ILayerZeroEndpointV2 {
+    function setDelegate(address) external {}
+
     bytes1 private constant VERSION = 0x01;
     bytes1 private constant T_FILL_INSTRUCTION = 0x01;
     bytes1 private constant T_FILL_CONFIRMED = 0x02;
@@ -41,14 +44,14 @@ contract StellarRelay is ILayerZeroEndpoint {
         eid = eid_;
     }
 
-    /// @inheritdoc ILayerZeroEndpoint
+    /// @inheritdoc ILayerZeroEndpointV2
     function quote(MessagingParams calldata, address) external pure returns (MessagingFee memory) {
         return MessagingFee({ nativeFee: 0, lzTokenFee: 0 });
     }
 
-    /// @inheritdoc ILayerZeroEndpoint
+    /// @inheritdoc ILayerZeroEndpointV2
     /// @dev Captures the escrow's outbound FillInstruction (the source->Stellar leg).
-    function send(MessagingParams calldata params, address) external payable returns (bytes32) {
+    function send(MessagingParams calldata params, address) external payable returns (MessagingReceipt memory receipt) {
         bytes calldata m = params.message;
         require(m.length >= 34, "relay: short message");
         require(m[0] == VERSION && m[1] == T_FILL_INSTRUCTION, "relay: not FillInstruction");
@@ -59,7 +62,7 @@ contract StellarRelay is ILayerZeroEndpoint {
         }
         lastFillIntentHash = h;
         fillInstructionCount++;
-        return bytes32(uint256(0xA11CE));
+        return MessagingReceipt({ guid: bytes32(uint256(0xA11CE)), nonce: 0, fee: MessagingFee({nativeFee: msg.value, lzTokenFee: 0}) });
     }
 
     /// @dev Stellar settled: deliver a FillConfirmed authorizing the solver payout.

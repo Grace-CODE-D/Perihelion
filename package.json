@@ -18,18 +18,30 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
+    "test:ci": "node --test scripts/ci-tests/*.test.mjs",
     "verify": "npm run build && npm test",
     "test:coverage": "npm run test:coverage --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present",
+    "lint": "eslint .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
     "clean": "npm run clean --workspaces --if-present",
-    "fmt": "npm run fmt --workspaces --if-present",
-    "fmt:check": "npm run fmt:check --workspaces --if-present"
+    "fmt": "prettier --write \"{sdk,relayer,solver,mempool,test}/{src,test}/**/*.ts\" eslint.config.mjs",
+    "fmt:check": "prettier --check \"{sdk,relayer,solver,mempool,test}/{src,test}/**/*.ts\" eslint.config.mjs",
+    "prepare": "lefthook install"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "^8.7.1",
+    "@stryker-mutator/typescript-checker": "^8.7.1",
+    "eslint": "^9.39.5",
+    "eslint-config-prettier": "^10.1.8",
     "lefthook": "^1.7.0",
-    "typescript": "^5.4.0"
+    "prettier": "^3.9.10",
+    "typescript": "^5.4.0",
+    "typescript-eslint": "^8.71.2"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }
