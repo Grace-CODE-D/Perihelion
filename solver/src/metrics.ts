@@ -31,9 +31,18 @@ export interface FillFees {
   sourceGasWei?: bigint;
   /** LayerZero messaging fee paid in native token (wei). */
   lzFeeWei?: bigint;
-  /** Stellar / Soroban transaction fee paid in stroops. */
+  /**
+   * Stellar / Soroban transaction fee paid in stroops. Should be the amount
+   * actually charged as read from the transaction result, not an estimate.
+   */
   stellarFeeStroops?: bigint;
 }
+
+/**
+ * Resumable executor stages for a single intent. Used as a metric label so
+ * operators can see where intents stall.
+ */
+export type FillStage = "lock" | "wait-for-registration" | "fill";
 
 export interface MetricsSnapshot {
   /** Per-asset P&L and fill accounting (key = dest asset "CODE:ISSUER"). */
@@ -48,6 +57,8 @@ export interface MetricsSnapshot {
   readonly stellarFeeStroops: bigint;
   /** Histogram of skip reasons: reason → count. */
   readonly skipReasons: Readonly<Record<string, number>>;
+  /** Per-stage counters: stage → count of intents currently/observed at that stage. */
+  readonly fillStages: Readonly<Record<string, number>>;
   /** Dedicated counter for implausible profit sanity bound triggers. */
   readonly implausibleProfitTriggers: number;
   /** ISO timestamp of the last reset (or process start). */
@@ -67,6 +78,8 @@ export interface Metrics {
   recordImplausibleProfitTrigger?(): void;
   recordFee(wei: bigint): void;
   recordFees?(fees: FillFees): void;
+  /** Record that an intent reached (or stalled at) a given executor stage. */
+  recordFillStage?(stage: FillStage): void;
   snapshot(): MetricsSnapshot;
 }
 
@@ -77,6 +90,7 @@ export class SolverMetrics implements Metrics {
   private lzFeeWei = 0n;
   private stellarFeeStroops = 0n;
   private readonly skipReasons = new Map<string, number>();
+  private readonly fillStages = new Map<string, number>();
   private implausibleProfitTriggers = 0;
   private readonly since = new Date().toISOString();
 
@@ -146,6 +160,10 @@ export class SolverMetrics implements Metrics {
     this.implausibleProfitTriggers += 1;
   }
 
+  recordFillStage(stage: FillStage): void {
+    this.fillStages.set(stage, (this.fillStages.get(stage) ?? 0) + 1);
+  }
+
   recordFee(wei: bigint): void {
     this.totalFeesWei += wei;
     this.sourceGasWei += wei;
@@ -180,6 +198,10 @@ export class SolverMetrics implements Metrics {
     for (const [k, v] of this.skipReasons) {
       skipReasons[k] = v;
     }
+    const fillStages: Record<string, number> = {};
+    for (const [k, v] of this.fillStages) {
+      fillStages[k] = v;
+    }
     return {
       corridors,
       totalFeesWei: this.totalFeesWei,
@@ -187,6 +209,7 @@ export class SolverMetrics implements Metrics {
       lzFeeWei: this.lzFeeWei,
       stellarFeeStroops: this.stellarFeeStroops,
       skipReasons,
+      fillStages,
       implausibleProfitTriggers: this.implausibleProfitTriggers,
       since: this.since,
     };
@@ -267,6 +290,12 @@ export class SolverMetrics implements Metrics {
     lines.push("# TYPE solver_skips_total counter");
     for (const [reason, count] of Object.entries(snap.skipReasons)) {
       lines.push(`solver_skips_total{reason="${this.escapeLabelValue(reason)}"} ${count}`);
+    }
+
+    lines.push("# HELP solver_fill_stage_total Intents observed at each resumable executor stage (lock, wait-for-registration, fill)");
+    lines.push("# TYPE solver_fill_stage_total counter");
+    for (const [stage, count] of Object.entries(snap.fillStages)) {
+      lines.push(`solver_fill_stage_total{stage="${this.escapeLabelValue(stage)}"} ${count}`);
     }
 
     return lines.join("\n") + "\n";

@@ -18,6 +18,7 @@ import {
   Operation,
   type Account,
 } from "@stellar/stellar-sdk";
+import { evmAddressToBytes32 } from "@perihelion/sdk";
 import { FatalError, type DestinationDelivery } from "./relayer.js";
 import {
   CANCEL_INTENT_LENGTH,

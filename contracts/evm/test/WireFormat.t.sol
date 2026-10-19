@@ -106,6 +106,44 @@ contract WireFormatConformanceTest is Test {
         assertEq(rebuilt, golden);
     }
 
+    /// @dev Issue #946: the solver SDK's `evmAddressToBytes32` must left-pad the
+    ///      address (bytes 12-31) so the EVM decoder accepts it. This pins the
+    ///      SDK helper to `_decodeFillConfirmed` and to the golden vector's
+    ///      `solver_evm` word (bytes 34-65 of fill_confirmed.hex), preventing a
+    ///      regression to the left-justified encoding the escrow rejects.
+    function test_SolverEvmEncodingDecodesOnEvm() public view {
+        // Known solver address used by the SDK helper's test vector.
+        address solverAddr = address(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa);
+
+        // Mirror of @perihelion/sdk evmAddressToBytes32: left-pad into bytes 12-31.
+        bytes32 solverWord = bytes32(uint256(uint160(solverAddr)));
+
+        // The golden vector's solver_evm word must equal the SDK encoding.
+        bytes memory golden = _readVector("fill_confirmed.hex");
+        bytes32 goldenSolverWord;
+        assembly {
+            goldenSolverWord := mload(add(add(golden, 0x20), 34))
+        }
+        assertEq(solverWord, goldenSolverWord, "SDK solver_evm word must match fill_confirmed.hex bytes 34-65");
+        assertEq(solverWord, FC_SOLVER_WORD);
+
+        // Feed the SDK-encoded word through the EVM decoder.
+        bytes memory payload = abi.encodePacked(
+            bytes1(0x01), bytes1(0x02), FC_HASH, solverWord, uint128(1_000_000), uint64(42)
+        );
+        (bytes32 h, address decodedSolver,,) = harness.decodeFillConfirmed(payload);
+        assertEq(h, FC_HASH);
+        assertEq(decodedSolver, solverAddr, "solver_evm must decode back to the solver address");
+
+        // A left-justified (buggy) encoding must be rejected by the decoder.
+        bytes32 leftJustified = bytes32(uint256(uint160(solverAddr)) << 96);
+        bytes memory bad = abi.encodePacked(
+            bytes1(0x01), bytes1(0x02), FC_HASH, leftJustified, uint128(1_000_000), uint64(42)
+        );
+        vm.expectRevert();
+        harness.decodeFillConfirmed(bad);
+    }
+
     function test_CancelIntentVectorDecodes() public view {
         bytes memory golden = _readVector("cancel_intent.hex");
         assertEq(golden.length, 35);

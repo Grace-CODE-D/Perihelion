@@ -171,5 +171,29 @@ export function loadExecutorConfig(
     settlementContractId,
     sourceChainId,
     stellarNetwork,
+    lzFeeBufferBps,
+    registrationPollIntervalMs,
+    minFillHeadroomSecs,
   };
+}
+
+/**
+ * Parse an optional non-negative integer env var, falling back to `fallback`
+ * when unset/blank. Invalid values are recorded in `errors` and the fallback
+ * is returned so the consolidated error message can list every problem.
+ */
+function parseNonNegativeInteger(
+  raw: string | undefined,
+  fallback: number,
+  name: string,
+  errors: string[],
+): number {
+  const trimmed = (raw ?? "").trim();
+  if (trimmed === "") return fallback;
+  const value = Number(trimmed);
+  if (!Number.isInteger(value) || value < 0) {
+    errors.push(`${name} must be a non-negative integer, got: "${trimmed}"`);
+    return fallback;
+  }
+  return value;
 }
