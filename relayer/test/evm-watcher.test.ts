@@ -84,15 +84,17 @@ function encodeLockedData(): Hex {
 }
 
 /** Build a mock Locked log. */
-function makeLockedLog() {
+function makeLockedLog(overrides: { blockNumber?: bigint; logIndex?: number; txHash?: Hex } = {}) {
   // Pad addresses to 32 bytes (topics are 32 bytes each).
   const pad = (addr: string) => ("0x" + addr.slice(2).padStart(64, "0")) as Hex;
 
   return {
     address: ESCROW as `0x${string}`,
-    blockNumber: 100n,
-    transactionHash: "0xtxhash0000000000000000000000000000000000000000000000000000000001" as Hex,
-    logIndex: 0,
+    blockNumber: overrides.blockNumber ?? 100n,
+    transactionHash:
+      overrides.txHash ??
+      ("0xtxhash0000000000000000000000000000000000000000000000000000000001" as Hex),
+    logIndex: overrides.logIndex ?? 0,
     topics: [
       // event signature topic — Locked(bytes32,address,address,address,uint256,string,string,uint128,uint64)
       keccak256(toHex("Locked(bytes32,address,address,address,uint256,string,string,uint128,uint64)")),
@@ -148,6 +150,83 @@ test("EVMSourceWatcher: decodes a Locked log into a PendingMessage", async () =>
   assert.equal(bm.recipient, DESTINATION);
   assert.equal(bm.destAsset, DEST_ASSET);
   assert.equal(bm.amount, MIN_DEST.toString());
+});
+
+test("EVMSourceWatcher: nonces are distinct and non-zero for Locked logs sharing a logIndex", async () => {
+  // Two intents whose Locked logs share logIndex 0 in different blocks.
+  const logA = makeLockedLog({
+    blockNumber: 100n,
+    logIndex: 0,
+    txHash: "0xtxhash000000000000000000000000000000000000000000000000000000000a" as Hex,
+  });
+  const logB = makeLockedLog({
+    blockNumber: 101n,
+    logIndex: 0,
+    txHash: "0xtxhash000000000000000000000000000000000000000000000000000000000b" as Hex,
+  });
+
+  const client = {
+    ...makeMockClient(),
+    getBlockNumber: async () => 101n,
+    getLogs: async () => [logA, logB],
+  };
+  const watcher = new EVMSourceWatcher(BASE_CONFIG);
+  (watcher as unknown as { client: unknown }).client = client;
+
+  const { messages } = await watcher.poll(0);
+
+  assert.equal(messages.length, 2, "both intents delivered");
+  const nonceA = messages[0]!.message.nonce;
+  const nonceB = messages[1]!.message.nonce;
+
+  assert.notEqual(nonceA, 0, "nonce must not be 0");
+  assert.notEqual(nonceB, 0, "nonce must not be 0");
+  assert.notEqual(nonceA, nonceB, "nonces must be distinct across blocks");
+  assert.ok(nonceB > nonceA, `nonces must be strictly increasing (${nonceA} -> ${nonceB})`);
+});
+
+test("EVMSourceWatcher: nonces are distinct for Locked logs sharing a non-zero logIndex", async () => {
+  const logA = makeLockedLog({
+    blockNumber: 200n,
+    logIndex: 3,
+    txHash: "0xtxhash000000000000000000000000000000000000000000000000000000000c" as Hex,
+  });
+  const logB = makeLockedLog({
+    blockNumber: 201n,
+    logIndex: 3,
+    txHash: "0xtxhash000000000000000000000000000000000000000000000000000000000d" as Hex,
+  });
+
+  const client = {
+    ...makeMockClient(),
+    getBlockNumber: async () => 201n,
+    getLogs: async () => [logA, logB],
+  };
+  const watcher = new EVMSourceWatcher(BASE_CONFIG);
+  (watcher as unknown as { client: unknown }).client = client;
+
+  const { messages } = await watcher.poll(0);
+
+  assert.equal(messages.length, 2, "both intents delivered");
+  const nonceA = messages[0]!.message.nonce;
+  const nonceB = messages[1]!.message.nonce;
+
+  assert.notEqual(nonceA, 0, "nonce must not be 0");
+  assert.notEqual(nonceB, 0, "nonce must not be 0");
+  assert.notEqual(nonceA, nonceB, "nonces must be distinct across blocks");
+  assert.ok(nonceB > nonceA, `nonces must be strictly increasing (${nonceA} -> ${nonceB})`);
+});
+
+test("EVMSourceWatcher: BridgeMessage.deadline matches the Locked event deadline", async () => {
+  const watcher = new EVMSourceWatcher(BASE_CONFIG);
+  (watcher as unknown as { client: unknown }).client = makeMockClient();
+
+  const { messages } = await watcher.poll(0);
+
+  assert.equal(messages.length, 1);
+  const bm = messages[0]!.message as unknown as { deadline?: bigint | number | string };
+  assert.notEqual(bm.deadline, undefined, "BridgeMessage must carry a deadline");
+  assert.equal(BigInt(bm.deadline as bigint), DEADLINE, "deadline must come from the Locked event");
 });
 
 test("EVMSourceWatcher: includes headHash and parentHash from latest block", async () => {

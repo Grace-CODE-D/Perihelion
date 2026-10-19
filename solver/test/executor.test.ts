@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildIntent, hashIntent, perihelionDomain } from "@perihelion/sdk";
 import type { Hex, SignedIntent } from "@perihelion/sdk";
+import { nativeToScVal, scvU32, scvVoid } from "@stellar/stellar-sdk";
 import { Executor, type ExecutorConfig, type Logger } from "../src/executor.js";
 
 // ─── Wire vector (#946) ───────────────────────────────────────────────────────
@@ -262,10 +263,255 @@ test("checkFillStatus: swallows isSettled errors and returns filled=false", asyn
   assert.equal(result.filled, false);
 });
 
+// ─── isSettled: decoding real ScVal status encodings ─────────────────────────
+//
+// `status(intent_hash)` returns `Option<IntentStatus>`, where `IntentStatus` is
+// a `#[contracttype]` C-like enum (Locked = 0, Filled = 1, ConfirmationSent = 2,
+// Cancelled = 3). Soroban encodes it as a `u32`, and `None` as void. These tests
+// feed real `ScVal` encodings through the decoder to verify classification.
+
+type StatusDecoder = {
+  decodeStatus(retval: unknown): unknown;
+};
+
+function statusDecoder(): StatusDecoder {
+  const ex = expose() as unknown as StatusDecoder;
+  assert.equal(
+    typeof ex.decodeStatus,
+    "function",
+    "Executor must expose a decodeStatus helper for status ScVals",
+  );
+  return ex;
+}
+
+test("isSettled: Filled (scvU32(1)) counts as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(1)), "Filled");
+});
+
+test("isSettled: ConfirmationSent (scvU32(2)) counts as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(2)), "ConfirmationSent");
+});
+
+test("isSettled: Locked (scvU32(0)) does not count as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(0)), "Locked");
+});
+
+test("isSettled: Cancelled (scvU32(3)) does not count as settled", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(3)), "Cancelled");
+});
+
+test("isSettled: None (scvVoid()) decodes as not registered", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvVoid()), undefined);
+});
+
+test("isSettled: native u32 values are classified correctly", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(nativeToScVal(1, { type: "u32" })), "Filled");
+  assert.equal(
+    decoder.decodeStatus(nativeToScVal(2, { type: "u32" })),
+    "ConfirmationSent",
+  );
+  assert.equal(decoder.decodeStatus(nativeToScVal(0, { type: "u32" })), "Locked");
+  assert.equal(
+    decoder.decodeStatus(nativeToScVal(3, { type: "u32" })),
+    "Cancelled",
+  );
+  assert.equal(decoder.decodeStatus(nativeToScVal(null)), undefined);
+});
+
+test("isSettled: unknown discriminants decode as undefined", () => {
+  const decoder = statusDecoder();
+  assert.equal(decoder.decodeStatus(scvU32(99)), undefined);
+});
+
 // ─── Constructor: config validation ──────────────────────────────────────────
 
 test("Executor: constructs without throwing for valid config", () => {
   assert.doesNotThrow(() => new Executor(BASE_CONFIG, SILENT_LOGGER));
+});
+
+test("Executor: rejects a missing config", () => {
+  assert.throws(
+    () => new Executor(undefined as unknown as ExecutorConfig, SILENT_LOGGER),
+    /executor config is required/i,
+  );
+});
+
+// ─── DefiniteFailureError classification ─────────────────────────────────────
+
+test("DefiniteFailureError: is an Error subclass", () => {
+  const err = new DefiniteFailureError("boom");
+  assert.ok(err instanceof Error);
+  assert.ok(err instanceof DefiniteFailureError);
+  assert.equal(err.name, "DefiniteFailureError");
+  assert.equal(err.message, "boom");
+});
+
+test("DefiniteFailureError: preserves cause", () => {
+  const cause = new Error("revert");
+  const err = new DefiniteFailureError("lock reverted", { cause });
+  assert.equal(err.cause, cause);
+});
+
+test("lockOnEvm: simulation failure throws DefiniteFailureError", async () => {
+  class SimFailingExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {
+      throw new Error("fill_intent simulation failed");
+    }
+  }
+  const ex = new SimFailingExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError, "expected DefiniteFailureError");
+      assert.match(err.message, /simulation failed/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: sendTransaction status ERROR throws DefiniteFailureError", async () => {
+  class ErrorStatusExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      throw new DefiniteFailureError("sendTransaction returned ERROR");
+    }
+  }
+  const ex = new ErrorStatusExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError);
+      assert.match(err.message, /ERROR/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: FAILED receipt throws DefiniteFailureError", async () => {
+  class FailedReceiptExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      return "0xdeadbeef" as Hex;
+    }
+    protected override async waitForLockReceipt(): Promise<{ status: string }> {
+      return { status: "reverted" };
+    }
+  }
+  const ex = new FailedReceiptExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError);
+      assert.match(err.message, /reverted|FAILED/i);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: pre-broadcast ContractFunctionRevertedError throws DefiniteFailureError", async () => {
+  class RevertExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      const revert = new Error("execution reverted: InsufficientBalance");
+      revert.name = "ContractFunctionRevertedError";
+      throw revert;
+    }
+  }
+  const ex = new RevertExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(err instanceof DefiniteFailureError);
+      assert.match(err.message, /InsufficientBalance/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: timeout remains a plain Error (indefinite)", async () => {
+  class TimeoutExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      throw new Error("transaction timed out");
+    }
+  }
+  const ex = new TimeoutExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(!(err instanceof DefiniteFailureError), "timeout must stay indefinite");
+      assert.ok(err instanceof Error);
+      assert.match(err.message, /timed out/);
+      return true;
+    },
+  );
+});
+
+test("lockOnEvm: unknown error remains a plain Error (indefinite)", async () => {
+  class UnknownExecutor extends Executor {
+    protected override async simulateLock(): Promise<void> {}
+    protected override async sendLockTransaction(): Promise<Hex> {
+      throw new Error("socket hang up");
+    }
+  }
+  const ex = new UnknownExecutor(BASE_CONFIG, SILENT_LOGGER);
+  await assert.rejects(
+    () => (ex as unknown as PrivateExecutor).lockOnEvm(makeSignedIntent()),
+    (err: unknown) => {
+      assert.ok(!(err instanceof DefiniteFailureError));
+      assert.match(err.message, /socket hang up/);
+      return true;
+    },
+  );
+});
+
+// ─── Reservation release on definite failure ─────────────────────────────────
+
+test("fill: simulation failure releases the InFlightTracker reservation in the same tick", async () => {
+  const signed = makeSignedIntent();
+  const tracker = new InFlightTracker();
+  tracker.reserve(signed.hash);
+
+  class SimFailingExecutor extends Executor {
+    protected override async checkFillStatus() {
+      return { filled: false };
+    }
+    protected override async lockOnEvm(): Promise<Hex> {
+      throw new DefiniteFailureError("fill_intent simulation failed");
+    }
+    protected override async fillOnSoroban(): Promise<Hex> {
+      throw new Error("fillOnSoroban must not be called after simulation failure");
+    }
+  }
+
+  const executor = new SimFailingExecutor(BASE_CONFIG, SILENT_LOGGER);
+
+  await assert.rejects(
+    async () => {
+      try {
+        await executor.fill(signed);
+      } catch (err) {
+        if (err instanceof DefiniteFailureError) {
+          // Definite failure: release immediately, no need to wait for refresh.
+          tracker.release(signed.hash);
+        }
+        throw err;
+      }
+    },
+    (err: unknown) => err instanceof DefiniteFailureError,
+  );
+
+  assert.equal(
+    tracker.has(signed.hash),
+    false,
+    "reservation must be released in the same tick after a definite failure",
+  );
 });
 
 // ─── loadExecutorConfig ───────────────────────────────────────────────────────

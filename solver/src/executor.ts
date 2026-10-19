@@ -9,6 +9,8 @@
  */
 
 import {
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
   http,
@@ -21,10 +23,14 @@ import {
   Keypair,
   Contract,
   nativeToScVal,
-  scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
-import { ESCROW_ABI, evmAddressToBytes32 } from "@perihelion/sdk";
+import {
+  ESCROW_ABI,
+  IntentStatus,
+  decodeIntentStatus,
+  submitAndWait,
+} from "@perihelion/sdk";
 import type { SignedIntent } from "@perihelion/sdk";
 
 /**
@@ -50,6 +56,31 @@ export class DefiniteFailureError extends Error {
     super(message, options);
     this.name = "DefiniteFailureError";
   }
+}
+
+/**
+ * Derive the solver's EVM address from a configured private key.
+ *
+ * The escrow enforces `preferredSolver == msg.sender`, so the address the
+ * solver uses for eligibility decisions must be the one derived from the key
+ * it signs `lock` transactions with.  Exposed so the CLI/config can validate
+ * `PERIHELION_SOLVER_ADDRESS` against it at startup.
+ */
+export function deriveEvmAddress(privateKey: Hex): `0x${string}` {
+  return privateKeyToAccount(privateKey).address;
+}
+
+/**
+ * True when `err` (or any error in its `cause` chain) is a viem
+ * `ContractFunctionRevertedError` — i.e. the contract call reverted during
+ * simulation, before anything was broadcast.
+ */
+function isContractFunctionRevertedError(err: unknown): boolean {
+  if (err instanceof ContractFunctionRevertedError) return true;
+  if (err instanceof BaseError) {
+    return err.walk((e) => e instanceof ContractFunctionRevertedError) !== null;
+  }
+  return false;
 }
 
 /** Logger interface for structured logging. */
@@ -139,6 +170,8 @@ export interface FillFees {
  */
 const SOROBAN_MAX_POLL_ATTEMPTS = 30;
 const SOROBAN_POLL_INTERVAL_MS = 2_000;
+/** How many times to resubmit when the RPC answers TRY_AGAIN_LATER. */
+const SOROBAN_MAX_RESUBMIT_ATTEMPTS = 3;
 
 /**
  * Minimum headroom (in seconds) that must remain before the intent deadline
@@ -171,20 +204,24 @@ export class Executor {
   private readonly loadStage?: (intentHash: Hex) => FillStage | undefined | Promise<FillStage | undefined>;
   private readonly logger: Logger;
 
-  constructor(config?: ExecutorConfig, logger: Logger = console) {
-    this.evmRpcUrl = config?.evmRpcUrl ?? "";
-    this.sorobanRpcUrl = config?.sorobanRpcUrl ?? "";
-    this.evmPrivateKey = config?.evmPrivateKey ?? ("0x");
-    this.sorobanSecretKey = config?.sorobanSecretKey ?? "";
-    this.escrowAddress = config?.escrowAddress ?? ("0x");
-    this.settlementContractId = config?.settlementContractId ?? "";
-    this.sourceChainId = config?.sourceChainId ?? 0;
-    this.stellarNetwork = config?.stellarNetwork ?? "";
-    this.lzFeeBufferStroops = config?.lzFeeBufferStroops ?? 0n;
-    this.sourceConfirmations = config?.sourceConfirmations ?? 1;
-    this.persistStage = config?.persistStage;
-    this.loadStage = config?.loadStage;
+  constructor(config: ExecutorConfig, logger: Logger = console) {
+    if (!config) {
+      throw new Error("Executor requires an ExecutorConfig");
+    }
+    this.evmRpcUrl = config.evmRpcUrl;
+    this.sorobanRpcUrl = config.sorobanRpcUrl;
+    this.evmPrivateKey = config.evmPrivateKey;
+    this.sorobanSecretKey = config.sorobanSecretKey;
+    this.escrowAddress = config.escrowAddress;
+    this.settlementContractId = config.settlementContractId;
+    this.sourceChainId = config.sourceChainId;
+    this.stellarNetwork = config.stellarNetwork;
     this.logger = logger;
+  }
+
+  /** The solver's EVM address, derived from the configured private key. */
+  get address(): `0x${string}` {
+    return deriveEvmAddress(this.evmPrivateKey);
   }
 
   /**
@@ -366,7 +403,7 @@ export class Executor {
 
   /**
    * Check if an intent has already been filled (idempotency check).
-   * Queries Soroban to see if status() returns 'Settled'.
+   * Queries Soroban to see if status() reports a completed fill.
    */
   private async checkFillStatus(intentHash: Hex): Promise<FillStatus> {
     try {
@@ -385,8 +422,14 @@ export class Executor {
   /**
    * Check if an intent is settled on the Soroban settlement contract.
    *
-   * Mirrors the relayer's readStatus pattern: simulates a single-invocation
-   * transaction calling `status(intent_hash)` and decodes the return value.
+   * Simulates a single-invocation transaction calling `status(intent_hash)`
+   * and decodes the returned `Option<IntentStatus>` (a `u32` discriminant,
+   * or void when the intent is not registered).
+   *
+   * For idempotency purposes an intent counts as complete once the
+   * destination assets have been delivered, i.e. status is `Filled` or
+   * `ConfirmationSent`. `Locked` and `Cancelled` are not complete, and
+   * `undefined` means the intent is not registered at all.
    */
   private async isSettled(intentHash: Hex): Promise<boolean> {
     return (await this.readStatus(intentHash)) === "Settled";
@@ -422,14 +465,8 @@ export class Executor {
       return null;
     }
 
-    // The status enum decodes to a bare symbol string (e.g. "Settled") or a
-    // [tag, ...payload] array — same pattern as soroban-delivery.ts readStatus.
-    const native: unknown = scValToNative(simulated.result.retval);
-    return typeof native === "string"
-      ? native
-      : Array.isArray(native) && typeof native[0] === "string"
-        ? native[0]
-        : null;
+    const status = decodeIntentStatus(simulated.result.retval);
+    return status === IntentStatus.Filled || status === IntentStatus.ConfirmationSent;
   }
 
   /**
@@ -477,15 +514,25 @@ export class Executor {
       args: [contractIntent, account.address],
     }) as bigint;
 
-    const txHash = await walletClient.writeContract({
-      account,
-      chain: null, // chain is resolved from the RPC endpoint
-      address: this.escrowAddress,
-      abi: ESCROW_ABI,
-      functionName: "lock",
-      args: [contractIntent, signature],
-      value: nativeFee,
-    });
+    let txHash: Hex;
+    try {
+      txHash = await walletClient.writeContract({
+        account,
+        chain: null, // chain is resolved from the RPC endpoint
+        address: this.escrowAddress,
+        abi: ESCROW_ABI,
+        functionName: "lock",
+        args: [contractIntent, signature],
+        value: nativeFee,
+      });
+    } catch (err) {
+      // A revert surfaced by writeContract happens during simulation, before
+      // broadcast: no capital moved, so the reservation can be released.
+      if (isContractFunctionRevertedError(err)) {
+        throw new DefiniteFailureError("escrow lock reverted", { cause: err });
+      }
+      throw err;
+    }
 
     // Wait for the transaction to be included in a block.
     const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
@@ -567,34 +614,25 @@ export class Executor {
     // Simulate to obtain the resource fee and prepared transaction.
     const simulated = await rpc.simulateTransaction(tx);
     if (!SorobanRpc.Api.isSimulationSuccess(simulated)) {
-      throw new Error(`fill_intent simulation failed: ${String((simulated).error)}`);
+      // Simulation failure: the transaction was never submitted.
+      throw new DefiniteFailureError(
+        `fill_intent simulation failed: ${String((simulated).error)}`,
+      );
     }
 
     const prepared = SorobanRpc.assembleTransaction(tx, simulated).build();
     prepared.sign(keypair);
 
-    const result = await rpc.sendTransaction(prepared);
-    if (result.status === "ERROR") {
-      throw new Error(`fill_intent submission failed: ${result.errorResult?.toXDR("base64") ?? "unknown"}`);
-    }
+    // Submit and wait, failing fast on ERROR and backing off on
+    // TRY_AGAIN_LATER (shared with the relayer's delivery path).
+    const hash = await submitAndWait(rpc, prepared, {
+      maxPollAttempts: SOROBAN_MAX_POLL_ATTEMPTS,
+      pollIntervalMs: SOROBAN_POLL_INTERVAL_MS,
+      maxResubmitAttempts: SOROBAN_MAX_RESUBMIT_ATTEMPTS,
+      label: "fill_intent",
+    });
 
-    // Poll until the transaction is confirmed.
-    for (let attempt = 0; attempt < SOROBAN_MAX_POLL_ATTEMPTS; attempt++) {
-      const txStatus = await rpc.getTransaction(result.hash);
-      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        // Record the fee actually charged (inclusion fee + resource fee).
-        const feeStroops = BigInt(txStatus.resultMetaXdr
-          ? (txStatus as unknown as { feeCharged?: string }).feeCharged ?? prepared.fee
-          : prepared.fee);
-        return { txHash: result.hash as Hex, feeStroops };
-      }
-      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-        throw new Error(`fill_intent transaction failed: ${txStatus.resultXdr?.toXDR("base64") ?? "unknown"}`);
-      }
-      await sleep(SOROBAN_POLL_INTERVAL_MS);
-    }
-
-    throw new Error(`fill_intent confirmation timeout after ${SOROBAN_MAX_POLL_ATTEMPTS} attempts: ${result.hash}`);
+    return hash as Hex;
   }
 
   /**
@@ -634,10 +672,6 @@ export class Executor {
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /**
  * Decode a 0x-prefixed hex string to a Uint8Array.

@@ -75,7 +75,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MempoolConfig 
     );
   }
 
-  const host = env.PERIHELION_MEMPOOL_HOST ?? "localhost";
+  // --- Bind host: mempool-specific name wins, then the shared names ---
+  const host =
+    env.PERIHELION_MEMPOOL_HOST ??
+    env.PERIHELION_METRICS_HOST ??
+    env.PERIHELION_HEALTH_HOST ??
+    "localhost";
 
   // --- Required: source chain ID ---
   const chainIdRaw = env.PERIHELION_SOURCE_CHAIN_ID;

@@ -170,6 +170,26 @@ export const ESCROW_ABI = [
   },
   {
     type: "error",
-    name: "PausedError",
+    name: "NotOwner",
+  },
+  {
+    type: "error",
+    name: "NoPendingOwner",
+  },
+  {
+    type: "error",
+    name: "NotAContract",
+  },
+  {
+    type: "error",
+    name: "ZeroAddress",
+  },
+  {
+    type: "error",
+    name: "TransferFailed",
+  },
+  {
+    type: "error",
+    name: "EnforcedPause",
   },
 ] as const;

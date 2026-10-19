@@ -3,17 +3,47 @@
 /** Load executor configuration from environment variables. */
 
 import type { ExecutorConfig } from "./executor.js";
-import { getAddress, isAddress, type Hex } from "viem";
+import { getAddress, isAddress, privateKeyToAccount, type Hex } from "viem";
 
 const EXECUTOR_ENV_KEYS = [
   "PERIHELION_EVM_RPC_URL",
   "PERIHELION_SOROBAN_RPC_URL",
+  "PERIHELION_STELLAR_RPC_URL",
   "PERIHELION_EVM_PRIVATE_KEY",
   "PERIHELION_SOROBAN_SECRET_KEY",
   "PERIHELION_ESCROW_ADDRESS",
   "PERIHELION_SETTLEMENT_CONTRACT_ID",
+  "PERIHELION_SETTLEMENT_CONTRACT",
   "PERIHELION_SOURCE_CHAIN_ID",
 ] as const;
+
+/** Read a setting, preferring the unified name and warning on legacy names. */
+function readWithLegacy(
+  env: NodeJS.ProcessEnv,
+  primary: string,
+  legacy: string,
+  errors: string[],
+): string {
+  const primaryValue = (env[primary] ?? "").trim();
+  const legacyValue = (env[legacy] ?? "").trim();
+  if (primaryValue) {
+    if (legacyValue && legacyValue !== primaryValue) {
+      errors.push(
+        `${legacy} is deprecated and conflicts with ${primary}; remove ${legacy} and keep only ${primary}`,
+      );
+    } else if (legacyValue) {
+      console.warn(
+        `[config] ${legacy} is deprecated; use ${primary} instead`,
+      );
+    }
+    return primaryValue;
+  }
+  if (legacyValue) {
+    console.warn(`[config] ${legacy} is deprecated; use ${primary} instead`);
+    return legacyValue;
+  }
+  return "";
+}
 
 /**
  * Return true when any executor-specific configuration has been provided.
@@ -45,8 +75,17 @@ export function loadExecutorConfig(
   const evmRpcUrl = env.PERIHELION_EVM_RPC_URL ?? "";
   if (!evmRpcUrl) errors.push("PERIHELION_EVM_RPC_URL is required");
 
-  const sorobanRpcUrl = env.PERIHELION_SOROBAN_RPC_URL ?? "";
-  if (!sorobanRpcUrl) errors.push("PERIHELION_SOROBAN_RPC_URL is required");
+  const sorobanRpcUrl = readWithLegacy(
+    env,
+    "PERIHELION_SOROBAN_RPC_URL",
+    "PERIHELION_STELLAR_RPC_URL",
+    errors,
+  );
+  if (!sorobanRpcUrl) {
+    errors.push(
+      "PERIHELION_SOROBAN_RPC_URL is required (legacy alias: PERIHELION_STELLAR_RPC_URL)",
+    );
+  }
 
   const evmPrivateKey = env.PERIHELION_EVM_PRIVATE_KEY ?? "";
   if (!evmPrivateKey) {
@@ -67,39 +106,55 @@ export function loadExecutorConfig(
     );
   }
 
-  const settlementContractId = env.PERIHELION_SETTLEMENT_CONTRACT_ID ?? "";
-  if (!settlementContractId) errors.push("PERIHELION_SETTLEMENT_CONTRACT_ID is required");
+  const settlementContractId = readWithLegacy(
+    env,
+    "PERIHELION_SETTLEMENT_CONTRACT_ID",
+    "PERIHELION_SETTLEMENT_CONTRACT",
+    errors,
+  );
+  if (!settlementContractId) {
+    errors.push(
+      "PERIHELION_SETTLEMENT_CONTRACT_ID is required (legacy alias: PERIHELION_SETTLEMENT_CONTRACT)",
+    );
+  }
 
   const stellarNetwork = env.STELLAR_NETWORK ?? "";
   if (!stellarNetwork) errors.push("STELLAR_NETWORK is required");
 
-  const sourceChainId = Number(env.PERIHELION_SOURCE_CHAIN_ID ?? 1);
-  if (!Number.isInteger(sourceChainId) || sourceChainId <= 0) {
+  const rawSourceChainId = (env.PERIHELION_SOURCE_CHAIN_ID ?? "").trim();
+  const sourceChainId = Number(rawSourceChainId);
+  if (!rawSourceChainId) {
+    errors.push("PERIHELION_SOURCE_CHAIN_ID is required");
+  } else if (!Number.isInteger(sourceChainId) || sourceChainId <= 0) {
     errors.push(
-      `PERIHELION_SOURCE_CHAIN_ID must be a positive integer, got: "${env.PERIHELION_SOURCE_CHAIN_ID}"`,
+      `PERIHELION_SOURCE_CHAIN_ID must be a positive integer, got: "${rawSourceChainId}"`,
     );
   }
 
-  const lzFeeBufferBps = parseNonNegativeInteger(
-    env.PERIHELION_LZ_FEE_BUFFER_BPS,
-    2000,
-    "PERIHELION_LZ_FEE_BUFFER_BPS",
-    errors,
-  );
-
-  const registrationPollIntervalMs = parseNonNegativeInteger(
-    env.PERIHELION_REGISTRATION_POLL_INTERVAL_MS,
-    5000,
-    "PERIHELION_REGISTRATION_POLL_INTERVAL_MS",
-    errors,
-  );
-
-  const minFillHeadroomSecs = parseNonNegativeInteger(
-    env.PERIHELION_MIN_FILL_HEADROOM_SECS,
-    120,
-    "PERIHELION_MIN_FILL_HEADROOM_SECS",
-    errors,
-  );
+  // The solver address used for eligibility checks must match the key that
+  // signs lock transactions, otherwise reserved intents are mis-attributed.
+  const configuredSolverAddress = (env.PERIHELION_SOLVER_ADDRESS ?? "").trim();
+  if (configuredSolverAddress && evmPrivateKey.startsWith("0x")) {
+    let derivedAddress: string | undefined;
+    try {
+      derivedAddress = privateKeyToAccount(evmPrivateKey as Hex).address;
+    } catch {
+      errors.push("PERIHELION_EVM_PRIVATE_KEY is not a valid EVM private key");
+    }
+    if (derivedAddress) {
+      if (!isAddress(configuredSolverAddress)) {
+        errors.push(
+          `PERIHELION_SOLVER_ADDRESS must be a 0x-prefixed 20-byte EVM address, got: "${configuredSolverAddress}"`,
+        );
+      } else if (
+        getAddress(configuredSolverAddress) !== getAddress(derivedAddress)
+      ) {
+        errors.push(
+          `PERIHELION_SOLVER_ADDRESS (${getAddress(configuredSolverAddress)}) does not match the address derived from PERIHELION_EVM_PRIVATE_KEY (${getAddress(derivedAddress)})`,
+        );
+      }
+    }
+  }
 
   if (errors.length > 0) {
     throw new Error(

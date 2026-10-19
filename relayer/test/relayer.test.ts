@@ -802,6 +802,102 @@ test("batch of two messages for one intent, both resolved, advances the cursor p
   );
 });
 
+// ─── Issue #945: CancelIntent delivery must not report `refunded` ───────────
+
+test("CancelIntent delivery reports `cancelling`, not `refunded` (#945)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const intentHash = `0x${"ef".repeat(32)}` as `0x${string}`;
+  const watcher: SourceWatcher = {
+    async poll() {
+      return {
+        messages: [makeMsg(10, { intentHash, messageType: "CancelIntent", nonce: 1 })],
+        head: 10,
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+  const reported: Array<{ intentHash: string; status: string }> = [];
+  const mempoolClient = {
+    async reportStatus(hash: string, status: string) {
+      reported.push({ intentHash: hash, status });
+    },
+  };
+
+  const relayer = new Relayer(
+    config,
+    watcher,
+    delivery,
+    silent,
+    0,
+    memCheckpoint(),
+    undefined,
+    undefined,
+    mempoolClient as never,
+  );
+  await relayer.tick();
+
+  assert.ok(
+    !reported.some((r) => r.status === "refunded"),
+    `must not report refunded before a refund event exists; got ${JSON.stringify(reported)}`,
+  );
+  assert.ok(
+    reported.some((r) => r.intentHash === intentHash && r.status === "cancelling"),
+    `expected a cancelling report for the intent; got ${JSON.stringify(reported)}`,
+  );
+});
+
+test("`refunded` is reported only once a refund event is observed for the intent hash (#945)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const intentHash = `0x${"12".repeat(32)}` as `0x${string}`;
+  const watcher: SourceWatcher = {
+    async poll() {
+      return {
+        messages: [makeMsg(10, { intentHash, messageType: "CancelIntent", nonce: 1 })],
+        head: 10,
+      };
+    },
+  };
+  const delivery: DestinationDelivery = {
+    async deliver() { return "0xdst"; },
+    async isDelivered() { return false; },
+  };
+  const reported: Array<{ intentHash: string; status: string }> = [];
+  const mempoolClient = {
+    async reportStatus(hash: string, status: string) {
+      reported.push({ intentHash: hash, status });
+    },
+  };
+
+  const relayer = new Relayer(
+    config,
+    watcher,
+    delivery,
+    silent,
+    0,
+    memCheckpoint(),
+    undefined,
+    undefined,
+    mempoolClient as never,
+  );
+  await relayer.tick();
+
+  assert.ok(
+    !reported.some((r) => r.status === "refunded"),
+    "no refunded report without an observed refund event",
+  );
+
+  // Simulate the return-leg watcher observing the EVM refund event.
+  await relayer.observeRefund(intentHash);
+
+  assert.ok(
+    reported.some((r) => r.intentHash === intentHash && r.status === "refunded"),
+    `expected refunded after observing the refund event; got ${JSON.stringify(reported)}`,
+  );
+});
+
 // ─── Issue #736: detectReorg tests ──────────────────────────────────────────
 
 test("detects single-block reorg and rolls back cursor correctly", async () => {

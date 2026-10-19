@@ -196,6 +196,25 @@ contract ReleaseFalseReturningERC20 is IERC20 {
     }
 }
 
+/// @dev Minimal ERC-1271 smart-contract wallet for tests. Returns the magic
+///      value when `valid` is true, otherwise an arbitrary non-magic value.
+contract MockERC1271Wallet {
+    bytes4 internal constant MAGIC = 0x1626ba7e;
+    bool public valid;
+
+    constructor(bool _valid) {
+        valid = _valid;
+    }
+
+    function setValid(bool _valid) external {
+        valid = _valid;
+    }
+
+    function isValidSignature(bytes32, bytes calldata) external view returns (bytes4) {
+        return valid ? MAGIC : bytes4(0xffffffff);
+    }
+}
+
 /// @dev Records the last outbound LayerZero send and can replay inbound messages
 ///      back into the escrow as if it were the canonical endpoint.
 contract MockEndpoint is ILayerZeroEndpointV2 {
@@ -539,6 +558,45 @@ contract PerihelionEscrowTest is Test {
         escrow.lock{ value: 0.01 ether }(intent, sig);
     }
 
+    // --- ERC-1271 contract wallets (Issue #932) ------------------------------
+
+    function test_LockWithERC1271Wallet() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(true);
+        token.mint(address(wallet), 1_000_000);
+        vm.prank(address(wallet));
+        token.approve(address(escrow), type(uint256).max);
+
+        PerihelionEscrow.Intent memory intent = _intent();
+        intent.user = address(wallet);
+        bytes32 h = escrow.hashIntent(intent);
+
+        // Contract wallets sign via isValidSignature; the raw bytes are opaque
+        // to the escrow.
+        bytes memory sig = hex"deadbeef";
+
+        vm.prank(solver);
+        escrow.lock{ value: 0.01 ether }(intent, sig);
+
+        assertEq(token.balanceOf(address(escrow)), 100_000);
+        (,,, uint256 lAmount,,,,) = escrow.locks(h);
+        assertEq(lAmount, 100_000);
+    }
+
+    function test_RevertWhen_ERC1271SignatureInvalid() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(false);
+        token.mint(address(wallet), 1_000_000);
+        vm.prank(address(wallet));
+        token.approve(address(escrow), type(uint256).max);
+
+        PerihelionEscrow.Intent memory intent = _intent();
+        intent.user = address(wallet);
+        bytes memory sig = hex"deadbeef";
+
+        vm.prank(solver);
+        vm.expectRevert(PerihelionEscrow.InvalidSignature.selector);
+        escrow.lock{ value: 0.01 ether }(intent, sig);
+    }
+
     // --- Asset allowlist (Issue #335) ----------------------------------------
 
     function test_RevertWhen_AssetNotAllowed() public {
@@ -572,6 +630,12 @@ contract PerihelionEscrowTest is Test {
         vm.prank(solver);
         escrow.lock{ value: 0.01 ether }(intent, sig);
         assertEq(newToken.balanceOf(address(escrow)), 100_000);
+    }
+
+    function test_RevertWhen_SetAssetAllowedNonContract() public {
+        address eoa = address(0xE0A);
+        vm.expectRevert(PerihelionEscrow.NotAContract.selector);
+        escrow.setAssetAllowed(eoa, true);
     }
 
     function test_RevokeAssetAllowed() public {
@@ -823,6 +887,32 @@ contract PerihelionEscrowTest is Test {
         escrow.setPeer(bytes32(uint256(0x1234)));
     }
 
+    function test_RevertWhen_SetPeerZero() public {
+        vm.expectRevert(PerihelionEscrow.ZeroAddress.selector);
+        escrow.setPeer(bytes32(0));
+    }
+
+    function test_RevertWhen_LockWithoutPeer() public {
+        // Fresh escrow with no peer configured but an allowlisted asset.
+        PerihelionEscrow fresh = new PerihelionEscrow(address(endpoint), STELLAR_EID);
+        fresh.setAssetAllowed(address(token), true);
+        fresh.setMaxIntentAmountPerAsset(address(token), type(uint256).max);
+
+        PerihelionEscrow.Intent memory intent = _intent();
+        bytes memory sig = _sign(intent);
+
+        uint256 userBefore = token.balanceOf(user);
+        uint256 escrowBefore = token.balanceOf(address(fresh));
+
+        vm.prank(solver);
+        vm.expectRevert(PerihelionEscrow.ZeroAddress.selector);
+        fresh.lock{ value: 0.01 ether }(intent, sig);
+
+        // Reverts before pulling funds.
+        assertEq(token.balanceOf(user), userBefore);
+        assertEq(token.balanceOf(address(fresh)), escrowBefore);
+    }
+
     function test_SetConfirmationGrace() public {
         vm.expectEmit(false, false, false, false);
         emit ConfirmationGraceSet(1 hours);
@@ -994,6 +1084,23 @@ contract PerihelionEscrowTest is Test {
         vm.prank(solver);
         vm.expectRevert(PerihelionEscrow.NotOwner.selector);
         escrow.transferOwnership(solver);
+    }
+
+    function test_RevertWhen_CancelOwnershipTransferNoPending() public {
+        // Owner calls cancel with no pending transfer: must be NoPendingOwner,
+        // not NotOwner.
+        vm.expectRevert(PerihelionEscrow.NoPendingOwner.selector);
+        escrow.cancelOwnershipTransfer();
+    }
+
+    function test_CancelOwnershipTransferClearsPending() public {
+        escrow.transferOwnership(solver);
+        assertEq(escrow.pendingOwner(), solver);
+
+        vm.expectEmit(true, false, false, false);
+        emit OwnershipTransferCancelled(owner);
+        escrow.cancelOwnershipTransfer();
+        assertEq(escrow.pendingOwner(), address(0));
     }
 
     // --- Token edge cases: no-return, false-returning ----------------------------------

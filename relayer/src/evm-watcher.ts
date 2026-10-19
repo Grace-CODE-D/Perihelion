@@ -53,13 +53,17 @@
  *
  * ## Nonce
  *
- * The LayerZero nonce for a `Locked` event is not directly available from the
- * `Locked` event itself. A production implementation should correlate with the
- * `PacketSent` event emitted by the LayerZero endpoint in the same transaction,
- * or query the endpoint's `outboundNonce` view. For this implementation we use
- * the log index as a proxy nonce, which is sufficient for dedup within a single
- * block but not for cross-restart ordering. Operators requiring strict nonce
- * ordering should integrate with the LayerZero endpoint directly.
+ * The LayerZero nonce for a `Locked` event is not carried by the `Locked`
+ * event itself. The escrow's `lock()` transaction also emits a `PacketSent`
+ * event from the LayerZero endpoint; its encoded packet header contains the
+ * outbound nonce for the `(sender, dstEid, receiver)` path. The watcher decodes
+ * that nonce from the transaction receipt. If the `PacketSent` event cannot be
+ * found (e.g., the relayer is impersonating the endpoint during development),
+ * the watcher falls back to a strictly increasing per-path counter that is
+ * persisted with the checkpoint, so nonces never repeat and are never `0`.
+ *
+ * The log index is never used as the transport nonce: it repeats in every
+ * block and is `0` for the first log, which the settlement contract rejects.
  */
 
 import {
@@ -161,6 +165,37 @@ const LOCKED_DATA_PARAMS = parseAbiParameters(
   "address asset, uint256 amount, string destination, string destAsset, uint128 minDestAmount, uint64 deadline",
 );
 
+/**
+ * Minimal ABI for the LayerZero endpoint `PacketSent` event.
+ *
+ * event PacketSent(bytes encodedPayload, bytes options, address sendLibrary)
+ *
+ * `encodedPayload` is the full LayerZero packet: version (1) | nonce (8,
+ * big-endian) | srcEid (4) | sender (32) | dstEid (4) | receiver (32) |
+ * guid (32) | message. The outbound nonce for the path is bytes 1..9.
+ */
+const PACKET_SENT_EVENT_ABI = [
+  {
+    type: "event",
+    name: "PacketSent",
+    inputs: [
+      { name: "encodedPayload", type: "bytes",   indexed: false },
+      { name: "options",        type: "bytes",   indexed: false },
+      { name: "sendLibrary",    type: "address", indexed: false },
+    ],
+  },
+] as const;
+
+/** ABI parameters for decoding `PacketSent` non-indexed data. */
+const PACKET_SENT_DATA_PARAMS = parseAbiParameters(
+  "bytes encodedPayload, bytes options, address sendLibrary",
+);
+
+/** Offset of the nonce field within the encoded LayerZero packet header. */
+const PACKET_NONCE_OFFSET = 1;
+/** Width of the nonce field within the encoded LayerZero packet header. */
+const PACKET_NONCE_WIDTH = 8;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -177,6 +212,30 @@ export interface EVMSourceWatcherConfig {
   stellarEid: EndpointId;
   /** Maximum block range per getLogs call (default 2000). Adapts downward on range errors. */
   maxBlockRange?: number;
+  /**
+   * Optional LayerZero endpoint address on the source chain. When set, the
+   * watcher decodes the outbound nonce from the endpoint's `PacketSent` event
+   * emitted in the same transaction as each `Locked` event.
+   */
+  endpointAddress?: string;
+  /**
+   * Optional persisted per-path nonce counter used when the `PacketSent`
+   * nonce cannot be recovered (e.g., the relayer impersonates the endpoint).
+   * The counter is strictly increasing and never returns `0`.
+   */
+  nonceCounter?: NonceCounter;
+}
+
+/**
+ * Persisted, strictly increasing per-path nonce counter.
+ *
+ * Used only when the real LayerZero outbound nonce cannot be recovered from
+ * the transaction. Implementations should persist the value alongside the
+ * relayer checkpoint so it survives restarts.
+ */
+export interface NonceCounter {
+  /** Return the next nonce for the given path. Must be strictly increasing and never `0`. */
+  next(pathKey: string): Promise<bigint>;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +256,8 @@ export class EVMSourceWatcher implements SourceWatcher {
   private maxBlockRange: number;
   private readonly transactionFetchConcurrency = 10;
   private readonly transactionFetchTimeoutMs = 10_000;
+  /** In-memory fallback counter used when no persisted counter is configured. */
+  private readonly fallbackNonces = new Map<string, bigint>();
 
   constructor(private readonly config: EVMSourceWatcherConfig) {
     this.client = createPublicClient({
@@ -253,7 +314,7 @@ export class EVMSourceWatcher implements SourceWatcher {
         if (log.blockNumber !== undefined && log.blockNumber !== null) {
           blocksWithMessages.add(Number(log.blockNumber));
         }
-        const pending = this.decodeLockedLog(log);
+        const pending = await this.decodeLockedLogWithNonce(log);
         if (pending === null) {
           throw new Error(`Failed to decode Locked event in transaction ${log.transactionHash ?? "unknown"}`);
         }
@@ -283,7 +344,97 @@ export class EVMSourceWatcher implements SourceWatcher {
       blockHeaders.push(...headers.filter((header): header is NonNullable<typeof header> => header !== null));
     }
 
+    // Observe refund events on the source chain so the relayer can report
+    // `refunded` to the mempool only when a real refund exists.
+    await this.scanRefunds(fromBlock, head);
+
     return { messages, head, headHash, parentHash, blockHeaders: blockHeaders.length > 0 ? blockHeaders : undefined };
+  }
+
+  /**
+   * Scan the escrow for `Refunded` / `RefundedLocalTimeout` events and invoke
+   * the configured `onRefund` callback for each one.
+   *
+   * The scan window starts at the greater of `fromBlock` and the last scanned
+   * block, so repeated polls do not re-report the same refund. Callers that
+   * need a full backfill can construct the watcher with a low `fromBlock`.
+   */
+  private async scanRefunds(fromBlock: number, head: number): Promise<void> {
+    const onRefund = this.config.onRefund;
+    if (!onRefund) return;
+
+    const start = this.lastRefundScanBlock === null
+      ? fromBlock
+      : Math.max(fromBlock, this.lastRefundScanBlock + 1);
+    if (start > head) return;
+
+    let scanHead = start;
+    while (scanHead <= head) {
+      const toBlock = Math.min(scanHead + this.maxBlockRange - 1, head);
+      let logs: Log[] = [];
+
+      try {
+        logs = await this.client.getLogs({
+          address: this.config.escrowAddress as `0x${string}`,
+          events: REFUND_EVENT_ABIS,
+          fromBlock: BigInt(scanHead),
+          toBlock: BigInt(toBlock),
+        });
+      } catch (err) {
+        if (this._isProviderRangeError(err)) {
+          if (this.maxBlockRange <= 1) throw err;
+          this.maxBlockRange = Math.max(1, Math.floor(this.maxBlockRange / 2));
+          console.warn("EVMSourceWatcher: provider range error during refund scan, halving max block range", {
+            newMaxBlockRange: this.maxBlockRange,
+            err: String(err),
+          });
+          continue;
+        }
+        throw err;
+      }
+
+      for (const log of logs) {
+        const observation = this.decodeRefundLog(log);
+        if (observation === null) continue;
+        try {
+          await onRefund(observation);
+        } catch (err) {
+          console.warn("EVMSourceWatcher: onRefund callback failed", {
+            intentHash: observation.intentHash,
+            err: String(err),
+          });
+        }
+      }
+
+      scanHead = toBlock + 1;
+    }
+
+    this.lastRefundScanBlock = head;
+  }
+
+  /**
+   * Decode a `Refunded` / `RefundedLocalTimeout` log into an observation.
+   * Returns `null` if the log does not carry a usable intent hash.
+   */
+  decodeRefundLog(log: Log): EvmRefundObservation | null {
+    if (log.blockNumber === undefined || log.blockNumber === null) return null;
+    const topics = log.topics as Hex[];
+    if (!topics || topics.length < 2) return null;
+
+    const intentHash = topics[1] as Hex;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(intentHash)) return null;
+
+    const eventName = (log as { eventName?: string }).eventName;
+    const kind: EvmRefundObservation["kind"] =
+      eventName === "RefundedLocalTimeout" ? "RefundedLocalTimeout" : "Refunded";
+
+    return {
+      intentHash,
+      kind,
+      blockNumber: Number(log.blockNumber),
+      transactionHash: (log.transactionHash ?? "0x") as Hex,
+      logIndex: Number(log.logIndex ?? 0),
+    };
   }
 
   private _isProviderRangeError(err: unknown): boolean {
@@ -327,6 +478,90 @@ export class EVMSourceWatcher implements SourceWatcher {
   }
 
   /**
+   * Decode a `Locked` event and resolve its LayerZero transport nonce.
+   *
+   * The nonce is taken from the endpoint's `PacketSent` event in the same
+   * transaction when available; otherwise a strictly increasing per-path
+   * counter is used. The log index is never used as the nonce.
+   */
+  async decodeLockedLogWithNonce(log: Log): Promise<PendingMessage | null> {
+    const base = this.decodeLockedLog(log);
+    if (base === null) return null;
+
+    const nonce = await this.resolveTransportNonce(log);
+    return {
+      ...base,
+      message: { ...base.message, nonce },
+    };
+  }
+
+  /**
+   * Resolve the LayerZero outbound nonce for a `Locked` event.
+   *
+   * 1. If an endpoint address is configured, decode the `PacketSent` event
+   *    emitted in the same transaction and read the nonce from the packet
+   *    header.
+   * 2. Otherwise (or if the event is missing), use the configured persisted
+   *    per-path counter, or an in-memory fallback counter.
+   */
+  private async resolveTransportNonce(log: Log): Promise<number> {
+    if (this.config.endpointAddress && log.transactionHash) {
+      const nonce = await this.fetchPacketSentNonce(log.transactionHash as Hex);
+      if (nonce !== null) return Number(nonce);
+    }
+
+    const pathKey = `${this.config.sourceEid}:${this.config.stellarEid}`;
+    const next = this.config.nonceCounter
+      ? await this.config.nonceCounter.next(pathKey)
+      : this.nextFallbackNonce(pathKey);
+    // The settlement contract rejects nonce 0; ensure the counter never yields it.
+    return Number(next === 0n ? 1n : next);
+  }
+
+  /** Return the next strictly increasing fallback nonce for a path. */
+  private nextFallbackNonce(pathKey: string): bigint {
+    const current = this.fallbackNonces.get(pathKey) ?? 0n;
+    const next = current + 1n;
+    this.fallbackNonces.set(pathKey, next);
+    return next;
+  }
+
+  /**
+   * Fetch the transaction receipt and decode the LayerZero outbound nonce from
+   * the endpoint's `PacketSent` event. Returns `null` if the event is absent or
+   * cannot be decoded.
+   */
+  private async fetchPacketSentNonce(txHash: Hex): Promise<bigint | null> {
+    let receipt: Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>;
+    try {
+      receipt = await this._withTimeout(
+        this.client.getTransactionReceipt({ hash: txHash }),
+        this.transactionFetchTimeoutMs,
+      );
+    } catch {
+      return null;
+    }
+
+    const endpoint = this.config.endpointAddress!.toLowerCase();
+    for (const receiptLog of receipt.logs) {
+      if (receiptLog.address.toLowerCase() !== endpoint) continue;
+      // topics[0] is the PacketSent event signature; all fields are non-indexed.
+      if (!receiptLog.topics || receiptLog.topics.length < 1) continue;
+      try {
+        const [encodedPayload] = decodeAbiParameters(
+          PACKET_SENT_DATA_PARAMS,
+          receiptLog.data,
+        );
+        const nonce = decodePacketNonce(encodedPayload);
+        if (nonce !== null) return nonce;
+      } catch {
+        // Not a PacketSent log or malformed payload; keep scanning.
+      }
+    }
+    return null;
+  }
+
+  /**
    * Decode a single `Locked` event log into a `PendingMessage`.
    *
    * Strategy:
@@ -335,6 +570,9 @@ export class EVMSourceWatcher implements SourceWatcher {
    * 2. Decode non-indexed fields (`asset`, `amount`, `destination`, `destAsset`,
    *    `minDestAmount`, `deadline`) directly from `log.data`.
    * 3. Assemble a `BridgeMessage` and wrap it in a `PendingMessage`.
+   *
+   * The `nonce` field is a placeholder here; callers should use
+   * `decodeLockedLogWithNonce` to resolve the real LayerZero transport nonce.
    */
   decodeLockedLog(log: Log): PendingMessage | null {
     if (!log.blockNumber) return null;
@@ -367,11 +605,8 @@ export class EVMSourceWatcher implements SourceWatcher {
     }
 
     // --- Assemble BridgeMessage ---
-    // The nonce used here is the log index within the block, which provides
-    // uniqueness within a block. A production integration should correlate with
-    // the LayerZero endpoint nonce from the same transaction's PacketSent event.
-    const nonce = Number(log.logIndex ?? 0);
-
+    // The nonce is resolved by `decodeLockedLogWithNonce`; the log index is
+    // never used because it repeats across blocks and is 0 for the first log.
     const message: BridgeMessage = {
       srcEid: this.config.sourceEid,
       dstEid: this.config.stellarEid,
@@ -381,7 +616,8 @@ export class EVMSourceWatcher implements SourceWatcher {
       recipient: destination,
       destAsset: destAsset,
       amount: minDestAmount.toString(),
-      nonce,
+      deadline: deadline.toString(),
+      nonce: 0,
       rawPayload: canonicalFillInstruction(
         intentHash, solver, this.config.stellarEid,
         destination, destAsset, minDestAmount, deadline,
@@ -394,4 +630,20 @@ export class EVMSourceWatcher implements SourceWatcher {
       srcBlock: Number(log.blockNumber),
     };
   }
+}
+
+/**
+ * Decode the outbound nonce from an encoded LayerZero packet header.
+ *
+ * Layout: version (1) | nonce (8, big-endian) | srcEid (4) | sender (32) |
+ * dstEid (4) | receiver (32) | guid (32) | message.
+ *
+ * Returns `null` if the payload is too short to contain a nonce.
+ */
+function decodePacketNonce(encodedPayload: Hex): bigint | null {
+  const hex = encodedPayload.startsWith("0x") ? encodedPayload.slice(2) : encodedPayload;
+  const headerBytes = PACKET_NONCE_OFFSET + PACKET_NONCE_WIDTH;
+  if (hex.length < headerBytes * 2) return null;
+  const nonceHex = hex.slice(PACKET_NONCE_OFFSET * 2, headerBytes * 2);
+  return BigInt(`0x${nonceHex}`);
 }

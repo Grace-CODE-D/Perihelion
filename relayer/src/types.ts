@@ -46,6 +46,13 @@ export interface BridgeMessage {
   readonly amount: string;
   /** Monotonic per-source-endpoint nonce for ordering and replay protection. */
   readonly nonce: number;
+  /**
+   * User-signed intent deadline, in Unix seconds, carried in the FillInstruction.
+   * Decoded from the source `Locked` event and delivered verbatim so the
+   * destination contract can validate the fill window instead of treating the
+   * intent as already expired.
+   */
+  readonly deadline: bigint;
   /** Exact LayerZero message bytes observed on the source chain. */
   readonly rawPayload: Hex;
 }
