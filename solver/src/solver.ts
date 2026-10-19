@@ -22,7 +22,7 @@ import type { Metrics, FillFees } from "./metrics.js";
 import type { InventoryProvider } from "./inventory.js";
 import { InFlightTracker } from "./inventory.js";
 import { SeenLRU } from "./seen-lru.js";
-import { DefiniteFailureError } from "./executor.js";
+import { DefiniteFailureError, LockOwnedByOtherError } from "./executor.js";
 
 /** Pluggable execution backend — abstracts the two settlement legs. */
 export interface Executor {
@@ -32,6 +32,14 @@ export interface Executor {
    * confirmed. Returns the Stellar settlement tx hash and optional fee breakdown.
    */
   fill(signed: SignedIntent): Promise<{ settlementTx: string; fees?: FillFees }>;
+
+  /**
+   * Optional: report the persisted progress stage for an intent
+   * (`"lock"`, `"await_registration"`, `"fill"`, `"done"`). Used for logging
+   * and metrics so operators can see where intents stall. Implementations
+   * that do not persist stages may omit it.
+   */
+  stage?(hash: Hex): string | undefined;
 }
 
 /** Minimal logger interface so callers can inject structured logging. */
@@ -620,7 +628,16 @@ export class Solver {
     }
 
     this.consecutiveImplausibleTriggers = 0;
-    this.log.info("filling intent", { hash, profitBps: decision.profitBps });
+    // A retry resumes from the executor's persisted per-intent stage: if a
+    // previous attempt already locked on the EVM escrow, `fill` skips the lock
+    // and proceeds straight to the registration wait / Soroban leg instead of
+    // re-submitting `lock` (which would revert with `AlreadyLocked`).
+    const retry = this.retryState.get(hash);
+    this.log.info("filling intent", {
+      hash,
+      profitBps: decision.profitBps,
+      attempt: (retry?.attempts ?? 0) + 1,
+    });
     this.metrics?.recordFillAttempt(intent.destAsset);
     const reserved = BigInt(intent.minDestAmount);
     this.inFlight.reserve(intent.destAsset, reserved);
@@ -657,9 +674,22 @@ export class Solver {
     } catch (err) {
       caughtErr = err;
       if (err instanceof FatalError) throw err;
-      this.log.error("fill failed", { hash, err: String(err) });
-      this.metrics?.recordFillLost(intent.destAsset, String(err));
-      this.scheduleRetry(hash, deadlineMs);
+      if (err instanceof LockOwnedByOtherError) {
+        // The escrow already holds a lock for this intent owned by another
+        // solver: this solver can never complete the fill, so retire the
+        // intent as lost instead of retrying until the budget is exhausted.
+        this.log.warn("retiring intent: locked by another solver", {
+          hash,
+          owner: err.owner,
+        });
+        this.metrics?.recordFillLost(intent.destAsset, "locked_by_other_solver");
+        this.seen.add(hash, deadlineMs);
+        this.retryState.delete(hash);
+      } else {
+        this.log.error("fill failed", { hash, err: String(err) });
+        this.metrics?.recordFillLost(intent.destAsset, String(err));
+        this.scheduleRetry(hash, deadlineMs);
+      }
     } finally {
       if (fillSucceeded) {
         // Successful fill: the capital has left the account on-chain but the
@@ -707,6 +737,15 @@ export class Solver {
     }
   }
 
+  /**
+   * Schedule a retry of a failed fill.
+   *
+   * The retry does **not** restart at `lock`: the executor persists per-intent
+   * progress, so a retry after a successful lock resumes at the registration
+   * wait / Soroban leg (see {@link Executor.fill}). This is what makes a
+   * partial failure — lock landed, Soroban leg failed — recoverable with
+   * exactly one `lock` transaction.
+   */
   private scheduleRetry(hash: string, deadlineMs: number): void {
     const state = this.retryState.get(hash) ?? { attempts: 0, nextRetryAt: 0 };
     const attempts = state.attempts + 1;
@@ -715,6 +754,13 @@ export class Solver {
       this.seen.add(hash, deadlineMs);
       this.retryState.delete(hash);
     } else {
+      this.log.info("scheduling fill retry", {
+        hash,
+        attempts,
+        // The executor resumes from its persisted stage; surface it so
+        // operators can see where the intent is stalling.
+        stage: this.executor.stage?.(hash) ?? "unknown",
+      });
       this.retryState.set(
         hash,
         { attempts, nextRetryAt: Date.now() + retryBackoff(attempts - 1) },
