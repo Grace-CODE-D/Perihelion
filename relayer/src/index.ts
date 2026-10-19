@@ -8,7 +8,9 @@
  */
 
 export { EVMSourceWatcher } from "./evm-watcher.js";
+export { SorobanSourceWatcher } from "./soroban-watcher.js";
 export { SorobanDestinationDelivery } from "./soroban-delivery.js";
+export { EvmDestinationDelivery } from "./evm-delivery.js";
 export { Relayer } from "./relayer.js";
 export { FileCheckpointStore } from "./file-checkpoint-store.js";
 export { NoopCheckpointStore } from "./checkpoint.js";

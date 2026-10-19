@@ -187,10 +187,36 @@ interface MessageRetryState {
   nextRetryAt: number;
 }
 
+/**
+ * Options for a single directional relay loop.
+ *
+ * A {@link Relayer} instance runs exactly one watch→confirm→deliver loop for
+ * one source→destination direction.  Each direction has its own cursor,
+ * checkpoint store, dead-letter store and retry bookkeeping, so the two legs
+ * of the Stellar ↔ EVM path (EVM→Soroban and Soroban→EVM) advance
+ * independently and cannot stall one another.
+ */
+export interface DirectionalRelayerOptions {
+  /** Human-readable label for logs/metrics, e.g. "evm->soroban". */
+  name: string;
+  config: RelayerConfig;
+  watcher: SourceWatcher;
+  delivery: DestinationDelivery;
+  log?: Logger;
+  startBlock?: number;
+  checkpoint?: CheckpointStore;
+  deadLetter?: DeadLetterStore;
+  retry?: RetryPolicy;
+}
+
 export class Relayer {
   private running = false;
   private cursor: number;
   private readonly backoff: BackoffState;
+
+  /** Label for this directional loop (used in logs). */
+  readonly name: string;
+=======
 
   // --- Internal state -------------------------------------------------------
 
@@ -230,6 +256,15 @@ export class Relayer {
    */
   private readonly mempoolClient: PerihelionClient | null;
 
+  /**
+   * Construct a directional relayer.
+   *
+   * The positional form (config, watcher, delivery, …) is retained for
+   * backward compatibility with existing callers and tests; it describes a
+   * single direction.  New code should prefer {@link Relayer.forDirection}
+   * or {@link Relayer.compose} so that both legs of the bridge can be run
+   * with independent checkpoints and dead-letter stores.
+   */
   constructor(
     private readonly config: RelayerConfig,
     private readonly watcher: SourceWatcher,
@@ -239,7 +274,9 @@ export class Relayer {
     private readonly checkpoint: CheckpointStore = new NoopCheckpointStore(),
     private readonly deadLetter: DeadLetterStore = new InMemoryDeadLetterStore(),
     private readonly retry: RetryPolicy = DEFAULT_RETRY,
+    name = "default",
   ) {
+    this.name = name;
     this.cursor = startBlock;
     this.backoff = new BackoffState(config);
     this.readiness.cursor = startBlock;
@@ -247,6 +284,33 @@ export class Relayer {
       config.mempoolUrl && config.mempoolStatusToken
         ? new PerihelionClient({ mempoolUrl: config.mempoolUrl })
         : null;
+  }
+
+  /** Build a directional relayer from an options object. */
+  static forDirection(opts: DirectionalRelayerOptions): Relayer {
+    return new Relayer(
+      opts.config,
+      opts.watcher,
+      opts.delivery,
+      opts.log ?? console,
+      opts.startBlock ?? 0,
+      opts.checkpoint ?? new NoopCheckpointStore(),
+      opts.deadLetter ?? new InMemoryDeadLetterStore(),
+      opts.retry ?? DEFAULT_RETRY,
+      opts.name,
+    );
+  }
+
+  /**
+   * Compose several directional relayers into a single controller.
+   *
+   * Each direction keeps its own cursor, checkpoint and dead-letter store;
+   * {@link RelayerGroup.start} runs all loops concurrently and
+   * {@link RelayerGroup.stop} drains them together.  A {@link FatalError}
+   * from any direction stops the whole group.
+   */
+  static compose(relayers: Relayer[]): RelayerGroup {
+    return new RelayerGroup(relayers);
   }
 
   /**
@@ -268,6 +332,7 @@ export class Relayer {
     await this.resume();
     this.running = true;
     this.log.info("relayer started", {
+      direction: this.name,
       escrow: this.config.escrowAddress,
       settlement: this.config.settlementContractId,
       cursor: this.cursor,
@@ -616,5 +681,47 @@ export class Relayer {
         resolve();
       };
     });
+  }
+}
+
+/**
+ * Runs a set of directional {@link Relayer} loops concurrently.
+ *
+ * Each loop owns its own cursor, checkpoint store and dead-letter store, so
+ * the EVM→Soroban and Soroban→EVM legs advance independently.  A fatal error
+ * in any direction stops the whole group and rejects {@link start}.
+ */
+export class RelayerGroup {
+  constructor(
+    readonly relayers: Relayer[],
+    private readonly log: Logger = console,
+  ) {
+    if (relayers.length === 0) {
+      throw new Error("RelayerGroup requires at least one relayer");
+    }
+  }
+
+  /**
+   * Start every directional loop.  Resolves when {@link stop} is called and
+   * all loops have drained; rejects if any loop throws a {@link FatalError}.
+   */
+  async start(): Promise<void> {
+    const loops = this.relayers.map((r) =>
+      r.start().catch((err: unknown) => {
+        // A fatal error in one direction must stop the others too.
+        this.stop();
+        throw err;
+      }),
+    );
+    const settled = await Promise.allSettled(loops);
+    const rejected = settled.find(
+      (s): s is PromiseRejectedResult => s.status === "rejected",
+    );
+    if (rejected) throw rejected.reason;
+  }
+
+  /** Signal every directional loop to stop after its current tick. */
+  stop(): void {
+    for (const r of this.relayers) r.stop();
   }
 }

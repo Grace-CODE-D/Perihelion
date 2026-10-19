@@ -105,6 +105,18 @@ Sometimes one chain sees an event before the other (message in flight):
 | EVM Released, Soroban never receives FillConfirmed | 30 min | Alert HIGH (message loss) |
 | EVM Refunded, Soroban Cancelled not received | 30 min | Alert MEDIUM (cancel delay) |
 
+### Cancellation Reasons
+
+Every `CancelIntent` carries a reason code that the relayer forwards unchanged to the settlement contract, which records it in the `Cancelled` event:
+
+| Code | Name | Meaning |
+| ---- | ---- | ------- |
+| `0x00` | `EXPIRED` | Intent deadline passed without settlement |
+| `0x01` | `ADMIN` | Operator-initiated cancellation |
+| `0x02` | `INVALID` | Intent failed validation |
+
+Reconciliation must compare the reason recorded on Soroban against the reason in the source message; a mismatch is a divergence. Incident response relies on this distinction: an `ADMIN` cancellation is an operator action and must never be reported as an `EXPIRED` one. The relayer must preserve the reason end-to-end (see issue #940) — it must not hard-code a default.
+
 ---
 
 ## Part II: Value Conservation Assertions
@@ -462,6 +474,7 @@ function reconcile(evmEvents: Event[], sorobanEvents: Event[]): ReconciliationRe
       rec.soroban_state = 'Filled';
     } else if (evt.type === 'Cancelled') {
       rec.soroban_state = 'Cancelled';
+      rec.cancelled_reason = evt.reason; // EXPIRED | ADMIN | INVALID
     }
   }
   
@@ -511,6 +524,12 @@ function reconcile(evmEvents: Event[], sorobanEvents: Event[]): ReconciliationRe
     if (rec.evm_state === 'Refunded' && rec.soroban_state === 'Cancelled') {
       if (rec.refunded_amount !== rec.locked_amount) {
         rec.divergences.push(`Refunded (${rec.refunded_amount}) != Locked (${rec.locked_amount})`);
+      }
+      // A2b: Cancellation reason must match the source message
+      if (rec.cancelled_reason !== rec.source_cancel_reason) {
+        rec.divergences.push(
+          `Cancel reason (${rec.cancelled_reason}) != source (${rec.source_cancel_reason})`
+        );
       }
     }
     
@@ -598,8 +617,9 @@ fn fill_intent(hash: XDRHash, amount: i128) {
   env.events().publish(("Filled", hash, user, amount, dest));
 }
 
-fn cancel_expired_intent(hash: XDRHash) {
-  env.events().publish(("Cancelled", hash, "expired"));
+fn cancel_intent(hash: XDRHash, reason: u32) {
+  // reason: 0 = EXPIRED, 1 = ADMIN, 2 = INVALID (validated by the contract)
+  env.events().publish(("Cancelled", hash, reason));
 }
 ```
 
@@ -646,6 +666,19 @@ describe('Reconciliation', () => {
     // Check report flags CRITICAL alert
     const report = await reconcile(evmEvents, sorobanEvents);
     expect(report.alerts.some(a => a.type === 'UnmatchedSettlement')).toBe(true);
+  });
+
+  it.each([
+    ['EXPIRED', 0],
+    ['ADMIN', 1],
+    ['INVALID', 2],
+  ])('should record %s cancellation reason (%i) from the source message', async (_name, reason) => {
+    // Source message carries `reason`; relayer delivers it unchanged
+    // Settlement contract records it in the Cancelled event
+    const report = await reconcile(evmEvents, sorobanEvents);
+    const rec = report.intent_records.find(r => r.hash === cancelledHash)!;
+    expect(rec.cancelled_reason).toBe(reason);
+    expect(rec.divergences).toHaveLength(0);
   });
 });
 ```

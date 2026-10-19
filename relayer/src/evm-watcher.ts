@@ -161,6 +161,35 @@ const LOCKED_DATA_PARAMS = parseAbiParameters(
   "address asset, uint256 amount, string destination, string destAsset, uint128 minDestAmount, uint64 deadline",
 );
 
+/**
+ * Minimal ABI for the PerihelionEscrow `CancelIntent` event.
+ *
+ * event CancelIntent(
+ *   bytes32 indexed intentHash,
+ *   address indexed solver,
+ *   address indexed user,
+ *   uint8 reason
+ * )
+ *
+ * The `reason` code is carried through to the Soroban `CancelInstruction` so
+ * the settlement contract records the true cancellation cause.
+ */
+const CANCEL_INTENT_EVENT_ABI = [
+  {
+    type: "event",
+    name: "CancelIntent",
+    inputs: [
+      { name: "intentHash", type: "bytes32", indexed: true },
+      { name: "solver",     type: "address", indexed: true },
+      { name: "user",       type: "address", indexed: true },
+      { name: "reason",     type: "uint8",   indexed: false },
+    ],
+  },
+] as const;
+
+/** ABI parameters for decoding the non-indexed `CancelIntent` event data. */
+const CANCEL_INTENT_DATA_PARAMS = parseAbiParameters("uint8 reason");
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -386,6 +415,54 @@ export class EVMSourceWatcher implements SourceWatcher {
         intentHash, solver, this.config.stellarEid,
         destination, destAsset, minDestAmount, deadline,
       ),
+    };
+
+    return {
+      message,
+      srcTxHash: log.transactionHash ?? "",
+      srcBlock: Number(log.blockNumber),
+    };
+  }
+
+  /**
+   * Decode a single `CancelIntent` event log into a `PendingMessage`.
+   *
+   * The cancellation `reason` code is decoded from the non-indexed event data
+   * and carried on the `BridgeMessage` so delivery records the true cause
+   * rather than a hard-coded default.
+   */
+  decodeCancelIntentLog(log: Log): PendingMessage | null {
+    if (!log.blockNumber) return null;
+
+    // topics[0] = event sig, [1] = intentHash, [2] = solver, [3] = user
+    const topics = log.topics as Hex[];
+    if (!topics || topics.length < 4) return null;
+
+    const intentHash = topics[1] as Hex; // bytes32
+    const solver     = ("0x" + topics[2]?.slice(26)) as Hex; // address from 32-byte word
+
+    let reason: number;
+    try {
+      const [reasonValue] = decodeAbiParameters(CANCEL_INTENT_DATA_PARAMS, log.data);
+      reason = Number(reasonValue);
+    } catch {
+      return null;
+    }
+
+    const nonce = Number(log.logIndex ?? 0);
+
+    const message: BridgeMessage = {
+      srcEid: this.config.sourceEid,
+      dstEid: this.config.stellarEid,
+      intentHash: intentHash,
+      messageType: "CancelInstruction",
+      solver: solver,
+      recipient: "",
+      destAsset: "",
+      amount: "0",
+      nonce,
+      reason,
+      rawPayload: "0x",
     };
 
     return {

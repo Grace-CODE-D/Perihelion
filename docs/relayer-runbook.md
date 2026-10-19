@@ -8,6 +8,19 @@ implementation lives in [`relayer/`](../relayer/).
 > development. Do not relay real-value traffic until the [phased-rollout audit
 > gate](./TECHNICAL-ARCHITECTURE.md#8-phased-rollout) clears.
 
+> 🚧 **Development-only stand-in.** The reference relayer in
+> [`relayer/`](../relayer/) is **not** a production LayerZero executor. It
+> impersonates the LayerZero endpoint: it signs `lz_receive` on the Soroban
+> settlement contract with its own Stellar key, so the settlement contract's
+> `Endpoint` must be configured to the relayer's account. In that mode the
+> relayer key is fully trusted — it can register any intent with any recipient,
+> amount and deadline, and can inject cancellations. No DVN verifies anything.
+> Production must run a real LayerZero endpoint/adapter on Stellar and a
+> permissionless executor (see [§1.2](#12-development-mode-vs-production)).
+> The CLI refuses to start in this mode against Pubnet unless
+> `PERIHELION_RELAYER_MODE=dev` is set explicitly (see [§4.1](#41-all-environment-variables)).
+=======
+
 ---
 
 ## Table of Contents
@@ -27,25 +40,56 @@ implementation lives in [`relayer/`](../relayer/).
 
 ## 1. What the relayer does
 
+### 1.1 Current implementation (development mode)
+
 ```
 EVM escrow ──emit MessageSent──► [relayer: confirm N blocks] ──► Soroban settlement
-                                                                  (verifies + releases)
+                                                                  (lz_receive, signed by relayer key)
+
+Soroban settlement ──emit outbound──► [relayer: follow events] ──► EVM escrow
+                                                                    (lzReceive via mock endpoint)
 ```
 
-The relayer is a **stateful daemon** that:
+The relayer is a **stateful daemon** that runs one loop per direction, each
+with its own checkpoint:
 
-1. Watches the EVM escrow contract for `MessageSent` events.
-2. Waits for `PERIHELION_CONFIRMATIONS` blocks before treating a message as
-   final.
-3. Delivers each confirmed message to the Soroban settlement contract's
-   `lz_receive` entrypoint.
-4. Persists a cursor checkpoint after every successful tick so a restart
-   resumes without re-scanning from genesis or silently skipping messages.
+1. **EVM → Soroban leg.** Watches the EVM escrow contract for `MessageSent`
+   events, waits for `PERIHELION_CONFIRMATIONS` blocks before treating a
+   message as final, then delivers each confirmed message to the Soroban
+   settlement contract's `lz_receive` entrypoint.
+2. **Soroban → EVM leg.** Watches the settlement contract for outbound
+   messages (`FillConfirmed`, `CancelIntent`) and delivers them to the EVM
+   escrow's `lzReceive` entrypoint through a mock endpoint on development
+   networks.
+3. Persists a cursor checkpoint per direction after every successful tick so a
+   restart resumes without re-scanning from genesis or silently skipping
+   messages.
 
-It is trust-minimized: the destination contract verifies message authenticity
-independently via the LayerZero DVN stack. A faulty or censoring relayer can
-**delay** delivery but cannot forge one — and anyone can run a competing
-instance.
+> ⚠️ **Trust model in this mode.** The relayer signs `lz_receive` as the
+> trusted endpoint, so the settlement contract's `Endpoint` must be the
+> relayer's account, and the relayer sets `Origin.sender` by echoing the
+> contract's own `get_peer(srcEid)` back. The peer check is therefore
+> self-fulfilling. Whoever holds `SIGNER_SECRET` can register any intent with
+> any recipient, amount and deadline, and can inject cancellations. This is a
+> **development shim**, not the LayerZero/DVN trust model described in
+> [TECHNICAL-ARCHITECTURE.md](./TECHNICAL-ARCHITECTURE.md).
+
+### 1.2 Development mode vs production
+
+| Aspect | Development mode (this relayer) | Production design |
+|--------|--------------------------------|-------------------|
+| Endpoint | Relayer's Stellar account is configured as the settlement `Endpoint` | Real LayerZero endpoint/adapter deployed on Stellar |
+| Message authentication | Relayer key signature; peer check self-fulfilling | DVN verifier set attests the packet; endpoint enforces peer |
+| Relayer authority | Full — can forge or cancel any message | None — executor is permissionless |
+| Outbound leg | Relayer calls a mock endpoint on the EVM escrow | LayerZero executor delivers the verified packet |
+| Network gate | Refuses Pubnet unless `PERIHELION_RELAYER_MODE=dev` | N/A — no impersonation |
+
+In production the relayer acts **only as a permissionless executor**: it calls
+the real endpoint's delivery function with a packet that the endpoint has
+already verified against the DVN set. The relayer key carries no authority; a
+faulty or censoring executor can **delay** delivery but cannot forge one, and
+anyone can run a competing instance. Both legs (EVM → Stellar and
+Stellar → EVM) are carried by LayerZero executors in production.
 
 ---
 
@@ -57,7 +101,7 @@ instance.
 | **EVM RPC endpoint** | Archival preferred; must support `eth_getLogs` and `eth_getBlockByNumber` |
 | **Stellar / Soroban RPC endpoint** | Horizon or a Soroban RPC that exposes `simulateTransaction` and `sendTransaction` |
 | **Deployed contracts** | EVM escrow address + Soroban settlement contract ID — both must be live and peered before the relayer starts |
-| **Signer key** | A Stellar secret key that pays for delivery transactions on the destination side |
+| **Signer key** | A Stellar secret key that pays for delivery transactions on the destination side. In development mode this key is also the trusted endpoint — see [§3.1](#31-what-keys-the-relayer-holds) |
 | **Checkpoint storage** | Writable filesystem path (default) or a database-backed `CheckpointStore` for multi-instance deployments |
 
 Build and verify before running:
@@ -75,12 +119,18 @@ npm run build          # compiles relayer/ with its workspace dependencies
 
 | Key | Variable | Role | Sensitivity |
 |-----|----------|------|-------------|
-| Stellar signer secret | `SIGNER_SECRET` | Signs Soroban delivery transactions | **High** — loss means the relayer cannot deliver; compromise means delivery spam (wasted fees, not fund theft) |
+| Stellar signer secret | `SIGNER_SECRET` | Signs Soroban delivery transactions | **High** — loss means the relayer cannot deliver; **in development mode, compromise means full forgery authority** (see below) |
 
 The relayer does **not** hold an EVM private key. Source-chain watching is
-read-only (`eth_getLogs`). The delivery-side Stellar key can pay fees but
-cannot move user funds — the settlement contract only releases to the user
-address embedded in the verified LayerZero message.
+read-only (`eth_getLogs`).
+
+> ⚠️ **Development mode only.** Because the relayer signs `lz_receive` as the
+> trusted endpoint, the settlement contract's `Endpoint` must be the relayer's
+> account, and the relayer key can forge or cancel any message. Treat
+> `SIGNER_SECRET` in development mode as equivalent to the settlement
+> contract's admin key. In the production design the relayer key carries no
+> authority — it only pays fees for a permissionless executor call against a
+> packet the real endpoint has already verified.
 
 ### 3.2 Storing the signer key
 
@@ -109,8 +159,12 @@ acceptable provided the file is `chmod 600` and owned by the service account.
 4. Restart the relayer. The old key may be retired once the new process is
    confirmed healthy.
 
-There is no on-chain registration of the signer key — the relayer's identity
-is its source-chain cursor and its delivery record, not a registered key.
+In development mode the signer key **is** registered on-chain: it must be the
+settlement contract's configured `Endpoint`. Rotating it therefore requires
+updating the contract's endpoint configuration (via the timelock) in addition
+to the environment. In the production design there is no on-chain registration
+of the executor key — the relayer's identity is its source-chain cursor and its
+delivery record, not a registered key.
 
 ### 3.4 EVM RPC credentials
 
@@ -133,6 +187,7 @@ cp relayer/.env.example relayer/.env
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `PERIHELION_RELAYER_MODE` | No | — | Set to `dev` to acknowledge development-mode endpoint impersonation. **Required** to start against Pubnet — see §4.1.1 |
 | `PERIHELION_ESCROW_ADDRESS` | **Yes** | — | `0x`-prefixed 20-byte EVM escrow contract address |
 | `PERIHELION_SETTLEMENT_CONTRACT` | **Yes** | — | Soroban settlement contract ID (`C…`, 56 chars) |
 | `PERIHELION_EVM_RPC_URL` | No | `http://localhost:8545` | EVM source-chain RPC |
@@ -149,6 +204,28 @@ cp relayer/.env.example relayer/.env
 The config loader validates all values at startup and exits with a descriptive
 error list if anything is missing or malformed — fix every reported error
 before retrying.
+
+#### 4.1.1 The `PERIHELION_RELAYER_MODE` gate
+
+The reference relayer impersonates the LayerZero endpoint (see
+[§1.1](#11-current-implementation-development-mode)). To make that impossible
+to do by accident against a public network, the CLI refuses to start when
+`STELLAR_NETWORK` is the Stellar Pubnet passphrase
+(`Public Global Stellar Network ; September 2015`) unless
+`PERIHELION_RELAYER_MODE=dev` is set explicitly:
+
+```
+[ERROR] Refusing to start: endpoint-impersonation mode is not permitted on Pubnet.
+        Set PERIHELION_RELAYER_MODE=dev only if you understand that the relayer
+        key becomes the trusted endpoint and can forge or cancel any message.
+```
+
+- **Testnet / local / Futurenet** — the gate does not apply; the relayer runs
+  in development mode by default.
+- **Pubnet** — set `PERIHELION_RELAYER_MODE=dev` only for a deliberate,
+  audited development exercise. Never set it for production traffic: the
+  production design uses a real LayerZero endpoint and a permissionless
+  executor, not this relayer.
 
 ### 4.2 Choosing confirmation depth
 
@@ -237,8 +314,9 @@ A healthy start looks like:
 ```
 [INFO]  Perihelion relayer starting
 [INFO]  Loaded config: escrow=0x… settlement=C… confirmations=12 poll=5000ms
-[INFO]  Checkpoint loaded: block=21045678 (or "no checkpoint — starting from 0")
-[INFO]  Relayer loop started
+[INFO]  Mode: development (endpoint impersonation) — not for production use
+[INFO]  Checkpoint loaded: evm=21045678 soroban=… (or "no checkpoint — starting from 0")
+[INFO]  Relayer loops started: evm→soroban, soroban→evm
 ```
 
 If config validation fails, the process exits immediately with a list of errors
@@ -350,11 +428,13 @@ filter level="error" and msg like /deliver/
 
 ### 7.1 How the cursor works
 
-The relayer maintains a **cursor** — the last EVM block it has fully processed.
-After every tick that advances the cursor, it writes the new value to
-`PERIHELION_CHECKPOINT_FILE` using a write-temp-then-rename strategy (atomic on
-POSIX filesystems). On restart, the cursor is loaded from the checkpoint file.
-If no checkpoint exists (first run), scanning begins from block 0.
+The relayer maintains **one cursor per direction** — the last EVM block it has
+fully processed for the EVM → Soroban leg, and the last Soroban ledger/event
+position for the Soroban → EVM leg. After every tick that advances a cursor, it
+writes the new value to `PERIHELION_CHECKPOINT_FILE` using a
+write-temp-then-rename strategy (atomic on POSIX filesystems). On restart, both
+cursors are loaded from the checkpoint file. If no checkpoint exists (first
+run), scanning begins from block 0 / the contract's deployment ledger.
 
 This means:
 
@@ -387,12 +467,14 @@ If the checkpoint file is lost or its JSON is corrupt:
 
 1. Stop the relayer.
 2. Find the EVM block at which the escrow was deployed (call it `$DEPLOY_BLOCK`).
-3. Write a minimal checkpoint manually:
+3. Write a minimal checkpoint manually (one cursor per direction):
    ```bash
-   echo '{"latestBlock": <DEPLOY_BLOCK>}' > .perihelion-relayer-checkpoint.json
+   echo '{"evm":{"latestBlock": <DEPLOY_BLOCK>},"soroban":{"latestLedger": <DEPLOY_LEDGER>}}' \
+     > .perihelion-relayer-checkpoint.json
    ```
-4. Restart. The relayer re-scans from `$DEPLOY_BLOCK`. Re-delivered messages
-   are idempotently rejected by the settlement contract's `isDelivered` guard.
+4. Restart. The relayer re-scans from `$DEPLOY_BLOCK` / `$DEPLOY_LEDGER`.
+   Re-delivered messages are idempotently rejected by the settlement
+   contract's `isDelivered` guard and the escrow's replay guard.
 
 For multi-instance or cloud deployments, use a database-backed `CheckpointStore`
 (inject a custom implementation via the `Relayer` constructor) backed by a
@@ -528,11 +610,16 @@ not initiate, or a security alert from your key management system.
 
 1. Immediately generate a new Stellar keypair and fund it.
 2. Update `SIGNER_SECRET` in the secrets manager with the new key.
-3. Restart the relayer — it picks up the new key on startup.
-4. The compromised key cannot steal user funds (it can only call `lz_receive`,
-   which the settlement contract verifies independently). The worst case is
-   wasted XLM fees from spam delivery calls.
-5. Revoke/archive the old key in your key management system.
+3. **Development mode:** the compromised key is the settlement contract's
+   trusted `Endpoint` and can forge or cancel any message. Pause the
+   settlement contract via the timelock, rotate the endpoint configuration to
+   the new key, then unpause. Treat any message delivered by the old key as
+   suspect and reconcile against the EVM escrow.
+4. **Production design:** the executor key carries no authority — it can only
+   pay fees for a permissionless delivery call against a packet the real
+   endpoint has already verified. The worst case is wasted XLM fees.
+5. Restart the relayer — it picks up the new key on startup.
+6. Revoke/archive the old key in your key management system.
 
 ### 9.6 Peer rotation (contract redeployment)
 
@@ -540,9 +627,10 @@ If the EVM escrow or Soroban settlement contract is redeployed to a new address:
 
 1. Update `PERIHELION_ESCROW_ADDRESS` and/or `PERIHELION_SETTLEMENT_CONTRACT` in
    the environment.
-2. Reset the checkpoint to the new contract's deployment block:
+2. Reset the checkpoint to the new contract's deployment block / ledger:
    ```bash
-   echo '{"latestBlock": <NEW_DEPLOY_BLOCK>}' > .perihelion-relayer-checkpoint.json
+   echo '{"evm":{"latestBlock": <NEW_DEPLOY_BLOCK>},"soroban":{"latestLedger": <NEW_DEPLOY_LEDGER>}}' \
+     > .perihelion-relayer-checkpoint.json
    ```
 3. Restart the relayer.
 
@@ -565,6 +653,14 @@ runbook. When they land, update the relevant sections:
   once merged.
 - **Solver runbook** (issue #9) — the companion document to this one; cross-reference
   for shared deployment patterns. See [`docs/running-a-solver.md`](./running-a-solver.md).
+- **Trust-model labelling** (issue #938) — labels this relayer as a
+  development-only stand-in for the LayerZero executor, adds the
+  `PERIHELION_RELAYER_MODE=dev` gate and Pubnet refusal, and documents the
+  production permissionless-executor design. See [§1.2](#12-development-mode-vs-production)
+  and [§4.1.1](#411-the-perihelion_relayer_mode-gate).
+- **Bidirectional relaying** (issue #941) — adds the Soroban → EVM leg
+  (`FillConfirmed`, `CancelIntent`) with a separate checkpoint. See
+  [§1.1](#11-current-implementation-development-mode) and [§7.1](#71-how-the-cursor-works).
 
 ---
 

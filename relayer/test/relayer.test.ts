@@ -15,6 +15,14 @@ import type {
 } from "../src/relayer.js";
 import type { CheckpointStore } from "../src/checkpoint.js";
 import type { PendingMessage, MessageKey } from "../src/types.js";
+import {
+  SorobanSourceWatcher,
+  type SorobanOutboundMessage,
+} from "../src/soroban-watcher.js";
+import {
+  EvmDestinationDelivery,
+  type EvmEscrowClient,
+} from "../src/evm-delivery.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -1164,6 +1172,199 @@ test("message re-polled after prolonged absence receives fresh retry budget", as
 
   assert.equal(relayer.metrics.deadLettered, 1, "dead-lettered message not retried even after re-appearing");
   assert.equal(deliverCalls, 2, "no further delivery attempts for the dead-lettered message");
+});
+
+// ─── Issue #941: bidirectional relayer (Stellar → EVM leg) ──────────────────
+
+/**
+ * Minimal in-memory stand-in for the settlement contract's outbound message
+ * log. The SorobanSourceWatcher polls it via `fetchOutbound`.
+ */
+function fakeSorobanEndpoint() {
+  const outbound: SorobanOutboundMessage[] = [];
+  let ledger = 0;
+  return {
+    outbound,
+    push(msg: Omit<SorobanOutboundMessage, "ledger">) {
+      ledger += 1;
+      outbound.push({ ...msg, ledger });
+      return ledger;
+    },
+    async fetchOutbound(fromLedger: number) {
+      const messages = outbound.filter((m) => m.ledger >= fromLedger);
+      return { messages, head: ledger };
+    },
+  };
+}
+
+/**
+ * Minimal in-memory stand-in for the EVM escrow. Records the calls the
+ * EvmDestinationDelivery makes through the mock endpoint.
+ */
+function fakeEvmEscrow() {
+  const calls: Array<{ fn: "lzReceive"; messageType: string; intentHash: string }> = [];
+  const delivered = new Set<string>();
+  const client: EvmEscrowClient = {
+    async lzReceive(p) {
+      const k = messageKeyString({
+        intentHash: p.message.intentHash,
+        messageType: p.message.messageType,
+      });
+      calls.push({
+        fn: "lzReceive",
+        messageType: p.message.messageType,
+        intentHash: p.message.intentHash,
+      });
+      delivered.add(k);
+      return `0xevm${calls.length}`;
+    },
+    async isDelivered(key) {
+      return delivered.has(messageKeyString(key));
+    },
+  };
+  return { calls, client };
+}
+
+test("a Stellar fill produces Released on the EVM escrow (#941)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const soroban = fakeSorobanEndpoint();
+  const escrow = fakeEvmEscrow();
+
+  const intentHash = `0x${"ee".repeat(32)}`;
+  soroban.push({
+    srcTxHash: "0xsorobanfill",
+    message: {
+      srcEid: 40161,
+      dstEid: 30101,
+      intentHash,
+      messageType: "FillConfirmed",
+      solver: "0x0000000000000000000000000000000000000002",
+      recipient: "GUSER",
+      destAsset: "native",
+      amount: "1000000",
+      nonce: 1,
+    },
+  });
+
+  const watcher = new SorobanSourceWatcher({
+    fetchOutbound: soroban.fetchOutbound,
+  });
+  const delivery = new EvmDestinationDelivery({ client: escrow.client });
+
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, memCheckpoint());
+  await relayer.tick();
+
+  assert.equal(escrow.calls.length, 1, "escrow received exactly one message");
+  assert.equal(escrow.calls[0]?.fn, "lzReceive");
+  assert.equal(escrow.calls[0]?.messageType, "FillConfirmed");
+  assert.equal(escrow.calls[0]?.intentHash, intentHash);
+  assert.equal(relayer.metrics.delivered, 1);
+});
+
+test("a Stellar-side cancellation produces Refunded on the EVM escrow (#941)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+  const soroban = fakeSorobanEndpoint();
+  const escrow = fakeEvmEscrow();
+
+  const intentHash = `0x${"ff".repeat(32)}`;
+  soroban.push({
+    srcTxHash: "0xsorobancancel",
+    message: {
+      srcEid: 40161,
+      dstEid: 30101,
+      intentHash,
+      messageType: "CancelIntent",
+      solver: "0x0000000000000000000000000000000000000003",
+      recipient: "GUSER",
+      destAsset: "native",
+      amount: "1000000",
+      nonce: 1,
+    },
+  });
+
+  const watcher = new SorobanSourceWatcher({
+    fetchOutbound: soroban.fetchOutbound,
+  });
+  const delivery = new EvmDestinationDelivery({ client: escrow.client });
+
+  const relayer = new Relayer(config, watcher, delivery, silent, 0, memCheckpoint());
+  await relayer.tick();
+
+  assert.equal(escrow.calls.length, 1, "escrow received exactly one message");
+  assert.equal(escrow.calls[0]?.messageType, "CancelIntent");
+  assert.equal(escrow.calls[0]?.intentHash, intentHash);
+});
+
+test("both directions run with separate checkpoints (#941)", async () => {
+  const config = { ...baseConfig(), confirmations: 0 };
+
+  // EVM → Stellar leg: watches Locked events, delivers to Soroban.
+  const evmWatcher: SourceWatcher = {
+    async poll() {
+      return { messages: [makeMsg(10, { messageType: "FillInstruction" })], head: 10 };
+    },
+  };
+  const sorobanDelivered: string[] = [];
+  const sorobanDelivery: DestinationDelivery = {
+    async deliver(p) {
+      sorobanDelivered.push(p.message.messageType);
+      return "0xsoroban";
+    },
+    async isDelivered() { return false; },
+  };
+
+  // Stellar → EVM leg: watches settlement outbound, delivers to the escrow.
+  const soroban = fakeSorobanEndpoint();
+  const escrow = fakeEvmEscrow();
+  soroban.push({
+    srcTxHash: "0xsorobanfill",
+    message: {
+      srcEid: 40161,
+      dstEid: 30101,
+      intentHash: `0x${"aa".repeat(32)}`,
+      messageType: "FillConfirmed",
+      solver: "0x0000000000000000000000000000000000000004",
+      recipient: "GUSER",
+      destAsset: "native",
+      amount: "1000000",
+      nonce: 1,
+    },
+  });
+  const sorobanWatcher = new SorobanSourceWatcher({
+    fetchOutbound: soroban.fetchOutbound,
+  });
+  const evmDelivery = new EvmDestinationDelivery({ client: escrow.client });
+
+  const evmToStellarCheckpoint = memCheckpoint();
+  const stellarToEvmCheckpoint = memCheckpoint();
+
+  const forward = new Relayer(
+    config,
+    evmWatcher,
+    sorobanDelivery,
+    silent,
+    0,
+    evmToStellarCheckpoint,
+  );
+  const backward = new Relayer(
+    config,
+    sorobanWatcher,
+    evmDelivery,
+    silent,
+    0,
+    stellarToEvmCheckpoint,
+  );
+
+  await forward.tick();
+  await backward.tick();
+
+  assert.deepEqual(sorobanDelivered, ["FillInstruction"], "forward leg delivered to Soroban");
+  assert.equal(escrow.calls.length, 1, "backward leg delivered to the EVM escrow");
+  assert.equal(escrow.calls[0]?.messageType, "FillConfirmed");
+
+  // Each direction persisted its own checkpoint independently.
+  assert.equal(await evmToStellarCheckpoint.load(), 11);
+  assert.equal(await stellarToEvmCheckpoint.load(), 2);
 });
 
 test("headers from a non-reorg tick are available for reorg detection on the next tick", async () => {

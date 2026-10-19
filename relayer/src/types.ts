@@ -24,6 +24,21 @@ export const CANCEL_INTENT_LENGTH = 35;
 export type MessageType = "FillInstruction" | "FillConfirmed" | "CancelIntent";
 
 /**
+ * Reason code for a `CancelIntent` message, matching the wire format shared by
+ * the Soroban and EVM contracts.
+ *
+ * - `0` — EXPIRED: the intent's deadline passed without a fill.
+ * - `1` — ADMIN: an operator cancelled the intent.
+ * - `2` — INVALID: the intent failed validation.
+ */
+export type CancelReason = 0 | 1 | 2;
+
+/** Named aliases for the {@link CancelReason} codes. */
+export const CANCEL_REASON_EXPIRED: CancelReason = 0;
+export const CANCEL_REASON_ADMIN: CancelReason = 1;
+export const CANCEL_REASON_INVALID: CancelReason = 2;
+
+/**
  * A cross-chain message carrying proof that a solver locked source funds for an
  * intent, instructing the destination chain to release the settlement assets.
  */
@@ -46,6 +61,12 @@ export interface BridgeMessage {
   readonly amount: string;
   /** Monotonic per-source-endpoint nonce for ordering and replay protection. */
   readonly nonce: number;
+  /**
+   * Cancellation reason decoded from the source event. Required for
+   * `CancelIntent` messages (the settlement contract validates it) and ignored
+   * for all other message types.
+   */
+  readonly reason?: CancelReason;
   /** Exact LayerZero message bytes observed on the source chain. */
   readonly rawPayload: Hex;
 }

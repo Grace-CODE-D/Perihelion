@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { toSmallestUnits, fromSmallestUnits } from "../src/units.js";
+import { evmAddressToBytes32 } from "../src/evm-address.js";
 
 // ---------------------------------------------------------------------------
 // Issue #533 — fromSmallestUnits mishandles negative input and lacks string
@@ -83,4 +84,34 @@ test("fromSmallestUnits negative output round-trips back through Math.abs + toSm
   const human = fromSmallestUnits(smallest, 6);
   assert.equal(human, "-1.5");
   assert.equal(toSmallestUnits(human.slice(1), 6), smallest.slice(1));
+});
+
+// ---------------------------------------------------------------------------
+// Issue #939 — EVM addresses must be encoded left-padded into bytes32
+// (bytes32(uint256(uint160(addr)))), i.e. the address occupies bytes 12-31.
+// ---------------------------------------------------------------------------
+
+test("evmAddressToBytes32 left-pads a minimal address into bytes 12-31", () => {
+  const out = evmAddressToBytes32("0x0000000000000000000000000000000000000001");
+  assert.equal(out.length, 32);
+  assert.deepEqual(out.subarray(0, 31), Buffer.alloc(31));
+  assert.equal(out[31], 0x01);
+});
+
+test("evmAddressToBytes32 left-pads a full address correctly", () => {
+  const addr = "0x1234567890abcdef1234567890abcdef12345678";
+  const out = evmAddressToBytes32(addr);
+  assert.equal(out.length, 32);
+  assert.deepEqual(out.subarray(0, 12), Buffer.alloc(12));
+  assert.equal(out.subarray(12).toString("hex"), addr.slice(2).toLowerCase());
+});
+
+test("evmAddressToBytes32 throws on malformed or missing input instead of returning zeros", () => {
+  for (const bad of [undefined, null, "", "0x", "0x1234", "not-an-address", "0x" + "zz".repeat(20)]) {
+    assert.throws(
+      () => evmAddressToBytes32(bad as unknown as string),
+      (err: unknown) => err instanceof Error,
+      `expected a throw for ${JSON.stringify(bad)}`,
+    );
+  }
 });

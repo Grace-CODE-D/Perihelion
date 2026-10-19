@@ -24,7 +24,7 @@ import {
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
-import { ESCROW_ABI } from "@perihelion/sdk";
+import { ESCROW_ABI, evmAddressToBytes32 } from "@perihelion/sdk";
 import type { SignedIntent } from "@perihelion/sdk";
 
 /**
@@ -314,11 +314,10 @@ export class Executor {
     // intent_hash: 0x-prefixed 32-byte hex → raw bytes → Soroban BytesN<32>
     const hashBytes = hexToBytes(intentHash);
 
-    // solver_evm: derive from the EVM private key, pad 20-byte address to 32
-    // bytes (right-padded with zeros as BytesN<32>; the contract stores the
-    // address in the leftmost 20 bytes).
+    // solver_evm: derive from the EVM private key and encode as bytes32
+    // (left-padded, i.e. bytes32(uint256(uint160(addr)))).
     const solverEvm = privateKeyToAccount(this.evmPrivateKey).address;
-    const solverEvmBytes = evmAddressTo32Bytes(solverEvm);
+    const solverEvmBytes = evmAddressToBytes32(solverEvm);
 
     // solver Stellar address (authorizing the call)
     const solverStellar = nativeToScVal(keypair.publicKey(), { type: "address" });
@@ -392,19 +391,4 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Encode a 20-byte EVM address into a 32-byte buffer, left-justified
- * (address in bytes 0–19, zeros in bytes 20–31).
- *
- * The Soroban contract stores `solver_evm` as `BytesN<32>` and decodes
- * the payout address from the first 20 bytes when emitting FillConfirmed.
- */
-function evmAddressTo32Bytes(address: string): Uint8Array {
-  const clean = address.startsWith("0x") ? address.slice(2) : address;
-  if (clean.length !== 40) throw new Error(`Invalid EVM address length: ${address}`);
-  const buf = new Uint8Array(32);
-  for (let i = 0; i < 20; i++) {
-    buf[i] = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  }
-  return buf;
-}
+
