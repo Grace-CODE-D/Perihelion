@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { test, before, after } from "node:test";
 import {
   buildIntent,
+  hashIntent,
   perihelionDomain,
   INTENT_TYPES,
   toMessage,
@@ -72,6 +73,11 @@ test("rejects an intent signed by a key other than intent.user under the correct
   assert.equal(res.status, 400);
   const body = (await res.json()) as { error: string };
   assert.equal(body.error, "Signature verification failed");
+
+  // The forged record must not have been stored.
+  const hash = hashIntent(intent, perihelionDomain(CHAIN_ID, ESCROW));
+  const lookup = await fetch(`${BASE}/intents/${hash}`);
+  assert.equal(lookup.status, 404);
 });
 
 test("accepts an intent signed by intent.user under the correct domain", async () => {

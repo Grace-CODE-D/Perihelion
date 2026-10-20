@@ -5,12 +5,11 @@ import type { Server } from "node:http";
 import {
   hashIntent,
   verifyIntent,
-  verifyIntentOnChain,
   perihelionDomain,
   parseIntent,
   isExpired,
 } from "@perihelion/sdk";
-import type { Hex, SignedIntent, Address, IntentRpcProvider } from "@perihelion/sdk";
+import type { Hex, SignedIntent, Address, VerifyIntentOptions } from "@perihelion/sdk";
 import { IntentStore } from "./store.js";
 import type { MempoolIntentRecord, IntentStatus } from "./types.js";
 
@@ -75,11 +74,11 @@ export interface MempoolServerOptions {
   /** Per-IP request budget within the window for read routes (GET). Default 600. */
   readRateLimit?: number;
   /**
-   * Optional JSON-RPC provider used to verify signatures from contract wallets
-   * (ERC-1271). When omitted, contract-wallet intents are rejected because
-   * their signatures cannot be checked with ECDSA alone.
+   * Optional viem `PublicClient` used to verify signatures from contract
+   * wallets (ERC-1271). When omitted, contract-wallet intents are rejected
+   * because their signatures cannot be checked with ECDSA alone.
    */
-  provider?: IntentRpcProvider;
+  client?: VerifyIntentOptions["client"];
 }
 
 const DEFAULT_LIST_LIMIT = 100;
@@ -102,7 +101,7 @@ export class MempoolServer {
   private readRateLimit: number;
   private sweepTimer?: ReturnType<typeof setInterval>;
   private statusToken?: string;
-  private provider?: IntentRpcProvider;
+  private client?: VerifyIntentOptions["client"];
   private isReady = false;
   private submissionStats = { accepted: 0, rejected: 0 };
   private rateLimitRejections = 0;
@@ -122,7 +121,7 @@ export class MempoolServer {
     this.verifyingContract = opts.verifyingContract;
     this.domain = perihelionDomain(this.chainId, this.verifyingContract);
     this.statusToken = opts.statusToken;
-    this.provider = opts.provider;
+    this.client = opts.client;
     this.store = new IntentStore({
       maxSize: opts.maxStoreSize,
       expiryGraceMs: opts.expiryGraceMs,
@@ -292,7 +291,7 @@ export class MempoolServer {
     // Contract wallets (Safe, ERC-4337 accounts) cannot produce an ECDSA
     // signature that recovers to their address, so their signatures are
     // checked through ERC-1271 `isValidSignature` over RPC instead. Without a
-    // configured provider the check fails closed.
+    // configured client the check fails closed.
     const signatureValid = await this.verifySignature(parsed, signature).catch(() => false);
     if (!signatureValid) {
       this.submissionStats.rejected++;
@@ -319,10 +318,7 @@ export class MempoolServer {
    * a truthy Promise (#888).
    */
   private async verifySignature(intent: SignedIntent["intent"], signature: Hex): Promise<boolean> {
-    if (!this.provider) {
-      return verifyIntent(intent, signature, this.domain);
-    }
-    return verifyIntentOnChain(intent, signature, this.domain, this.provider);
+    return verifyIntent(intent, signature, this.domain, { client: this.client });
   }
 
   private handleGetIntent(req: Request, res: Response): void {
