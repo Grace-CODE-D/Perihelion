@@ -135,7 +135,7 @@ export function validateIntent(
   }
   if (!isStellarAsset(params.destAsset)) {
     throw new PerihelionValidationError(
-      `must be 'native' or '<CODE>:<G...ISSUER>' with a valid issuer checksum (got '${params.destAsset}')`, "destAsset",
+      `must be 'native', '<CODE>:<G...ISSUER>' or a 'C...' token contract strkey, with a valid checksum (got '${params.destAsset}')`, "destAsset",
     );
   }
   // Enforce byte-length bound on destAsset as defence-in-depth, independent of isStellarAsset.
@@ -208,8 +208,9 @@ export const MAX_DESTINATION_LEN = 56;
 
 /**
  * Maximum byte length of `Intent.destAsset`. The longest valid form is
- * `<CODE>:<ISSUER>` (12 + 1 + 56 = 69 bytes); `"native"` is 6 bytes.
- * Matches `PerihelionEscrow.MAX_DEST_ASSET_LEN`.
+ * `<CODE>:<ISSUER>` (12 + 1 + 56 = 69 bytes); a `C...` contract strkey is 56
+ * bytes and `"native"` is 6. Matches `PerihelionEscrow.MAX_DEST_ASSET_LEN`
+ * and the Soroban `asset::MAX_DEST_ASSET_LEN`.
  */
 export const MAX_DEST_ASSET_LEN = 69;
 

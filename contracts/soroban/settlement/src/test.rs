@@ -2700,6 +2700,8 @@ fn try_deliver_fill_bytes(
         locked_solver: Some(BytesN::from_array(&s.env, &[0x22; 32])),
         reservation_window: 0,
     };
+    // `s.asset` travels as its `C...` strkey, so it must be allowlisted.
+    s.client.set_dest_token_allowed(&s.asset, &true);
     let message = crate::messages::encode_fill_instruction(&s.env, &fi);
     let origin = Origin {
         src_eid: s.src_eid,
@@ -3343,4 +3345,203 @@ fn propose_endpoint_succeeds_after_cancel_of_pending_proposal() {
     s.client.cancel_pending_endpoint();
 
     assert!(s.client.try_propose_endpoint(&second).is_ok());
+}
+
+// --- Contract-native destination assets ---------------------------------------
+//
+// `destAsset` has three canonical forms (`native`, `CODE:ISSUER`, `C...`); see
+// `asset.rs`. These tests deliver each form as raw wire bytes through
+// `lz_receive_bytes` and settle it with `fill_intent`.
+
+/// A minimal SEP-41-style token that exists only as a contract: no classic
+/// asset, no issuer account and no Stellar Asset Contract.
+#[contract]
+pub struct ContractOnlyToken;
+
+#[contractimpl]
+impl ContractOnlyToken {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let bal = Self::balance(env.clone(), to.clone());
+        env.storage().persistent().set(&to, &(bal + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage().persistent().get(&id).unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_bal = Self::balance(env.clone(), from.clone());
+        assert!(from_bal >= amount, "insufficient balance");
+        env.storage().persistent().set(&from, &(from_bal - amount));
+        let to_bal = Self::balance(env.clone(), to.clone());
+        env.storage().persistent().set(&to, &(to_bal + amount));
+    }
+}
+
+fn strkey_bytes(addr: &Address) -> std::vec::Vec<u8> {
+    let s = addr.to_string();
+    let mut buf = std::vec![0u8; s.len() as usize];
+    s.copy_into_slice(&mut buf);
+    buf
+}
+
+/// Deliver a canonical FillInstruction whose wire `dest_asset` is `asset_id`.
+fn try_deliver_fill_with_asset_id(
+    s: &Setup,
+    h: &BytesN<32>,
+    recipient: &Address,
+    asset_id: &[u8],
+    min: i128,
+    nonce: u64,
+) -> Result<(), PerihelionError> {
+    let fi = FillInstruction {
+        intent_hash: h.clone(),
+        src_eid: s.src_eid,
+        recipient: recipient.clone(),
+        // Ignored: the encoder writes `asset_id` into the dest_asset field.
+        dest_asset: s.asset.clone(),
+        min_dest_amount: min,
+        deadline: 20_000,
+        preferred_solver: None,
+        locked_solver: Some(evm_solver(&s.env, 0x22)),
+        reservation_window: 0,
+    };
+    let message = crate::messages::encode_fill_instruction_with_dest_asset(&s.env, &fi, asset_id);
+    let origin = Origin {
+        src_eid: s.src_eid,
+        sender: s.peer.clone(),
+        nonce,
+    };
+    let guid = BytesN::from_array(&s.env, &[0u8; 32]);
+    match s.client.try_lz_receive_bytes(&origin, &guid, &message) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => panic!("lz_receive_bytes return value failed to convert: {e:?}"),
+        Err(e) => Err(e.expect("lz_receive_bytes aborted with a non-contract error")),
+    }
+}
+
+#[test]
+fn contract_only_dest_asset_settles_end_to_end() {
+    let s = setup();
+    let token_id = s.env.register(ContractOnlyToken, ());
+    let token = ContractOnlyTokenClient::new(&s.env, &token_id);
+    s.client.set_dest_token_allowed(&token_id, &true);
+
+    let h = hash(&s.env, 0xC1);
+    let recipient = Address::generate(&s.env);
+    try_deliver_fill_with_asset_id(&s, &h, &recipient, &strkey_bytes(&token_id), 5_000, 1)
+        .expect("an allowlisted contract-only token must register");
+    let rec = s.client.get_intent(&h).expect("intent registered");
+    assert_eq!(rec.dest_asset, token_id, "C... identifier is used directly");
+
+    let solver = Address::generate(&s.env);
+    token.mint(&solver, &10_000);
+    s.client
+        .fill_intent(&solver, &evm_solver(&s.env, 0x22), &h, &5_000, &0);
+
+    assert_eq!(token.balance(&recipient), 5_000);
+    assert_eq!(token.balance(&solver), 5_000);
+    assert_eq!(
+        s.client.get_intent(&h).unwrap().status,
+        IntentStatus::ConfirmationSent
+    );
+    assert_eq!(
+        s.mock.sent(),
+        1,
+        "FillConfirmed dispatched to the source chain"
+    );
+}
+
+#[test]
+fn contract_only_dest_asset_requires_allowlist() {
+    let s = setup();
+    let token_id = s.env.register(ContractOnlyToken, ());
+    let h = hash(&s.env, 0xC2);
+    let recipient = Address::generate(&s.env);
+    let id = strkey_bytes(&token_id);
+
+    assert_eq!(
+        try_deliver_fill_with_asset_id(&s, &h, &recipient, &id, 5_000, 1),
+        Err(PerihelionError::UnsupportedDestAsset)
+    );
+    assert!(s.client.get_intent(&h).is_none());
+
+    // The rejected delivery consumed no nonce, so the same message is
+    // redeliverable once the operator allowlists the token.
+    s.client.set_dest_token_allowed(&token_id, &true);
+    assert!(s.client.is_dest_token_allowed(&token_id));
+    try_deliver_fill_with_asset_id(&s, &h, &recipient, &id, 5_000, 1)
+        .expect("redelivery after allowlisting");
+    assert!(s.client.get_intent(&h).is_some());
+
+    // Removing it again blocks new registrations.
+    s.client.set_dest_token_allowed(&token_id, &false);
+    assert!(!s.client.is_dest_token_allowed(&token_id));
+    assert_eq!(
+        try_deliver_fill_with_asset_id(&s, &hash(&s.env, 0xC3), &recipient, &id, 5_000, 2),
+        Err(PerihelionError::UnsupportedDestAsset)
+    );
+}
+
+#[test]
+fn classic_dest_asset_resolves_to_its_stellar_asset_contract() {
+    let s = setup();
+    // The testutils SAC wraps the classic asset `aaa:<issuer>`.
+    let sac = s
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&s.env));
+    let mut id = std::vec::Vec::from(&b"aaa:"[..]);
+    id.extend_from_slice(&strkey_bytes(&sac.issuer().address()));
+
+    assert_eq!(
+        s.client.resolve_dest_asset(&Bytes::from_slice(&s.env, &id)),
+        sac.address()
+    );
+
+    let h = hash(&s.env, 0xC4);
+    let recipient = Address::generate(&s.env);
+    try_deliver_fill_with_asset_id(&s, &h, &recipient, &id, 5_000, 1)
+        .expect("CODE:ISSUER needs no allowlist entry");
+    assert_eq!(s.client.get_intent(&h).unwrap().dest_asset, sac.address());
+
+    let solver = Address::generate(&s.env);
+    token::StellarAssetClient::new(&s.env, &sac.address()).mint(&solver, &5_000);
+    s.client
+        .fill_intent(&solver, &evm_solver(&s.env, 0x22), &h, &5_000, &0);
+    assert_eq!(
+        token::Client::new(&s.env, &sac.address()).balance(&recipient),
+        5_000
+    );
+}
+
+#[test]
+fn native_dest_asset_resolves_to_native_token() {
+    let s = setup();
+    let native = s
+        .client
+        .resolve_dest_asset(&Bytes::from_slice(&s.env, b"native"));
+    let h = hash(&s.env, 0xC5);
+    try_deliver_fill_with_asset_id(&s, &h, &Address::generate(&s.env), b"native", 5_000, 1)
+        .expect("native needs no allowlist entry");
+    assert_eq!(s.client.get_intent(&h).unwrap().dest_asset, native);
+}
+
+#[test]
+fn malformed_dest_asset_is_rejected() {
+    let s = setup();
+    let recipient = Address::generate(&s.env);
+    // A G... account is a valid strkey but not an asset.
+    let account = b"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    assert_eq!(
+        try_deliver_fill_with_asset_id(&s, &hash(&s.env, 0xC6), &recipient, account, 5_000, 1),
+        Err(PerihelionError::MalformedPayload)
+    );
+    assert_eq!(
+        s.client
+            .try_resolve_dest_asset(&Bytes::from_slice(&s.env, b"USDC"))
+            .err()
+            .map(|e| e.unwrap()),
+        Some(PerihelionError::InvalidDestAsset)
+    );
 }

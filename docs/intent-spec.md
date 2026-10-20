@@ -13,7 +13,7 @@ outcome and the constraints under which a solver may fill it.
 | `sourceChainId`   | `uint256` | EVM chain id spent from (1 = Ethereum, 8453 = Base, …)            |
 | `sourceAsset`     | `address` | ERC-20 token spent on the source chain                            |
 | `sourceAmount`    | `uint256` | Amount of `sourceAsset` locked, in smallest units                |
-| `destAsset`       | `string`  | Stellar asset wanted: `native` or `<CODE>:<ISSUER>`              |
+| `destAsset`       | `string`  | Stellar asset wanted: `native`, `<CODE>:<ISSUER>` or `C...` token |
 | `minDestAmount`   | `uint256` | Minimum acceptable amount on Stellar (slippage floor)            |
 | `deadline`        | `uint256` | Unix seconds after which the intent is void and refundable       |
 | `nonce`           | `uint256` | Unique value preventing replay/collision of identical intents    |
@@ -36,6 +36,36 @@ right character class can have a corrupted checksum and be undeliverable. A
 single transcription error (one character changed) will fail the checksum, and
 `validateIntent` will throw an `IntentValidationError` on the `destination`
 field before the intent is ever signed or submitted.
+
+### `destAsset` field — canonical asset identifier
+
+`destAsset` names the token the solver delivers on Stellar. It takes exactly
+one of three canonical forms; the SDK checks them with `isStellarAsset`
+(`sdk/src/stellar.ts`) and the Soroban decoder with the same rules
+(`contracts/soroban/settlement/src/asset.rs`):
+
+| Form          | Example                                                       | Settled through |
+| ------------- | ------------------------------------------------------------- | --------------- |
+| `native`      | `native`                                                      | the native XLM token contract configured at deployment |
+| `CODE:ISSUER` | `USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN` | the asset's Stellar Asset Contract, derived on-chain from the asset |
+| `C...`        | `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`    | that token contract directly — **only if allowlisted** |
+
+- `CODE` is 1–12 ASCII alphanumeric characters (case-sensitive); `ISSUER` is a
+  checksum-valid `G...` account strkey.
+- A `C...` value is a checksum-valid contract strkey for a contract-native
+  (SEP-41) token that has no classic asset. Because the settlement contract
+  calls `transfer` on it, the admin must allowlist it first
+  (`set_dest_token_allowed`). An intent naming a token that isn't allowlisted is
+  rejected on Stellar with `UnsupportedDestAsset`. The LayerZero message stays
+  retryable, but solvers should call `resolve_dest_asset` before locking.
+- Classic assets should be named as `CODE:ISSUER`, not by their Stellar Asset
+  Contract's `C...` address. Both forms settle the same token, but they are
+  different strings, so they sign to different intent hashes.
+- A `G...` account strkey by itself is **not** an asset and is rejected.
+
+The longest form is `CODE:ISSUER` (12 + 1 + 56 = 69 bytes), which sets
+`MAX_DEST_ASSET_LEN = 69` in the SDK, the EVM escrow and the 69-byte
+`dest_asset` wire field. A `C...` strkey is 56 bytes and `native` is 6.
 
 ### `deadline` field — lower and upper bounds
 
@@ -186,7 +216,9 @@ Intent(
 ```
 
 The struct hash encodes dynamic fields (`destination`, `destAsset`) as the
-keccak256 of their UTF-8 bytes. The final digest is:
+keccak256 of their UTF-8 bytes. `destAsset` is hashed exactly as written in one
+of its [canonical forms](#destasset-field--canonical-asset-identifier), so the
+escrow forwards the same bytes the user signed. The final digest is:
 
 ```
 keccak256(0x1901 ‖ domainSeparator ‖ structHash)

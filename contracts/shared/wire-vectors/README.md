@@ -28,16 +28,21 @@ to fixed widths:
 
 - `recipient` is a Stellar account (`G...`) or contract (`C...`) strkey — 56
   ASCII characters exactly — stored as 56 bytes, no zero-padding needed.
-- `dest_asset` is a Stellar strkey or a `CODE:ISSUER` asset string, up to 69
-  bytes, right-zero-padded to 69 bytes. The full 69-byte field prevents
-  truncation of `CODE:ISSUER` assets whose issuer strkey extends past byte 32
-  (issue #270).
+- `dest_asset` is the user-signed canonical asset identifier: `native`,
+  `CODE:ISSUER`, or a `C...` token contract strkey (see
+  [`docs/intent-spec.md`](../../../docs/intent-spec.md#destasset-field--canonical-asset-identifier)),
+  up to 69 bytes, right-zero-padded to 69 bytes. The full 69-byte field
+  prevents truncation of `CODE:ISSUER` assets whose issuer strkey extends past
+  byte 32 (issue #270).
 - `preferred_solver` is an EVM address left-padded to 32 bytes; all zeros
   signals "open" (no preferred solver) on the Soroban side.
 
-The Soroban decoder strips trailing zeros from the `recipient` and `dest_asset`
-fields to recover the strkey string, then converts it to a native `Address` via
-`Address::from_string_bytes` (issue #271).
+The Soroban decoder strips trailing zeros from both fields. It converts
+`recipient` to a native `Address` via `Address::from_string_bytes` (issue #271).
+It checks that `dest_asset` is one of the three canonical forms, keeps it
+verbatim, and resolves it to a token contract (native token, derived Stellar
+Asset Contract, or allowlisted contract) before registering the intent. Any
+other value, including a bare `G...` account strkey, is `MalformedPayload`.
 
 ### Byte layout
 
@@ -48,15 +53,14 @@ fields to recover the strkey string, then converts it to a native `Address` via
 | `intent_hash`      | 2           | 32            | Raw bytes (EIP-712 keccak256 hash)               | Soroban      |
 | `src_eid`          | 34          | 4             | Big-endian `u32`                                 | Soroban      |
 | `recipient`        | 38          | 56            | ASCII strkey (`G...` or `C...`), right-zero-padded | Soroban    |
-| `dest_asset`       | 94          | 69            | ASCII strkey or `CODE:ISSUER` string, right-zero-padded | Soroban |
+| `dest_asset`       | 94          | 69            | ASCII `native`, `CODE:ISSUER` or `C...` strkey, right-zero-padded | Soroban |
 | `min_dest_amount`  | 163         | 16            | Big-endian `u128`                                | Soroban      |
 | `deadline`         | 179         | 8             | Big-endian `u64` (Unix timestamp, seconds)       | Soroban      |
 | `preferred_solver` | 187         | 32            | EVM address left-padded to 32 bytes; all zeros = "open" | Soroban (dropped) |
 
 **Total: 227 bytes.** All integer fields are big-endian. The `recipient` and
-`dest_asset` fields contain ASCII characters — not raw key material — and are
-decoded by stripping trailing zero bytes and calling `Address::from_string_bytes`
-on the resulting string.
+`dest_asset` fields contain ASCII characters, not raw key material, and are
+decoded by stripping trailing zero bytes (see above).
 
 The canonical inputs below produce the strkeys by encoding the raw byte arrays
 via the Stellar SEP-0023 base32 algorithm. Specifically, `[0xBB; 32]` encodes
@@ -74,6 +78,21 @@ encodes to `CDGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZLND`.
 | `min_dest_amount`  | `1_000_000_000` (u128, big-endian)                                     |
 | `deadline`         | `9_999_999_999` (u64, big-endian)                                      |
 | `preferred_solver` | All zeros (32 bytes) — open, no preferred solver (test encoder hardcodes this) |
+
+### `dest_asset` form variants
+
+`fill_instruction.hex` covers the contract-native `C...` form. Two more golden
+vectors are identical to it except for the `dest_asset` field, which covers the
+other canonical forms:
+
+| File                                  | `dest_asset` (right-zero-padded to 69 bytes) |
+| ------------------------------------- | -------------------------------------------- |
+| `fill_instruction_native_asset.hex`   | `native`                                     |
+| `fill_instruction_classic_asset.hex`  | `USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN` (61 bytes + 8 zero bytes) |
+
+`neg/fill_instruction_account_dest_asset.hex` carries the all-zero `G...`
+account strkey in `dest_asset`. It is a valid strkey but not an asset, and the
+Soroban decoder must reject it.
 
 ## `fill_confirmed.hex` (90 bytes)
 

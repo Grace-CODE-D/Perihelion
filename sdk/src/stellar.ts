@@ -104,18 +104,26 @@ export function decodeStrkey(
 }
 
 /**
- * Returns true if `value` is a valid Stellar asset identifier:
- * - `"native"` for XLM
+ * Returns true if `value` is a canonical Stellar asset identifier, one of:
+ * - `"native"` for XLM;
  * - `"<CODE>:<ISSUER>"` where CODE is 1–12 alphanumeric chars and ISSUER
- *   is a valid `G...` account strkey.
+ *   is a valid `G...` account strkey — a classic asset, settled through its
+ *   Stellar Asset Contract;
+ * - a `C...` contract strkey (56 chars) — a contract-native (SEP-41) token
+ *   with no classic asset, settled by calling that contract directly. The
+ *   settlement contract only accepts tokens its admin has allowlisted, so a
+ *   well-formed `C...` value can still be refused on Stellar.
  *
- * This is the valid form for {@link Intent.destAsset}.
+ * These are the valid forms for {@link Intent.destAsset}. Matches the Soroban
+ * decoder (`contracts/soroban/settlement/src/asset.rs`) exactly.
  */
 export function isStellarAsset(value: string): boolean {
   if (typeof value !== "string") return false;
   if (value === "native") return true;
   const colon = value.indexOf(":");
-  if (colon === -1) return false;
+  if (colon === -1) {
+    return value.length === 56 && value[0] === "C" && isValidStrkey(value, 0x10);
+  }
   const code = value.slice(0, colon);
   const issuer = value.slice(colon + 1);
   // Asset codes: 1–12 alphanumeric characters (Stellar spec).

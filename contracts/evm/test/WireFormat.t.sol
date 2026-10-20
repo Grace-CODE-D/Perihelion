@@ -194,6 +194,34 @@ contract WireFormatConformanceTest is Test {
         assertEq(encodedSrcEid, 30_316, "offset 34 must encode the source eid, not the destination eid");
     }
 
+    /// @dev The other two canonical destAsset forms (`native`, `CODE:ISSUER`)
+    ///      encode to their golden vectors too; `fill_instruction.hex` above
+    ///      covers the contract-native `C...` form.
+    function test_FillInstructionDestAssetFormVectorsMatchSolidityEncoder() public view {
+        _assertFillInstructionVector("fill_instruction_native_asset.hex", "native");
+        _assertFillInstructionVector(
+            "fill_instruction_classic_asset.hex",
+            "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+        );
+    }
+
+    function _assertFillInstructionVector(string memory name, string memory destAsset) internal view {
+        PerihelionEscrow.Intent memory intent = PerihelionEscrow.Intent({
+            user: address(0xA1),
+            destination: FI_RECIPIENT_STR,
+            sourceChainId: block.chainid,
+            sourceAsset: address(0xA2),
+            sourceAmount: 0,
+            destAsset: destAsset,
+            minDestAmount: 1_000_000_000,
+            deadline: 9_999_999_999,
+            nonce: 0,
+            preferredSolver: address(0)
+        });
+        bytes memory encoded = harness.encodeFillInstruction(FI_INTENT_HASH, intent);
+        assertEq(encoded, _readVector(name), name);
+    }
+
     /// @dev Asserts the golden vector length matches the expected constant.
     /// This test catches stale vectors immediately rather than surfacing as
     /// a decode error in an unrelated test.
