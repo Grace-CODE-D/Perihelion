@@ -14,6 +14,7 @@ import {
   PerihelionHashMismatchError,
   PerihelionHttpError,
   PerihelionNetworkError,
+  PerihelionPaginationError,
   PerihelionTimeoutError,
   PerihelionValidationError,
 } from "./errors.js";
@@ -350,16 +351,29 @@ export class PerihelionClient {
    * `nextCursor` until no further pages remain.
    *
    * **Retry policy**: Each page request retries transient failures up to `maxRetries` times.
+   *
+   * @throws {@link PerihelionPaginationError} (`reason: "repeated_cursor"`) if the
+   * server returns a cursor it already returned, which would otherwise loop
+   * forever. Its `records` is empty, because every page was already yielded.
    */
   async *listPendingPages(
     status: MempoolIntentStatus = "pending",
     limit?: number,
   ): AsyncGenerator<IntentRecord[], void, unknown> {
     let cursor: string | undefined;
+    const seen = new Set<string>();
+    let pages = 0;
     do {
       const page: ListPendingPageResult = await this.listPendingPage(status, cursor, limit);
+      pages++;
       yield page.records;
       cursor = page.nextCursor;
+      if (cursor !== undefined) {
+        if (seen.has(cursor)) {
+          throw new PerihelionPaginationError("repeated_cursor", [], cursor, pages);
+        }
+        seen.add(cursor);
+      }
     } while (cursor !== undefined);
   }
 
@@ -374,8 +388,13 @@ export class PerihelionClient {
    * The server caps each page at `DEFAULT_LIST_LIMIT` (100) records and
    * returns a `nextCursor` when more remain. This method accumulates all pages
    * so callers always see the full result set, regardless of how many intents
-   * are in the mempool. A `maxPages` guard (default 100) prevents a
-   * misbehaving server from looping the client forever.
+   * are in the mempool.
+   *
+   * It never returns a partial result silently. If `maxPages` pages (default
+   * 100) have been fetched and the server still returns a `nextCursor`, or if
+   * the server repeats a cursor it already returned (which would loop
+   * forever), it throws {@link PerihelionPaginationError}. The error carries the
+   * records fetched so far and the cursor to resume from.
    *
    * For callers that need explicit pagination control (e.g. a solver that wants
    * to rate-limit its own page fetches), use {@link listPendingPage} or {@link listPendingPages} directly.
@@ -390,6 +409,7 @@ export class PerihelionClient {
     limit: number = DEFAULT_LIST_LIMIT,
   ): Promise<IntentRecord[]> {
     const all: IntentRecord[] = [];
+    const seen = new Set<string>();
     let cursor: string | undefined;
     let pages = 0;
 
@@ -398,8 +418,16 @@ export class PerihelionClient {
       all.push(...page.records);
       cursor = page.nextCursor;
       pages++;
-    } while (cursor !== undefined && pages < maxPages);
+      if (cursor === undefined) break;
+      if (seen.has(cursor)) {
+        throw new PerihelionPaginationError("repeated_cursor", all, cursor, pages);
+      }
+      seen.add(cursor);
+    } while (pages < maxPages);
 
+    if (cursor !== undefined) {
+      throw new PerihelionPaginationError("max_pages", all, cursor, pages);
+    }
     return all;
   }
 

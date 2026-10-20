@@ -101,6 +101,58 @@ export class IntentValidationError extends PerihelionValidationError {
 }
 
 /**
+ * Thrown by `listPending` when it stops before the server reports the last
+ * page, so the caller never mistakes a partial order book for the whole one.
+ *
+ * - `reason: "max_pages"` — `maxPages` pages were fetched and the server still
+ *   returned a `nextCursor`. More records exist; resume from `nextCursor` with
+ *   `listPendingPage`, or raise `maxPages`.
+ * - `reason: "repeated_cursor"` — the server returned a cursor it had already
+ *   returned, so following it would loop forever. This is a server bug.
+ *
+ * `records` holds everything fetched before stopping, so a caller that can work
+ * with a partial set can still use it.
+ *
+ * @example
+ * ```ts
+ * let pending: IntentRecord[];
+ * try {
+ *   pending = await client.listPending();
+ * } catch (e) {
+ *   if (!(e instanceof PerihelionPaginationError)) throw e;
+ *   log.warn("order book truncated", { reason: e.reason, pages: e.pages });
+ *   pending = e.records;
+ * }
+ * ```
+ */
+export class PerihelionPaginationError<T = unknown> extends PerihelionError {
+  readonly reason: "max_pages" | "repeated_cursor";
+  readonly records: T[];
+  readonly nextCursor: string;
+  readonly pages: number;
+  constructor(
+    reason: "max_pages" | "repeated_cursor",
+    records: T[],
+    nextCursor: string,
+    pages: number,
+    options?: ErrorOptions,
+  ) {
+    super(
+      reason === "max_pages"
+        ? `[Perihelion] listPending stopped after ${pages} pages (maxPages) with more records remaining; ` +
+            `${records.length} records fetched, resume from cursor ${JSON.stringify(nextCursor)}`
+        : `[Perihelion] listPending: server repeated cursor ${JSON.stringify(nextCursor)} after ${pages} pages; ` +
+            `${records.length} records fetched`,
+      options,
+    );
+    this.reason = reason;
+    this.records = records;
+    this.nextCursor = nextCursor;
+    this.pages = pages;
+  }
+}
+
+/**
  * Thrown when the mempool returns a hash that does not match the locally-computed
  * hash. This indicates a server bug or tampering attempt.
  */
