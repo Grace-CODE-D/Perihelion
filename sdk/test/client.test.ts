@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PerihelionClient } from "../src/client.js";
+import { PerihelionValidationError } from "../src/errors.js";
 
 const VALID_ADDRESS = "0x1234567890123456789012345678901234567890";
 const VALID_HASH = "0x" + "ab".repeat(32);
@@ -233,4 +234,62 @@ test("listPending follows nextCursor to accumulate all pages", async () => {
   assert.equal(result[1].hash, page2Record.hash);
   assert.equal(calls.length, 2);
   assert.ok(calls[1].includes("cursor=page2"), `second call should include cursor: ${calls[1]}`);
+});
+
+// ─── getIntent / reportStatus: hash validation ────────────────────────────────
+
+const BAD_HASHES: unknown[] = [
+  "../admin",
+  "x?y=",
+  VALID_HASH + "/../../admin",
+  VALID_HASH + "?x=1",
+  "0x" + "ab".repeat(31), // 31 bytes
+  "0x" + "ab".repeat(33), // 33 bytes
+  "ab".repeat(32), // missing 0x
+  "0x" + "zz".repeat(32),
+  "",
+  undefined,
+  42,
+];
+
+for (const bad of BAD_HASHES) {
+  test(`getIntent rejects ${JSON.stringify(bad)} without making a request`, async () => {
+    let calls = 0;
+    const client = makeClient((async () => {
+      calls++;
+      return new Response("{}");
+    }) as unknown as typeof fetch);
+    await assert.rejects(client.getIntent(bad as `0x${string}`), PerihelionValidationError);
+    assert.equal(calls, 0);
+  });
+
+  test(`reportStatus rejects ${JSON.stringify(bad)} without sending the token`, async () => {
+    let calls = 0;
+    const client = makeClient((async () => {
+      calls++;
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof fetch);
+    await assert.rejects(
+      client.reportStatus(bad as `0x${string}`, "filled", "secret-token"),
+      PerihelionValidationError,
+    );
+    assert.equal(calls, 0);
+  });
+}
+
+test("getIntent and reportStatus lower-case the hash in the request URL", async () => {
+  const urls: string[] = [];
+  const client = makeClient((async (url: string | URL) => {
+    urls.push(String(url));
+    return urls.length === 1
+      ? new Response(JSON.stringify(makeRecord()), { status: 200 })
+      : new Response(null, { status: 204 });
+  }) as unknown as typeof fetch);
+  const mixed = ("0x" + "AB".repeat(32)) as `0x${string}`;
+  await client.getIntent(mixed);
+  await client.reportStatus(mixed, "filled", "secret-token");
+  assert.deepEqual(urls, [
+    `https://mempool.example.com/intents/${VALID_HASH}`,
+    `https://mempool.example.com/intents/${VALID_HASH}/status`,
+  ]);
 });
