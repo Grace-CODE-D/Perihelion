@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PerihelionClient } from "../src/client.js";
-import { PerihelionValidationError } from "../src/errors.js";
+import { PerihelionPaginationError, PerihelionValidationError } from "../src/errors.js";
 
 const VALID_ADDRESS = "0x1234567890123456789012345678901234567890";
 const VALID_HASH = "0x" + "ab".repeat(32);
@@ -292,4 +292,66 @@ test("getIntent and reportStatus lower-case the hash in the request URL", async 
     `https://mempool.example.com/intents/${VALID_HASH}`,
     `https://mempool.example.com/intents/${VALID_HASH}/status`,
   ]);
+});
+
+// ─── listPending: truncation is never silent ──────────────────────────────────
+
+/** A server that always has another page: page N returns cursor "cN". */
+function endlessServer(calls: string[], cursorFor: (n: number) => string) {
+  return (async (url: string | URL | Request) => {
+    calls.push(url.toString());
+    const n = calls.length;
+    const record = { ...makeRecord(), hash: "0x" + n.toString(16).padStart(64, "0") };
+    return new Response(JSON.stringify({ records: [record], nextCursor: cursorFor(n) }), { status: 200 });
+  }) as unknown as typeof fetch;
+}
+
+test("listPending throws PerihelionPaginationError when maxPages is hit with more pages left", async () => {
+  const calls: string[] = [];
+  const client = makeClient(endlessServer(calls, (n) => `c${n}`));
+  const err = await client.listPending("pending", 3).then(
+    () => assert.fail("listPending must not return a truncated result"),
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof PerihelionPaginationError, `got ${String(err)}`);
+  assert.equal(err.reason, "max_pages");
+  assert.equal(err.pages, 3);
+  assert.equal(err.records.length, 3, "partial records are carried on the error");
+  assert.equal(err.nextCursor, "c3", "the cursor to resume from");
+  assert.equal(calls.length, 3);
+});
+
+test("listPending returns normally when the last page lands exactly on maxPages", async () => {
+  const calls: string[] = [];
+  const fetchImpl = (async (url: string | URL | Request) => {
+    calls.push(url.toString());
+    const nextCursor = calls.length < 2 ? `c${calls.length}` : undefined;
+    return new Response(JSON.stringify({ records: [makeRecord()], nextCursor }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const result = await makeClient(fetchImpl).listPending("pending", 2);
+  assert.equal(result.length, 2);
+});
+
+test("listPending detects a server that repeats a cursor", async () => {
+  const calls: string[] = [];
+  // c1, c2, c1, ... — loops back to an earlier cursor.
+  const client = makeClient(endlessServer(calls, (n) => (n % 2 === 1 ? "c1" : "c2")));
+  const err = await client.listPending().then(
+    () => assert.fail("must not return"),
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof PerihelionPaginationError);
+  assert.equal(err.reason, "repeated_cursor");
+  assert.equal(err.nextCursor, "c1");
+  assert.equal(calls.length, 3, "stops as soon as the cursor repeats, not at maxPages");
+});
+
+test("listPendingPages stops on a repeated cursor instead of looping forever", async () => {
+  const calls: string[] = [];
+  const client = makeClient(endlessServer(calls, () => "same"));
+  let pages = 0;
+  await assert.rejects(async () => {
+    for await (const _page of client.listPendingPages()) pages++;
+  }, PerihelionPaginationError);
+  assert.equal(pages, 2);
 });

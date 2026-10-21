@@ -7,6 +7,7 @@
 
 import {
   PerihelionClient,
+  PerihelionPaginationError,
   verifyIntent,
   hashIntent,
   perihelionDomain,
@@ -488,7 +489,21 @@ export class Solver {
     // new round of `evaluate()` calls.
     this.inFlight.flushHeld();
 
-    const pending = await this.client.listPending();
+    let pending: IntentRecord[];
+    try {
+      pending = await this.client.listPending();
+    } catch (err) {
+      if (!(err instanceof PerihelionPaginationError)) throw err;
+      // A backlog deeper than maxPages (or a server repeating cursors) must be
+      // visible, but it should not stall the solver: work the part of the
+      // order book that was fetched and try again next tick.
+      this.log.warn("pending order book truncated; working the partial set", {
+        reason: err.reason,
+        pages: err.pages,
+        records: err.records.length,
+      });
+      pending = err.records as IntentRecord[];
+    }
     const now = Date.now();
 
     // Count hash-mismatches across this page so we can escalate when every
