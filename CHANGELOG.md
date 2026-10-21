@@ -14,6 +14,45 @@ versioned independently.
 
 ### Added
 
+- **sdk**: `PerihelionEscrowClient.isRefundable(intentHash)` and
+  `refundStatus(intentHash)` decide refundability from chain state. They read
+  `locks`, `confirmationGrace` and the timestamp from the latest block, apply
+  `cancelExpired`'s checks in the contract's order, and report the revert it
+  would hit (`NotLocked`, `AlreadyFinalized`, `DeadlineNotPassed`) plus
+  `refundableAt`. They are verified against `cancelExpired` on an Anvil
+  deployment. `PerihelionClient.isRefundable(record, …)` is now documented as an
+  off-chain hint only, since mempool statuses are best-effort and can be wrong
+  or stale.
+- `make sdk-abi` / `make sdk-abi-check`: `sdk/src/escrow-abi.ts` is now
+  generated from the PerihelionEscrow Foundry build artefact, and CI fails if
+  the committed file is stale.
+
+### Fixed
+
+- **sdk**: `ESCROW_ABI` had drifted from `PerihelionEscrow.sol` — it declared a
+  non-existent `getLock` function and a `PausedError` error.
+  `PerihelionEscrowClient.getLock` now reads the contract's `locks(bytes32)`
+  mapping getter (previously every call reverted) and returns the full record,
+  including the new `minDestAmount` field. Pause reverts now decode as
+  `EnforcedPause`.
+- **sdk**: `getEscrowAddress` now throws `PerihelionUndeployedChainError`, a
+  `PerihelionError` subclass exported from the package root that exposes the
+  requested `chainId`, instead of a bare `Error`. Its `name` is now
+  `"PerihelionUndeployedChainError"` (was `"UndeployedChainError"`); callers
+  matching on the name string should switch to `instanceof`.
+- **sdk**: doc-comments now match the mempool's real behaviour — duplicate
+  `submitIntent` calls return `201` and overwrite the record (not `409`);
+  `reportStatus` accepts only `MempoolIntentStatus` values (not `claimed`) and
+  returns `404` for terminal records; `listPending` pages are bounded by the
+  requested `limit` (server range 1–1000); `MIN_FILL_HEADROOM_SECS` refers to
+  the renamed Soroban `MIN_DISPATCH_WINDOW`. `IntentStatus` now includes
+  `filled`, which `MempoolIntentStatus` was silently dropping, so
+  `reportStatus(hash, "filled")` type-checks.
+- **docs**: `mempool-api.yaml` documents `201` for `POST /intents` (no `409`),
+  `limit` 1–1000 with default 100, and the five statuses the server accepts
+  (dropping `cancelling`). New SDK and mempool contract tests pin the SDK, the
+  spec and the server to each other. Restored the tail of
+  `mempool/test/contract.test.ts`, which an earlier commit had truncated.
 - **Soroban settlement:** `lz_receive_bytes` accepts the raw LayerZero `message`
   bytes, decodes them with the same codec the differential-fuzz harness
   exercises, and dispatches through the same endpoint/peer checks, pause gate,

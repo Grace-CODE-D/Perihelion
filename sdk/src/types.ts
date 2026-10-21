@@ -59,6 +59,7 @@ export type IntentStatus =
   | "pending" // signed, in the mempool, unclaimed
   | "claimed" // a solver has locked source funds
   | "settling" // cross-chain message in flight
+  | "filled" // delivered on Stellar; awaiting source-chain `Released`
   | "settled" // source-chain escrow emitted `Released`; bridge complete
   | "refunded" // deadline passed / failed; source funds returned
   | "expired"; // deadline passed before any claim

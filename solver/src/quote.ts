@@ -267,8 +267,8 @@ export async function evaluate(
   }
   // Reject intents that lack sufficient deadline headroom for the Soroban
   // settlement contract.  The contract's validate_and_stage_fill guard is:
-  //   if now + MAX_DISPATCH_WINDOW > rec.deadline { return Err(IntentExpired) }
-  // where MAX_DISPATCH_WINDOW = 1_800 s.  An intent that passes the plain
+  //   if now.saturating_add(MIN_DISPATCH_WINDOW) > rec.deadline { return Err(IntentExpired) }
+  // where MIN_DISPATCH_WINDOW = 1_800 s.  An intent that passes the plain
   // isExpired() check above but falls inside this window will have its EVM
   // lock succeed and its LayerZero fee paid, only for deliver_intent to reject
   // the fill — leaving the user's funds locked until cancelExpired.

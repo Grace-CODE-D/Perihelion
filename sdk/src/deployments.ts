@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import { Address } from "viem";
+import { PerihelionUndeployedChainError } from "./errors.js";
 
 /**
  * Deployed Perihelion escrow addresses by chain ID.
@@ -21,7 +22,7 @@ export const DEPLOYMENTS: Readonly<Record<number, Address>> = Object.freeze({
  *
  * @param chainId - The EVM chain ID
  * @returns The escrow contract address
- * @throws UndeployedChainError if the chain is not deployed
+ * @throws {PerihelionUndeployedChainError} if the chain is not deployed
  *
  * @example
  * ```ts
@@ -30,13 +31,7 @@ export const DEPLOYMENTS: Readonly<Record<number, Address>> = Object.freeze({
  */
 export function getEscrowAddress(chainId: number): Address {
   const address = DEPLOYMENTS[chainId];
-  if (!address) {
-    const error = new Error(
-      `Chain ${chainId} is not deployed. See docs/deployment.md for deployment procedure and supported chains.`
-    );
-    error.name = "UndeployedChainError";
-    throw error;
-  }
+  if (!address) throw new PerihelionUndeployedChainError(chainId);
   return address;
 }
 

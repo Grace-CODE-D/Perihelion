@@ -52,11 +52,11 @@ export interface ClientOptions {
 }
 
 /**
- * Default page size {@link PerihelionClient.listPending} requests explicitly,
- * matching the mempool server's own default page cap (issue #532). Passing an
- * explicit value (rather than relying on the server's default) keeps page
- * sizes bounded even against a server whose own default changes or is
- * misconfigured.
+ * Default page size {@link PerihelionClient.listPending} requests explicitly
+ * (issue #532). It equals the mempool server's default page size; the server
+ * accepts any `limit` from 1 to 1000. Passing an explicit value (rather than
+ * relying on the server's default) keeps page sizes bounded even against a
+ * server whose own default changes or is misconfigured.
  */
 const DEFAULT_LIST_LIMIT = 100;
 
@@ -72,7 +72,8 @@ export interface ListPendingPageResult {
  *
  * ## Retry Policy Summary
  * - **Writes ({@link submitIntent}, {@link reportStatus})**: Do NOT retry automatically.
- *   `submitIntent` is non-idempotent from the server's perspective (duplicate submissions return HTTP 409).
+ *   Resubmitting an intent is not rejected: the mempool replies `201` and overwrites the stored
+ *   record (resetting its status to `pending`), so a blind retry is not a safe no-op.
  * - **Reads ({@link getIntent}, {@link listPending}, {@link listPendingPage})**: Retry transient failures
  *   (network connection errors and 5xx HTTP responses) up to `maxRetries` times with exponential backoff.
  *   Timeouts and caller-initiated aborts are never retried.
@@ -174,13 +175,15 @@ export class PerihelionClient {
   /**
    * Submit a signed intent to the mempool. Returns its hash (id).
    *
-   * **Retry policy**: Does NOT retry automatically. Mempool intent submissions
-   * are non-idempotent from the server's perspective; duplicate submissions return HTTP 409.
+   * **Retry policy**: Does NOT retry automatically. The mempool does not
+   * reject duplicates: resubmitting an intent with the same hash returns `201`
+   * and overwrites the stored record, resetting its status to `pending`.
    *
    * The locally-computed `signed.hash` is treated as authoritative. If the
    * server echoes a different hash, {@link PerihelionHashMismatchError} is thrown.
    *
-   * @throws {@link PerihelionHttpError} on non-2xx responses (e.g. 400 validation, 409 conflict).
+   * @throws {@link PerihelionHttpError} on non-2xx responses (e.g. 400 validation or
+   *   signature failure, 413 oversized body, 429 rate limited).
    * @throws {@link PerihelionTimeoutError} if the request exceeds `requestTimeoutMs`.
    * @throws {@link PerihelionNetworkError} on network / transport failure.
    * @throws {@link PerihelionHashMismatchError} if the server returns a different hash.
@@ -229,14 +232,18 @@ export class PerihelionClient {
   }
 
   /**
-   * Report a status transition for an intent (e.g. `"claimed"`, `"settled"`).
+   * Report a status transition for an intent (e.g. `"filled"`, `"settled"`).
+   * `status` must be one of the {@link MempoolIntentStatus} values the mempool
+   * accepts — `pending`, `filled`, `settled`, `refunded` or `expired` — anything
+   * else is rejected with `400`.
    * Restricted server-side to holders of the mempool's shared status token —
    * intended for relayer/solver services, not end users.
    *
    * **Retry policy**: Does NOT retry automatically (PATCH updates intent state).
    *
-   * @throws {@link PerihelionValidationError} if `hash` is not a 32-byte hex string (no request is made).
-   * @throws {@link PerihelionHttpError} on non-2xx responses (401 unauthorized, 404 not found, 409 conflict).
+   * @throws {@link PerihelionHttpError} on non-2xx responses (400 invalid hash or
+   *   status, 401 unauthorized, 404 unknown intent or one already in a terminal
+   *   status — `settled`, `refunded` or `expired` — 429 rate limited).
    * @throws {@link PerihelionTimeoutError} if the request exceeds `requestTimeoutMs`.
    * @throws {@link PerihelionNetworkError} on network / transport failure.
    */
@@ -371,8 +378,9 @@ export class PerihelionClient {
    * **Retry policy**: Retries each page request up to `maxRetries` times on
    * transient network errors and 5xx server responses.
    *
-   * The server caps each page at `DEFAULT_LIST_LIMIT` (100) records and
-   * returns a `nextCursor` when more remain. This method accumulates all pages
+   * Each page holds at most `limit` records (default {@link DEFAULT_LIST_LIMIT},
+   * 100; the server accepts 1–1000 and rejects anything else with `400`), and
+   * the server returns a `nextCursor` when more remain. This method accumulates all pages
    * so callers always see the full result set, regardless of how many intents
    * are in the mempool. A `maxPages` guard (default 100) prevents a
    * misbehaving server from looping the client forever.
@@ -481,31 +489,36 @@ export class PerihelionClient {
   }
 
   /**
-   * Check if an intent is refundable via `cancelExpired` (issue #175).
+   * **Off-chain hint only** — estimate from a mempool record whether the
+   * intent looks refundable via `cancelExpired` (issue #175).
    *
-   * An intent is refundable if **all three** conditions hold:
-   * 1. It exists and has not been settled or previously refunded.
+   * Do not use this to decide whether to call `cancelExpired`. Mempool
+   * statuses are best-effort reports from relayers and solvers, and the status
+   * endpoint is unauthenticated unless the operator configures a token. A wrong
+   * or malicious `settled` report hides a refundable lock, and a stale
+   * `pending` after an on-chain release suggests a call that will revert. Use
+   * {@link PerihelionEscrowClient.isRefundable} (or
+   * {@link PerihelionEscrowClient.refundStatus}), which reads the escrow's
+   * `locks` record, `confirmationGrace` and block time and mirrors
+   * `cancelExpired`'s checks exactly.
+   *
+   * This hint returns `true` when both conditions hold:
+   * 1. The mempool status is still `'pending'`. Every other
+   *    {@link MempoolIntentStatus} is treated as not refundable: `filled`
+   *    means the intent was delivered on the destination chain and is awaiting
+   *    source-chain release, `settled` and `refunded` are terminal, and
+   *    `expired` indicates the record has diverged from the refund path.
    * 2. Its deadline has passed **and** the confirmation grace period has elapsed.
-   * 3. No `FillConfirmed` was received — the status is still `'pending'`.
-   *    An intent with status `'claimed'`, `'settling'`, `'filled'`, or
-   *    `'expired'` is **not** refundable: `settling` means a cross-chain message
-   *    is already in flight (calling `cancelExpired` would race it and likely
-   *    revert with `AlreadyFinalized`), `filled` means the intent was delivered
-   *    on the destination chain and is awaiting source-chain release (the
-   *    refund path no longer applies), and `claimed` / `expired` indicate the
-   *    on-chain state has already diverged from the refund path.
    *
-   * This helper detects when a bridge has definitively failed and the user's
-   * funds can be recovered locally without waiting for cross-chain confirmation.
-   *
-   * **Typical usage**: After `waitForSettlement` times out or returns `'expired'`,
-   * check `isRefundable` to see if the user can recover via the local fallback.
+   * It is useful for cheaply filtering a list of records (e.g. in a UI) before
+   * confirming each candidate on-chain.
    *
    * ```ts
-   * const grace = await escrowClient.confirmationGrace(); // live contract value
    * const record = await client.waitForSettlement(hash);
-   * if (client.isRefundable(record, grace * 1_000)) {
-   *   // Call escrow.cancelExpired(hash) to recover funds
+   * const grace = await escrowClient.confirmationGrace(); // bigint seconds
+   * if (client.isRefundable(record, Number(grace) * 1_000)) {
+   *   // Hint only: confirm on-chain before sending the transaction.
+   *   if (await escrowClient.isRefundable(hash)) await escrowClient.cancelExpired(hash);
    * }
    * ```
    *
@@ -523,8 +536,9 @@ export class PerihelionClient {
    *   boundary, mirroring {@link isExpired}'s `clockSkew` parameter. Useful
    *   when `now` comes from a client clock that may run fast.
    *   Default: `0`.
-   * @returns `true` if the intent can be refunded via `cancelExpired`.
+   * @returns `true` if the mempool record suggests the intent is refundable.
    *
+   * @see {PerihelionEscrowClient.isRefundable} for the authoritative on-chain check.
    * @see {PerihelionEscrowClient.confirmationGrace} to read the live grace period.
    */
   isRefundable(
@@ -534,10 +548,9 @@ export class PerihelionClient {
     clockSkew = 0,
   ): boolean {
     // Condition 3: only 'pending' intents are candidates — no settlement is
-    // in progress or has already completed. This also excludes 'settling',
-    // which has a cross-chain message in flight, and 'filled', which has been
-    // delivered on the destination chain and is awaiting source-chain release;
-    // neither must be treated as refundable purely on elapsed time.
+    // in progress or has already completed. This excludes 'filled', which has
+    // been delivered on the destination chain and is awaiting source-chain
+    // release and must not be treated as refundable purely on elapsed time.
     if (record.status !== "pending") {
       return false;
     }

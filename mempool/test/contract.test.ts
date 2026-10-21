@@ -121,15 +121,69 @@ test("spec has the expected paths and schemas (sanity check on the fixture itsel
   assert.ok(schemas.IntentRecord, "spec must define IntentRecord");
 });
 
-test("POST /intents 200 response matches the documented SubmitIntentResponse schema", async () => {
+test("POST /intents 201 response matches the documented SubmitIntentResponse schema", async () => {
   const res = await submitSignedIntent();
-  assert.equal(res.status, 200);
+  assert.equal(res.status, 201);
   const body = await res.json();
   assertMatchesSchema(
-    responseSchema("/intents", "post", "200"),
+    responseSchema("/intents", "post", "201"),
     body,
-    "POST /intents 200 body",
+    "POST /intents 201 body",
   );
+});
+
+test("POST /intents: a duplicate submission returns 201 and overwrites, as documented (no 409)", async () => {
+  const responses = (spec.paths as Record<string, any>)["/intents"].post.responses;
+  assert.ok(!("409" in responses), "spec must not document a 409 the server never sends");
+
+  // Pin every field that varies per call so both submissions hash identically.
+  const fixed = { nonce: "123456789", deadline: Math.floor(Date.now() / 1000) + 600 };
+  const first = await submitSignedIntent(fixed);
+  assert.equal(first.status, 201);
+  const { hash } = (await first.json()) as { hash: string };
+
+  const patched = await fetch(`${BASE}/intents/${hash}/status`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "filled" }),
+  });
+  assert.equal(patched.status, 200);
+
+  const second = await submitSignedIntent(fixed);
+  assert.equal(second.status, 201);
+  assert.equal(((await second.json()) as { hash: string }).hash, hash);
+
+  const record = (await (await fetch(`${BASE}/intents/${hash}`)).json()) as { status: string };
+  assert.equal(record.status, "pending", "a resubmission resets the stored record");
+});
+
+test("PATCH /intents/:hash/status accepts exactly the documented IntentStatus vocabulary", async () => {
+  const documented = (schemas.IntentStatus as { enum: string[] }).enum;
+  // Terminal statuses freeze a record, so each transition gets a fresh intent.
+  const patchFresh = async (status: string) => {
+    const { hash } = (await (await submitSignedIntent()).json()) as { hash: string };
+    return fetch(`${BASE}/intents/${hash}/status`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+  };
+
+  for (const status of documented) {
+    const res = await patchFresh(status);
+    assert.equal(res.status, 200, `documented status "${status}" must be accepted`);
+  }
+  // Lifecycle states the SDK's broader IntentStatus has but the mempool rejects.
+  for (const status of ["claimed", "settling", "cancelling"]) {
+    assert.ok(!documented.includes(status), `spec must not document "${status}"`);
+    const res = await patchFresh(status);
+    assert.equal(res.status, 400, `undocumented status "${status}" must be rejected`);
+    assertMatchesSchema(
+      responseSchema("/intents/{hash}/status", "patch", "400"),
+      await res.json(),
+      `PATCH status=${status} 400 body`,
+    );
+  }
 });
 
 test("POST /intents 400 (invalid signature) response matches the documented ErrorResponse schema", async () => {
@@ -207,5 +261,118 @@ test("GET /intents/:hash 200 response matches the documented IntentRecord schema
 
   const res = await fetch(`${BASE}/intents/${hash}`);
   assert.equal(res.status, 200);
+  const body = await res.json();
+  assertMatchesSchema(
+    responseSchema("/intents/{hash}", "get", "200"),
+    body,
+    "GET /intents/:hash 200 body",
+  );
+});
 
-/* … truncated 3299 chars — edit only what you need near the top … */
+test("GET /intents/:hash 404 response matches the documented ErrorResponse schema", async () => {
+  // Use a well-formed hash that doesn't exist (not a malformed one).
+  // Malformed hashes return 400 (see server.test.ts "returns 400 for a malformed hash").
+  const res = await fetch(`${BASE}/intents/0x${"00".repeat(32)}`);
+  assert.equal(res.status, 404);
+  const body = await res.json();
+  assertMatchesSchema(
+    responseSchema("/intents/{hash}", "get", "404"),
+    body,
+    "GET /intents/:hash 404 body",
+  );
+});
+
+test("POST /intents 413 (oversized body) matches the documented ErrorResponse schema", async () => {
+  const res = await fetch(`${BASE}/intents`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ intent: { blob: "x".repeat(9000) }, signature: "0x00" }),
+  });
+  assert.equal(res.status, 413);
+  assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+  const body = await res.json();
+  assertMatchesSchema(
+    responseSchema("/intents", "post", "413"),
+    body,
+    "POST /intents 413 body",
+  );
+});
+
+test("POST /intents 400 (malformed JSON) matches the documented ErrorResponse schema", async () => {
+  const res = await fetch(`${BASE}/intents`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{ not json",
+  });
+  assert.equal(res.status, 400);
+  assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+  const body = await res.json();
+  assertMatchesSchema(
+    responseSchema("/intents", "post", "400"),
+    body,
+    "POST /intents 400 (malformed JSON) body",
+  );
+});
+
+test("an unknown route returns 404 in the documented ErrorResponse shape", async () => {
+  const res = await fetch(`${BASE}/does-not-exist`);
+  assert.equal(res.status, 404);
+  assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+  const body = await res.json();
+  assertMatchesSchema(
+    { $ref: "#/components/schemas/ErrorResponse" },
+    body,
+    "404 catch-all body",
+  );
+});
+
+test("GET /intents enforces the documented limit bounds", async () => {
+  const params = (spec.paths as Record<string, any>)["/intents"].get.parameters as Array<{
+    name: string;
+    schema: { minimum: number; maximum: number };
+  }>;
+  const { minimum, maximum } = params.find((p) => p.name === "limit")!.schema;
+  for (const limit of [minimum, maximum]) {
+    const res = await fetch(`${BASE}/intents?limit=${limit}`);
+    assert.equal(res.status, 200, `limit=${limit} is documented as valid`);
+  }
+  for (const limit of [minimum - 1, maximum + 1]) {
+    const res = await fetch(`${BASE}/intents?limit=${limit}`);
+    assert.equal(res.status, 400, `limit=${limit} is outside the documented range`);
+  }
+});
+
+test("GET /intents?limit=<invalid> returns the documented 400", async () => {
+  const res = await fetch(`${BASE}/intents?limit=abc`);
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assertMatchesSchema(
+    responseSchema("/intents", "get", "400"),
+    body,
+    "GET /intents?limit=abc 400 body",
+  );
+});
+
+test("GET /intents?chainId=<invalid> returns the documented 400", async () => {
+  const res = await fetch(`${BASE}/intents?chainId=abc`);
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assertMatchesSchema(
+    responseSchema("/intents", "get", "400"),
+    body,
+    "GET /intents?chainId=abc 400 body",
+  );
+});
+
+test("GET /info matches the documented MempoolInfo schema and reflects the configured domain", async () => {
+  const res = await fetch(`${BASE}/info`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assertMatchesSchema(responseSchema("/info", "get", "200"), body, "GET /info 200 body");
+  assert.deepEqual(body, {
+    name: "Perihelion",
+    version: "1",
+    chainId: CHAIN_ID,
+    verifyingContract: ESCROW,
+  });
+});

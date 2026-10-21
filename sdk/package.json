@@ -40,8 +40,10 @@
     "viem": "^2.55.8"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.14.0",
     "c8": "^10.1.2",
+    "js-yaml": "^4.3.2",
     "tsx": "^4.23.13",
     "typescript": "^5.4.0"
   }

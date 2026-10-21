@@ -8,7 +8,10 @@
  * - `lock()` for a solver to claim an intent: pulls the user's pre-approved
  *   source funds into escrow and dispatches the fill instruction to Stellar
  * - `cancelExpired()` to recover expired intents
- * - `confirmationGrace()` and `getLock()` to verify intent status
+ * - `confirmationGrace()` and `getLock()` (over the `locks` mapping getter)
+ *   to verify intent status
+ * - `isRefundable()` / `refundStatus()` to check, from chain state, whether
+ *   `cancelExpired()` would currently succeed
  *
  * This client provides type-safe helpers over viem's PublicClient and
  * WalletClient to perform these on-chain actions directly.
@@ -23,15 +26,45 @@ import type {
 import type { Intent, Hex } from "./types.js";
 import { ESCROW_ABI } from "./escrow-abi.js";
 
-/** Lock structure returned by getLock. */
-interface Lock {
+/**
+ * Lock record returned by {@link PerihelionEscrowClient.getLock}. Mirrors
+ * `PerihelionEscrow.Lock` (`minDestAmount` is a uint128 and `deadline` a
+ * uint64 on-chain; both are surfaced as bigint).
+ */
+export interface Lock {
   solver: Address;
   user: Address;
   asset: Address;
   amount: bigint;
+  minDestAmount: bigint;
   deadline: bigint;
   released: boolean;
   refunded: boolean;
+}
+
+/**
+ * Why `cancelExpired` would revert right now, named after the contract error it
+ * would revert with.
+ */
+export type RefundBlocker = "NotLocked" | "AlreadyFinalized" | "DeadlineNotPassed";
+
+/** Result of {@link PerihelionEscrowClient.refundStatus}. */
+export interface RefundStatus {
+  /** `true` if `cancelExpired(intentHash)` passes all of its checks at `blockNumber`. */
+  refundable: boolean;
+  /** When not refundable, the error `cancelExpired` would revert with. */
+  reason?: RefundBlocker;
+  /** The on-chain lock record, if one exists. */
+  lock?: Lock;
+  /**
+   * Unix time (seconds) from which the lock is refundable: `deadline +
+   * confirmationGrace`. Present whenever a lock exists.
+   */
+  refundableAt?: bigint;
+  /** Block the state was read at; every value above is from this one block. */
+  blockNumber: bigint;
+  /** Timestamp of `blockNumber`, compared against `refundableAt`. */
+  blockTimestamp: bigint;
 }
 
 /**
@@ -133,30 +166,92 @@ export class PerihelionEscrowClient {
   /**
    * Retrieve the lock record for an intent.
    *
-   * `getLock` is a public mapping getter and does not revert for an unknown
-   * hash — it returns a zero-valued struct — so absence is determined from
-   * `lock.user` rather than from a caught exception. RPC/transport failures
-   * are not caught here and propagate to the caller, since they must not be
-   * confused with "no lock exists".
+   * Wraps the contract's public `locks(bytes32)` mapping getter, which does
+   * not revert for an unknown hash — it returns a zero-valued struct — so
+   * absence is determined from `user` rather than from a caught exception.
+   * RPC/transport failures are not caught here and propagate to the caller,
+   * since they must not be confused with "no lock exists".
    *
    * @param intentHash The hash of the intent.
    * @returns The lock record, or undefined if no lock exists.
    * @throws If the underlying RPC call fails (network, timeout, etc.).
    */
   async getLock(intentHash: Hex): Promise<Lock | undefined> {
-    const lock = (await this.publicClient.readContract({
-      address: this.escrowAddress,
-      abi: ESCROW_ABI,
-      functionName: "getLock",
-      args: [intentHash],
-    })) as Lock;
-    return lock.user === zeroAddress ? undefined : lock;
+    return this._readLock(intentHash);
   }
 
   /**
-   * Read the confirmation grace period (in seconds).
-   * Used by {@link PerihelionClient.isRefundable} to determine when
-   * an expired intent becomes refundable via {@link cancelExpired}.
+   * Check, from chain state, whether `cancelExpired(intentHash)` would succeed.
+   *
+   * This is the authoritative refundability check. Unlike
+   * {@link PerihelionClient.isRefundable}, it does not trust the mempool's
+   * best-effort status reports.
+   *
+   * See {@link refundStatus} for the exact semantics and for the reason a
+   * lock is not refundable.
+   *
+   * @param intentHash The hash of the intent.
+   * @returns `true` if `cancelExpired` passes all of its checks at the latest block.
+   * @throws If the underlying RPC call fails (network, timeout, etc.).
+   */
+  async isRefundable(intentHash: Hex): Promise<boolean> {
+    return (await this.refundStatus(intentHash)).refundable;
+  }
+
+  /**
+   * Evaluate `cancelExpired`'s checks against the escrow's state at the latest
+   * block, in the contract's order:
+   *
+   * 1. a lock exists (`NotLocked`),
+   * 2. it is neither released nor refunded (`AlreadyFinalized`),
+   * 3. `block.timestamp >= deadline + confirmationGrace` (`DeadlineNotPassed`).
+   *
+   * The lock, the grace period and the timestamp are all read at the same
+   * block, so the verdict cannot mix state from different blocks.
+   * `cancelExpired` is not pause-gated, so pausing does not affect the result.
+   *
+   * A transaction lands in a later block than the one read here, with a
+   * timestamp at least as high, so a `refundable: true` verdict stays true
+   * unless another transaction finalizes the lock first. Near the boundary
+   * the check is conservative: it can report `DeadlineNotPassed` for a call
+   * that would succeed one block later. It does not predict a revert from
+   * the asset token itself (`TransferFailed`).
+   *
+   * @param intentHash The hash of the intent.
+   * @returns The verdict, the reason when not refundable, and the state it was based on.
+   * @throws If the underlying RPC call fails (network, timeout, etc.).
+   */
+  async refundStatus(intentHash: Hex): Promise<RefundStatus> {
+    const block = await this.publicClient.getBlock({ blockTag: "latest" });
+    const blockNumber = block.number;
+    const blockTimestamp = block.timestamp;
+    const [lock, grace] = await Promise.all([
+      this._readLock(intentHash, blockNumber),
+      this.publicClient.readContract({
+        address: this.escrowAddress,
+        abi: ESCROW_ABI,
+        functionName: "confirmationGrace",
+        blockNumber,
+      }),
+    ]);
+
+    if (!lock) {
+      return { refundable: false, reason: "NotLocked", blockNumber, blockTimestamp };
+    }
+    const refundableAt = lock.deadline + grace;
+    const base = { lock, refundableAt, blockNumber, blockTimestamp };
+    if (lock.released || lock.refunded) {
+      return { refundable: false, reason: "AlreadyFinalized", ...base };
+    }
+    if (blockTimestamp < refundableAt) {
+      return { refundable: false, reason: "DeadlineNotPassed", ...base };
+    }
+    return { refundable: true, ...base };
+  }
+
+  /**
+   * Read the confirmation grace period (in seconds): how long after an
+   * intent's deadline {@link cancelExpired} becomes callable.
    *
    * @returns The grace period in seconds.
    */
@@ -167,6 +262,37 @@ export class PerihelionEscrowClient {
       functionName: "confirmationGrace",
     });
     return grace as bigint;
+  }
+
+  // Read locks(intentHash), optionally at a pinned block; undefined if no lock exists.
+  private async _readLock(intentHash: Hex, blockNumber?: bigint): Promise<Lock | undefined> {
+    const [
+      solver,
+      user,
+      asset,
+      amount,
+      minDestAmount,
+      deadline,
+      released,
+      refunded,
+    ] = await this.publicClient.readContract({
+      address: this.escrowAddress,
+      abi: ESCROW_ABI,
+      functionName: "locks",
+      args: [intentHash],
+      blockNumber,
+    });
+    if (user === zeroAddress) return undefined;
+    return {
+      solver,
+      user,
+      asset,
+      amount,
+      minDestAmount,
+      deadline,
+      released,
+      refunded,
+    };
   }
 
   // Convert SDK intent to contract tuple format.

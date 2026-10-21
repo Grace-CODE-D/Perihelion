@@ -33,6 +33,7 @@ jobs:
       pull-requests: read
     outputs:
       evm: ${{ steps.filter.outputs.evm }}
+      sdk_escrow: ${{ steps.filter.outputs.sdk_escrow }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
@@ -43,6 +44,13 @@ jobs:
             evm:
               - 'contracts/evm/**'
               - '.github/workflows/evm.yml'
+            sdk_escrow:
+              - 'contracts/evm/**'
+              - '.github/workflows/evm.yml'
+              - 'sdk/src/escrow-abi.ts'
+              - 'sdk/src/escrow-client.ts'
+              - 'sdk/test/escrow-client.test.ts'
+              - 'scripts/gen-escrow-abi.mjs'
 
   evm:
     name: EVM (Solidity)
@@ -193,6 +201,40 @@ jobs:
       - name: Compare build against pinned bytecode
         run: ./scripts/check-pinned-bytecode.sh
 
+  # The SDK's ESCROW_ABI is generated from the contract build; fail if the
+  # committed copy is stale, then exercise PerihelionEscrowClient against a
+  # deployed escrow on Anvil (getLock, and refundStatus against cancelExpired).
+  sdk-abi:
+    name: SDK ABI in sync
+    needs: changes
+    if: needs.changes.outputs.sdk_escrow == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09  # v1.6.0
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check escrow-abi.ts matches the contract build
+        run: make sdk-abi-check
+
+      - name: Escrow client tests (Anvil)
+        working-directory: sdk
+        run: node --test --import tsx test/escrow-client.test.ts
+
   natspec:
     name: NatSpec coverage
     needs: changes
@@ -244,12 +286,12 @@ jobs:
   check:
     name: EVM / required
     runs-on: ubuntu-latest
-    needs: [evm, slither, bytecode, natspec]
+    needs: [evm, slither, bytecode, sdk-abi, natspec]
     if: always()
     steps:
       - name: Assert all EVM jobs passed or were skipped
         run: |
-          for result in "${{ needs.evm.result }}" "${{ needs.slither.result }}" "${{ needs.bytecode.result }}" "${{ needs.natspec.result }}"; do
+          for result in "${{ needs.evm.result }}" "${{ needs.slither.result }}" "${{ needs.bytecode.result }}" "${{ needs.sdk-abi.result }}" "${{ needs.natspec.result }}"; do
             if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
               echo "::error::An EVM job $result — merge is blocked."
               exit 1
