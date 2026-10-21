@@ -239,9 +239,9 @@ export const MAX_DEADLINE_HORIZON_SEC = MAX_DEADLINE_HORIZON;
  *
  * The contract's `validate_and_stage_fill` guard is:
  * ```
- * if now + MAX_DISPATCH_WINDOW > rec.deadline { return Err(IntentExpired) }
+ * if now.saturating_add(MIN_DISPATCH_WINDOW) > rec.deadline { return Err(IntentExpired) }
  * ```
- * where `MAX_DISPATCH_WINDOW = 1_800` (30 minutes). Any intent whose deadline
+ * where `MIN_DISPATCH_WINDOW = 1_800` (30 minutes). Any intent whose deadline
  * is within 30 minutes of the current ledger time is rejected on-chain even
  * though it has not yet expired.
  *
@@ -250,12 +250,12 @@ export const MAX_DEADLINE_HORIZON_SEC = MAX_DEADLINE_HORIZON;
  * dispatching the cross-chain message — all of which are sunk costs that
  * cannot be recovered if the destination leg is rejected.
  *
- * The value here is `MAX_DISPATCH_WINDOW + 120 s` (2 minutes of relay-latency
+ * The value here is `MIN_DISPATCH_WINDOW + 120 s` (2 minutes of relay-latency
  * and clock-skew margin). It is defined once in the SDK so the solver,
  * the relayer, and any future tooling can import the same constant rather than
  * each duplicating the magic number.
  *
- * Mirrors `contracts/soroban/settlement/src/lib.rs::MAX_DISPATCH_WINDOW`.
+ * Mirrors `contracts/soroban/settlement/src/lib.rs::MIN_DISPATCH_WINDOW`.
  */
 export const MIN_FILL_HEADROOM_SECS = 1_920; // 1_800 s dispatch window + 120 s margin
 

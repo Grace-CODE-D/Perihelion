@@ -147,9 +147,10 @@ paths:
 
         **Duplicate submissions are not currently rejected.** If an intent
         with the same hash has already been submitted, this call overwrites
-        the stored record (last write wins) and still returns `200`. A
-        strict `409 Conflict` check is tracked separately by issue #320 and
-        is not yet part of this contract.
+        the stored record (last write wins, resetting its status to
+        `pending`) and still returns `201`. A strict `409 Conflict` check is
+        tracked separately by issue #320 and is not yet part of this
+        contract.
       requestBody:
         required: true
         content:
@@ -171,7 +172,7 @@ paths:
               signature: "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b0f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a69781c"
               hash: "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"
       responses:
-        '200':
+        '201':
           description: |
             Intent accepted and stored; returns the canonical intent hash.
             Also returned when overwriting a prior submission with the same
@@ -207,15 +208,6 @@ paths:
                   summary: Request body is not valid JSON
                   value:
                     error: "Malformed JSON request body"
-        '409':
-          description: |
-            Conflict — an intent with this hash already exists in the mempool.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Intent already exists"
         '413':
           description: |
             The JSON request body exceeds the server's 8 KiB limit.
@@ -257,8 +249,8 @@ paths:
           schema:
             type: integer
             minimum: 1
-            maximum: 100
-            default: 20
+            maximum: 1000
+            default: 100
       responses:
         '200':
           description: A page of intents.
@@ -378,7 +370,10 @@ paths:
               example:
                 error: "Unauthorized"
         '404':
-          description: No intent with this hash is known to the mempool.
+          description: |
+            No intent with this hash is known to the mempool, or the intent is
+            already in a terminal status (`settled`, `refunded`, `expired`)
+            and can no longer change.
           content:
             application/json:
               schema:
@@ -420,7 +415,6 @@ components:
         - pending
         - filled
         - settled
-        - cancelling
         - refunded
         - expired
 

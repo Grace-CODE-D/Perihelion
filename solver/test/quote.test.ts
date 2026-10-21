@@ -79,7 +79,7 @@ test("rejects expired intents (terminal)", async () => {
 
 test("rejects intent with insufficient deadline headroom (terminal)", async () => {
   // The Soroban settlement contract rejects deliver_intent when
-  //   now + MAX_DISPATCH_WINDOW (1_800 s) > intent.deadline
+  //   now + MIN_DISPATCH_WINDOW (1_800 s) > intent.deadline
   // so the solver must refuse fills whose remaining time is below
   // MIN_FILL_HEADROOM_SECS (1_920 s = 1_800 s dispatch window + 120 s margin)
   // before committing to the EVM lock and LayerZero fee.
