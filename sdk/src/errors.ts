@@ -119,6 +119,21 @@ export class PerihelionHashMismatchError extends PerihelionError {
 }
 
 /**
+ * Thrown by `getEscrowAddress` when no escrow is registered in `DEPLOYMENTS`
+ * for the requested chain. `chainId` is the chain that was looked up.
+ */
+export class PerihelionUndeployedChainError extends PerihelionError {
+  readonly chainId: number;
+  constructor(chainId: number, options?: ErrorOptions) {
+    super(
+      `Chain ${chainId} is not deployed. See docs/deployment.md for deployment procedure and supported chains.`,
+      options,
+    );
+    this.chainId = chainId;
+  }
+}
+
+/**
  * Thrown when a contract call reverts with a custom error decoded from the
  * escrow ABI. `errorName` is the Solidity error identifier (e.g.
  * `"NoPendingOwner"`), `selector` is the 4-byte selector as a hex string, and

@@ -193,6 +193,36 @@ jobs:
       - name: Compare build against pinned bytecode
         run: ./scripts/check-pinned-bytecode.sh
 
+  # The SDK's ESCROW_ABI is generated from the contract build; fail if the
+  # committed copy is stale, then exercise PerihelionEscrowClient against a
+  # deployed escrow on Anvil.
+  sdk-abi:
+    name: SDK ABI in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check escrow-abi.ts matches the contract build
+        run: make sdk-abi-check
+
+      - name: Escrow client tests (Anvil)
+        working-directory: sdk
+        run: node --test --import tsx test/escrow-client.test.ts
+
   natspec:
     name: NatSpec coverage
     needs: changes
@@ -244,12 +274,12 @@ jobs:
   check:
     name: EVM / required
     runs-on: ubuntu-latest
-    needs: [evm, slither, bytecode, natspec]
+    needs: [evm, slither, bytecode, sdk-abi, natspec]
     if: always()
     steps:
       - name: Assert all EVM jobs passed or were skipped
         run: |
-          for result in "${{ needs.evm.result }}" "${{ needs.slither.result }}" "${{ needs.bytecode.result }}" "${{ needs.natspec.result }}"; do
+          for result in "${{ needs.evm.result }}" "${{ needs.slither.result }}" "${{ needs.bytecode.result }}" "${{ needs.sdk-abi.result }}" "${{ needs.natspec.result }}"; do
             if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
               echo "::error::An EVM job $result — merge is blocked."
               exit 1

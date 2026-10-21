@@ -19,6 +19,7 @@ import {
   PerihelionNetworkError,
   PerihelionValidationError,
   PerihelionHashMismatchError,
+  PerihelionUndeployedChainError,
   IntentValidationError,
 } from "../src/errors.js";
 import { MempoolResponseError } from "../src/validate.js";
@@ -203,6 +204,7 @@ test("all SDK error types pass instanceof PerihelionError", () => {
     new PerihelionNetworkError("network"),
     new PerihelionValidationError("validation"),
     new PerihelionHashMismatchError("0x01", "0x02"),
+    new PerihelionUndeployedChainError(1),
     new IntentValidationError("field", "message"),
     new MempoolResponseError("mempool"),
   ];

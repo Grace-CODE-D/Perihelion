@@ -14,6 +14,23 @@ versioned independently.
 
 ### Added
 
+- `make sdk-abi` / `make sdk-abi-check`: `sdk/src/escrow-abi.ts` is now
+  generated from the PerihelionEscrow Foundry build artefact, and CI fails if
+  the committed file is stale.
+
+### Fixed
+
+- **sdk**: `ESCROW_ABI` had drifted from `PerihelionEscrow.sol` — it declared a
+  non-existent `getLock` function and a `PausedError` error.
+  `PerihelionEscrowClient.getLock` now reads the contract's `locks(bytes32)`
+  mapping getter (previously every call reverted) and returns the full record,
+  including the new `minDestAmount` field. Pause reverts now decode as
+  `EnforcedPause`.
+- **sdk**: `getEscrowAddress` now throws `PerihelionUndeployedChainError`, a
+  `PerihelionError` subclass exported from the package root that exposes the
+  requested `chainId`, instead of a bare `Error`. Its `name` is now
+  `"PerihelionUndeployedChainError"` (was `"UndeployedChainError"`); callers
+  matching on the name string should switch to `instanceof`.
 - **Soroban settlement:** `lz_receive_bytes` accepts the raw LayerZero `message`
   bytes, decodes them with the same codec the differential-fuzz harness
   exercises, and dispatches through the same endpoint/peer checks, pause gate,

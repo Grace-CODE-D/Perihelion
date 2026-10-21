@@ -7,6 +7,7 @@ import {
   getEscrowAddress,
   tryGetEscrowAddress,
 } from "../src/deployments.js";
+import { PerihelionError, PerihelionUndeployedChainError } from "../src/errors.js";
 
 test("DEPLOYMENTS", async (t) => {
   await t.test("is a readonly object", () => {
@@ -21,14 +22,26 @@ test("DEPLOYMENTS", async (t) => {
 });
 
 test("getEscrowAddress", async (t) => {
-  await t.test("throws UndeployedChainError for undeployed chain", () => {
+  await t.test("throws PerihelionUndeployedChainError for undeployed chain", () => {
     assert.throws(
       () => getEscrowAddress(8453),
       (err: unknown) => {
-        assert(err instanceof Error);
-        assert.equal(err.name, "UndeployedChainError");
+        assert(err instanceof PerihelionUndeployedChainError);
+        assert.equal(err.name, "PerihelionUndeployedChainError");
         assert.match(err.message, /Chain 8453 is not deployed/);
         assert.match(err.message, /docs\/deployment.md/);
+        return true;
+      }
+    );
+  });
+
+  await t.test("error is a PerihelionError exposing chainId", () => {
+    assert.throws(
+      () => getEscrowAddress(1),
+      (err: unknown) => {
+        assert(err instanceof PerihelionError);
+        assert(err instanceof PerihelionUndeployedChainError);
+        assert.equal(err.chainId, 1);
         return true;
       }
     );
@@ -49,8 +62,8 @@ test("getEscrowAddress", async (t) => {
     assert.throws(
       () => getEscrowAddress(1),
       (err: unknown) => {
-        assert(err instanceof Error);
-        assert.equal(err.name, "UndeployedChainError");
+        assert(err instanceof PerihelionUndeployedChainError);
+        assert.equal(err.name, "PerihelionUndeployedChainError");
         assert.match(err.message, /Chain 1/);
         return true;
       }
@@ -61,8 +74,8 @@ test("getEscrowAddress", async (t) => {
     assert.throws(
       () => getEscrowAddress(0),
       (err: unknown) => {
-        assert(err instanceof Error);
-        assert.equal(err.name, "UndeployedChainError");
+        assert(err instanceof PerihelionUndeployedChainError);
+        assert.equal(err.name, "PerihelionUndeployedChainError");
         return true;
       }
     );
@@ -72,8 +85,8 @@ test("getEscrowAddress", async (t) => {
     assert.throws(
       () => getEscrowAddress(-1),
       (err: unknown) => {
-        assert(err instanceof Error);
-        assert.equal(err.name, "UndeployedChainError");
+        assert(err instanceof PerihelionUndeployedChainError);
+        assert.equal(err.name, "PerihelionUndeployedChainError");
         return true;
       }
     );
