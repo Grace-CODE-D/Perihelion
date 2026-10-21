@@ -128,13 +128,21 @@ fn base32_value(c: u8) -> Option<u8> {
 /// trailing two bytes. This mirrors what the host parser accepts, so a `true`
 /// result means `Address::from_string_bytes` will not trap (issue #902).
 pub fn is_valid_strkey(s: &[u8]) -> bool {
+    decode_strkey(s).is_some()
+}
+
+/// Decode a well-formed 56-character `G...` or `C...` strkey into its version
+/// byte and 32-byte key payload, applying the same checks as
+/// [`is_valid_strkey`]. Returns `None` for anything the host parser would
+/// refuse.
+pub fn decode_strkey(s: &[u8]) -> Option<(u8, [u8; 32])> {
     if s.len() != 56 {
-        return false;
+        return None;
     }
     let expected_version = match s[0] {
         b'G' => VERSION_ACCOUNT,
         b'C' => VERSION_CONTRACT,
-        _ => return false,
+        _ => return None,
     };
 
     // 56 base32 characters carry exactly 280 bits = 35 bytes, with no leftover.
@@ -143,9 +151,7 @@ pub fn is_valid_strkey(s: &[u8]) -> bool {
     let mut bits_in_buffer: u32 = 0;
     let mut out_idx = 0usize;
     for &c in s.iter() {
-        let Some(value) = base32_value(c) else {
-            return false;
-        };
+        let value = base32_value(c)?;
         bit_buffer = (bit_buffer << 5) | (value as u64);
         bits_in_buffer += 5;
         if bits_in_buffer >= 8 {
@@ -155,7 +161,12 @@ pub fn is_valid_strkey(s: &[u8]) -> bool {
         }
     }
 
-    payload[0] == expected_version && checksum(&payload[..33]) == [payload[33], payload[34]]
+    if payload[0] != expected_version || checksum(&payload[..33]) != [payload[33], payload[34]] {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&payload[1..33]);
+    Some((payload[0], key))
 }
 
 #[cfg(test)]
@@ -200,6 +211,19 @@ mod test {
         let mut nul = *ZERO_ACCOUNT;
         nul[20] = 0;
         assert!(!is_valid_strkey(&nul));
+    }
+
+    #[test]
+    fn decode_strkey_round_trips_contract_id() {
+        let id = [0x7Bu8; 32];
+        assert_eq!(
+            decode_strkey(&contract_strkey(&id)),
+            Some((VERSION_CONTRACT, id))
+        );
+        assert_eq!(
+            decode_strkey(ZERO_ACCOUNT),
+            Some((VERSION_ACCOUNT, [0u8; 32]))
+        );
     }
 
     #[test]

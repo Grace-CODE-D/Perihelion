@@ -1211,3 +1211,42 @@ test("#525 validateIntent rejects destination with invalid char in base32", () =
     IntentValidationError,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Contract-native destination assets: destAsset may name a SEP-41 token that
+// exists only as a contract, as its `C...` strkey.
+// ---------------------------------------------------------------------------
+
+const CONTRACT_TOKEN = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+test("isStellarAsset accepts the three canonical destAsset forms", () => {
+  assert.equal(isStellarAsset("native"), true);
+  assert.equal(isStellarAsset(VALID_DEST_ASSET), true);
+  assert.equal(isStellarAsset(CONTRACT_TOKEN), true);
+});
+
+test("isStellarAsset rejects non-asset strkeys and corrupted contract strkeys", () => {
+  // An account is a valid strkey but not an asset.
+  assert.equal(isStellarAsset(VALID_DESTINATION), false);
+  // Corrupted checksum.
+  assert.equal(isStellarAsset(CONTRACT_TOKEN.slice(0, 55) + "A"), false);
+  // Truncated.
+  assert.equal(isStellarAsset(CONTRACT_TOKEN.slice(0, 55)), false);
+  // A contract cannot be a classic issuer.
+  assert.equal(isStellarAsset(`USDC:${CONTRACT_TOKEN}`), false);
+});
+
+test("validateIntent accepts a contract-only token as destAsset", () => {
+  assert.doesNotThrow(() =>
+    validateIntent({
+      user: account.address,
+      destination: VALID_DESTINATION,
+      sourceChainId: 8453,
+      sourceAsset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      sourceAmount: "1000000",
+      destAsset: CONTRACT_TOKEN,
+      minDestAmount: "900000",
+      deadline: FUTURE_DEADLINE,
+    })
+  );
+});

@@ -84,6 +84,12 @@ pub enum DataKey {
     /// Latest memoized window start timestamp (for efficiency).
     LatestWindowStart,
 
+    // Instance tier (destination assets).
+    /// Contract-native (SEP-41) token allowed as a `C...` `dest_asset`. Present
+    /// (as `true`) iff the admin allowlisted it. `native` and `CODE:ISSUER`
+    /// identifiers resolve without an entry; see `asset.rs`.
+    AllowedDestToken(Address),
+
     // Persistent tier (per-intent lifecycle).
     Intent(BytesN<32>),
     /// Terminal idempotency marker: set iff the intent was settled.

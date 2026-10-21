@@ -18,13 +18,20 @@ floating point arithmetic for conversion or pricing.
 | XLM | Stellar `native` | `destAsset` | 7 | 0.0000001 XLM, one stroop |
 | USDC | Stellar `USDC:<ISSUER_G...>` | `destAsset` | 7 | 0.0000001 USDC |
 | EURC | Stellar `EURC:<ISSUER_G...>` | `destAsset` | 7 | 0.0000001 EURC |
+| Contract-native token | Stellar `C...` token contract (allowlisted) | `destAsset` | token's `decimals()` | token-specific |
 
 EVM token addresses are deployment-specific. A solver must configure decimals
 per token address; the 6 decimal stablecoin convention only applies to listed
 USDC/EURC-style source assets. Stellar classic assets and the native XLM asset
-use 7 decimals in Soroban token amounts. At settlement, a Stellar destination
-asset may be represented by its Stellar Asset Contract address, but its decimals
+use 7 decimals in Soroban token amounts. At settlement, a classic destination
+asset is represented by its Stellar Asset Contract address, but its decimals
 remain the decimals of the underlying Stellar asset.
+
+A contract-native (SEP-41) token has no classic asset and no fixed decimals.
+Solvers must read its `decimals()` and must not assume 7. The settlement
+contract accepts such a token only after the admin allowlists it; see
+[Intent Specification](./intent-spec.md#destasset-field--canonical-asset-identifier)
+for the three `destAsset` forms.
 
 The reference solver's `defaultDecimalsLookup` (`solver/src/quote.ts`) reflects
 this: it never guesses decimals for an EVM token address — it throws, and the

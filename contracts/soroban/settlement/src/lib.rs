@@ -16,6 +16,7 @@
 //! message boundary, and Soroban transaction atomicity (a failed check rolls back
 //! any token transfer in the same call). See `docs/TECHNICAL-ARCHITECTURE.md`.
 
+mod asset;
 mod endpoint;
 mod error;
 mod messages;
@@ -85,6 +86,7 @@ mod events {
         keeper_reward_paid,
         keeper_reward_skipped,
         dispatch_keeper_reward_set,
+        dest_token_allowed_set,
         max_intent_amount_set,
         max_ttl_set,
         rolling_window_cap_set,
@@ -133,6 +135,7 @@ mod events {
 // | `keeper_reward_paid`           | ("keeper_reward_paid", intent_hash)    | (caller: Address, reward: i128)
 // | `keeper_reward_skipped`        | ("keeper_reward_skipped", intent_hash) | (caller: Address, reward: i128)
 // | `dispatch_keeper_reward_set`   | ("dispatch_keeper_reward_set",)        | (reward: i128)
+// | `dest_token_allowed_set`       | ("dest_token_allowed_set",)            | (token: Address, allowed: bool)
 // | `max_intent_amount_set`        | ("max_intent_amount_set",)             | (max_amount: i128)
 // | `max_ttl_set`                  | ("max_ttl_set",)                       | (old: u32, new: u32)
 // | `rolling_window_cap_set`       | ("rolling_window_cap_set",)            | (duration: u64, cap: i128)
@@ -753,6 +756,51 @@ impl Perihelion {
         Ok(())
     }
 
+    /// Allow or disallow a contract-native (SEP-41) token as a `C...`
+    /// `destAsset`. Admin-only.
+    ///
+    /// A `C...` identifier is settled by calling `transfer` on that contract
+    /// directly, so only tokens the operator has vetted may be named. Inbound
+    /// FillInstructions naming a token that is not allowed are rejected with
+    /// `UnsupportedDestAsset` (the LayerZero message stays retryable, so it can
+    /// be redelivered once the token is allowed). `native` and `CODE:ISSUER`
+    /// identifiers need no entry: they resolve to the native token and to the
+    /// asset's derived Stellar Asset Contract respectively.
+    ///
+    /// Emits `dest_token_allowed_set(token, allowed)` event.
+    pub fn set_dest_token_allowed(
+        env: Env,
+        token: Address,
+        allowed: bool,
+    ) -> Result<(), PerihelionError> {
+        Self::bump_instance(&env);
+        Self::require_admin(&env)?.require_auth();
+        let key = DataKey::AllowedDestToken(token.clone());
+        if allowed {
+            env.storage().instance().set(&key, &true);
+        } else {
+            env.storage().instance().remove(&key);
+        }
+        env.events()
+            .publish((events::dest_token_allowed_set(&env),), (token, allowed));
+        Ok(())
+    }
+
+    /// Whether `token` is allowlisted as a contract-native `destAsset`.
+    pub fn is_dest_token_allowed(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::AllowedDestToken(token))
+    }
+
+    /// Resolve a canonical `destAsset` identifier to the token contract a fill
+    /// would transfer: `native` → the native token, `CODE:ISSUER` → its Stellar
+    /// Asset Contract, `C...` → that contract if allowlisted. Lets solvers and
+    /// integrators check an intent's asset before locking funds.
+    pub fn resolve_dest_asset(env: Env, asset_id: Bytes) -> Result<Address, PerihelionError> {
+        Self::resolve_dest_asset_id(&env, &asset_id)
+    }
+
     /// Set the per-intent maximum amount (value cap). Admin-only.
     /// Rejects any intent with min_dest_amount > max_amount. Set to 0 to disable.
     /// Issue #286: This cap is applied to the destination asset amount on Stellar
@@ -994,28 +1042,6 @@ impl Perihelion {
 
     // --- LayerZero inbound -----------------------------------------------------
 
-    /// LayerZero receive hook for an already-typed message. Callable only by the
-    /// configured endpoint, and only for messages from the registered peer on
-    /// `origin.src_eid`. Replay-guarded by a lazy-nonce high-water mark.
-    /// Dispatches on the message variant.
-    ///
-    /// This is the typed half of the inbound boundary. When the endpoint hands
-    /// the contract the raw LayerZero `message` bytes instead of an ABI-marshalled
-    /// `LzMessage`, use [`Self::lz_receive_bytes`], which decodes those bytes with
-    /// the same codec the differential-fuzz harness exercises and then dispatches
-    /// through the same `apply_inbound` path.
-    #[cfg(any(test, feature = "typed-inbound"))]
-    pub fn lz_receive(
-        env: Env,
-        origin: Origin,
-        _guid: BytesN<32>,
-        message: LzMessage,
-    ) -> Result<(), PerihelionError> {
-        Self::bump_instance(&env);
-        Self::authorize_inbound(&env, &origin)?;
-        Self::apply_inbound(&env, &origin, message)
-    }
-
     /// LayerZero receive hook for the raw wire bytes of a `FillInstruction` or
     /// `CancelIntent` payload (#722).
     ///
@@ -1050,7 +1076,8 @@ impl Perihelion {
             if fill_instruction.locked_solver.is_none() {
                 return Err(PerihelionError::MalformedPayload);
             }
-            LzMessage::FillInstruction(fill_instruction)
+            let dest_asset = Self::resolve_dest_asset_id(&env, &fill_instruction.dest_asset)?;
+            LzMessage::FillInstruction(fill_instruction.into_fill_instruction(dest_asset))
         } else {
             // `decode_message` only ever returns MSG_FILL_INSTRUCTION or
             // MSG_CANCEL_INTENT; any other discriminant is already
@@ -1778,6 +1805,33 @@ impl Perihelion {
     }
 }
 
+/// Typed inbound entrypoint, kept in its own `#[contractimpl]` block because the
+/// macro cannot gate a single method behind `#[cfg]`.
+#[cfg(any(test, feature = "typed-inbound"))]
+#[contractimpl]
+impl Perihelion {
+    /// LayerZero receive hook for an already-typed message. Callable only by the
+    /// configured endpoint, and only for messages from the registered peer on
+    /// `origin.src_eid`. Replay-guarded by a lazy-nonce high-water mark.
+    /// Dispatches on the message variant.
+    ///
+    /// This is the typed half of the inbound boundary. When the endpoint hands
+    /// the contract the raw LayerZero `message` bytes instead of an ABI-marshalled
+    /// `LzMessage`, use [`Self::lz_receive_bytes`], which decodes those bytes with
+    /// the same codec the differential-fuzz harness exercises and then dispatches
+    /// through the same `apply_inbound` path.
+    pub fn lz_receive(
+        env: Env,
+        origin: Origin,
+        _guid: BytesN<32>,
+        message: LzMessage,
+    ) -> Result<(), PerihelionError> {
+        Self::bump_instance(&env);
+        Self::authorize_inbound(&env, &origin)?;
+        Self::apply_inbound(&env, &origin, message)
+    }
+}
+
 // --- Private helpers (not contract entrypoints) -------------------------------
 
 impl Perihelion {
@@ -1833,6 +1887,40 @@ impl Perihelion {
                 // remains available even during pause to prevent fund stranding.
                 Self::accept_nonce(env, origin.src_eid, origin.nonce)?;
                 Self::on_cancel_inbound(env, origin.src_eid, ci)
+            }
+        }
+    }
+
+    /// See [`Self::resolve_dest_asset`] and `asset.rs`.
+    fn resolve_dest_asset_id(env: &Env, asset_id: &Bytes) -> Result<Address, PerihelionError> {
+        let len = asset_id.len() as usize;
+        if len > asset::MAX_DEST_ASSET_LEN {
+            return Err(PerihelionError::InvalidDestAsset);
+        }
+        let mut buf = [0u8; asset::MAX_DEST_ASSET_LEN];
+        asset_id.copy_into_slice(&mut buf[..len]);
+        match asset::parse(&buf[..len]).ok_or(PerihelionError::InvalidDestAsset)? {
+            asset::DestAsset::Native => env
+                .storage()
+                .instance()
+                .get(&DataKey::NativeToken)
+                .ok_or(PerihelionError::NotInitialized),
+            asset::DestAsset::Classic { code, issuer } => Ok(env
+                .deployer()
+                .with_stellar_asset(asset::classic_asset_xdr(env, code, &issuer))
+                .deployed_address()),
+            asset::DestAsset::Contract => {
+                // `parse` validated the strkey, so this cannot trap.
+                let token = Address::from_string_bytes(asset_id);
+                if env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::AllowedDestToken(token.clone()))
+                {
+                    Ok(token)
+                } else {
+                    Err(PerihelionError::UnsupportedDestAsset)
+                }
             }
         }
     }

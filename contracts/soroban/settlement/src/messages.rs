@@ -160,6 +160,45 @@ fn read_field<const N: usize>(
     Ok(out)
 }
 
+/// A `FillInstruction` as it arrives on the wire, before its `dest_asset`
+/// identifier is resolved to a token contract.
+///
+/// `dest_asset` holds the user-signed canonical identifier (`native`,
+/// `CODE:ISSUER` or a `C...` strkey, see [`crate::asset`]) with the wire
+/// padding stripped. It is already validated structurally; resolving it needs
+/// contract storage (the native token and the contract-token allowlist), so
+/// `Perihelion::lz_receive_bytes` does that and then calls
+/// [`WireFillInstruction::into_fill_instruction`].
+#[derive(Clone)]
+pub struct WireFillInstruction {
+    pub intent_hash: BytesN<32>,
+    pub src_eid: u32,
+    pub recipient: Address,
+    pub dest_asset: Bytes,
+    pub min_dest_amount: i128,
+    pub deadline: u64,
+    pub preferred_solver: Option<Address>,
+    pub locked_solver: Option<BytesN<32>>,
+    pub reservation_window: u64,
+}
+
+impl WireFillInstruction {
+    /// Attach the resolved destination token contract.
+    pub fn into_fill_instruction(self, dest_asset: Address) -> FillInstruction {
+        FillInstruction {
+            intent_hash: self.intent_hash,
+            src_eid: self.src_eid,
+            recipient: self.recipient,
+            dest_asset,
+            min_dest_amount: self.min_dest_amount,
+            deadline: self.deadline,
+            preferred_solver: self.preferred_solver,
+            locked_solver: self.locked_solver,
+            reservation_window: self.reservation_window,
+        }
+    }
+}
+
 /// Decode an inbound message payload. Returns the message type discriminant and
 /// parsed message, or an error if the payload is malformed.
 /// Validates version and routes to the appropriate decoder.
@@ -170,7 +209,7 @@ fn read_field<const N: usize>(
 pub fn decode_message(
     env: &Env,
     message: &Bytes,
-) -> Result<(u8, FillInstruction, Option<CancelInstruction>), crate::PerihelionError> {
+) -> Result<(u8, WireFillInstruction, Option<CancelInstruction>), crate::PerihelionError> {
     use crate::PerihelionError;
 
     // Minimum: version(1) + type(1)
@@ -193,18 +232,18 @@ pub fn decode_message(
         MSG_CANCEL_INTENT => {
             let ci = decode_cancel_intent(env, message)?;
             // Return a dummy FillInstruction carrying the cancel's intent_hash so the
-            // decoder keeps one return shape. The zero-account strkey is a
-            // placeholder: callers that handle CancelIntent read the third element
-            // and ignore this one.
+            // decoder keeps one return shape. The zero-account strkey and empty
+            // asset are placeholders: callers that handle CancelIntent read the
+            // third element and ignore this one.
             let zero_addr = Address::from_str(
                 env,
                 "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
             );
-            let dummy = FillInstruction {
+            let dummy = WireFillInstruction {
                 intent_hash: ci.intent_hash.clone(),
                 src_eid: 0,
-                recipient: zero_addr.clone(),
-                dest_asset: zero_addr,
+                recipient: zero_addr,
+                dest_asset: Bytes::new(env),
                 min_dest_amount: 0,
                 deadline: 0,
                 preferred_solver: None,
@@ -222,12 +261,13 @@ pub fn decode_message(
 ///
 /// # Address decoding
 ///
-/// The `recipient` field carries a Stellar strkey. The `dest_asset` field
-/// carries the user-signed asset identifier (`native` or `CODE:ISSUER`) as
-/// ASCII, right-zero-padded to 69 bytes. The adapter must preserve that exact
-/// identifier and resolve it through the destination-chain asset registry; it
-/// must not decode an asset identifier as a Soroban `Address`. The recipient
-/// remains a Soroban `Address` and is decoded from its 56-byte strkey field.
+/// The `recipient` field carries a Stellar strkey and is decoded into a Soroban
+/// `Address`. The `dest_asset` field carries the user-signed asset identifier
+/// (`native`, `CODE:ISSUER` or a `C...` contract strkey, see [`crate::asset`])
+/// as ASCII, right-zero-padded to 69 bytes. It is validated here and preserved
+/// verbatim; it is never decoded as a Soroban `Address`, because two of its
+/// three forms are not strkeys. `lz_receive_bytes` resolves it to the token
+/// contract.
 ///
 /// # solver identity and preferred solver
 ///
@@ -242,7 +282,7 @@ pub fn decode_message(
 fn decode_fill_instruction(
     env: &Env,
     message: &Bytes,
-) -> Result<FillInstruction, crate::PerihelionError> {
+) -> Result<WireFillInstruction, crate::PerihelionError> {
     use crate::PerihelionError;
 
     // Release delivery accepts only the canonical fixed-width payload. The
@@ -269,16 +309,16 @@ fn decode_fill_instruction(
     }
     let recipient = decode_strkey_address(env, &recipient_raw)?;
 
-    // Extract dest_asset (offset 94, 69 bytes): ASCII strkey characters right-zero-padded.
-    // The field is 69 bytes wide (not 32) so CODE:ISSUER assets survive the wire
-    // without truncation — see #270. Strip trailing zeros and decode.
-    let mut dest_asset_raw = [0u8; 69];
-    for (i, byte) in dest_asset_raw.iter_mut().enumerate() {
-        *byte = message
-            .get(94 + i as u32)
-            .ok_or(PerihelionError::MalformedPayload)?;
+    // Extract dest_asset (offset 94, 69 bytes): the ASCII asset identifier,
+    // right-zero-padded. The field is 69 bytes wide (not 32) so CODE:ISSUER
+    // assets survive the wire without truncation — see #270. Strip the padding,
+    // check it is one of the canonical forms and keep the identifier bytes.
+    let dest_asset_raw: [u8; crate::asset::MAX_DEST_ASSET_LEN] = read_field(message, 94)?;
+    let dest_asset_id = &dest_asset_raw[..trimmed_len(&dest_asset_raw)];
+    if crate::asset::parse(dest_asset_id).is_none() {
+        return Err(PerihelionError::MalformedPayload);
     }
-    let dest_asset = decode_strkey_address(env, &dest_asset_raw)?;
+    let dest_asset = Bytes::from_slice(env, dest_asset_id);
 
     // Extract min_dest_amount (offset 163, 16 bytes, big-endian)
     let mut min_dest_amount_bytes = [0u8; 16];
@@ -311,7 +351,7 @@ fn decode_fill_instruction(
         Some(BytesN::from_array(env, &solver_word))
     };
 
-    Ok(FillInstruction {
+    Ok(WireFillInstruction {
         intent_hash,
         src_eid,
         recipient,
@@ -338,13 +378,7 @@ fn decode_fill_instruction(
 /// alphabet, version byte and CRC16). Any failure is `MalformedPayload` (issue #902).
 fn decode_strkey_address(env: &Env, padded: &[u8]) -> Result<Address, crate::PerihelionError> {
     use crate::PerihelionError;
-    // Find length by trimming trailing zero bytes.
-    let len = padded
-        .iter()
-        .rposition(|&b| b != 0)
-        .map(|p| p + 1)
-        .unwrap_or(0);
-    let strkey_bytes = &padded[..len];
+    let strkey_bytes = &padded[..trimmed_len(padded)];
     if !strkey::is_valid_strkey(strkey_bytes) {
         return Err(PerihelionError::MalformedPayload);
     }
@@ -354,6 +388,15 @@ fn decode_strkey_address(env: &Env, padded: &[u8]) -> Result<Address, crate::Per
     }
     // from_string_bytes accepts both G... (account) and C... (contract) strkeys.
     Ok(Address::from_string_bytes(&b))
+}
+
+/// Length of a right-zero-padded ASCII wire field with the padding removed.
+fn trimmed_len(padded: &[u8]) -> usize {
+    padded
+        .iter()
+        .rposition(|&b| b != 0)
+        .map(|p| p + 1)
+        .unwrap_or(0)
 }
 
 /// Render an `Address` as its strkey ASCII bytes, right-zero-padded to `N`.
@@ -384,13 +427,31 @@ fn strkey_field<const N: usize>(addr: &Address) -> [u8; N] {
 /// (see #271).
 #[cfg(test)]
 pub(crate) fn encode_fill_instruction(env: &Env, fi: &FillInstruction) -> Bytes {
+    encode_fill_instruction_with_dest_asset(env, fi, &strkey_field::<69>(&fi.dest_asset))
+}
+
+/// [`encode_fill_instruction`], but writing `dest_asset_id` (any canonical
+/// identifier: `native`, `CODE:ISSUER` or a `C...` strkey) into the
+/// `dest_asset` field in place of `fi.dest_asset`'s strkey.
+#[cfg(test)]
+pub(crate) fn encode_fill_instruction_with_dest_asset(
+    env: &Env,
+    fi: &FillInstruction,
+    dest_asset_id: &[u8],
+) -> Bytes {
+    assert!(
+        dest_asset_id.len() <= 69,
+        "dest_asset does not fit the 69-byte wire field"
+    );
+    let mut dest_asset_field = [0u8; 69];
+    dest_asset_field[..dest_asset_id.len()].copy_from_slice(dest_asset_id);
     let mut b = Bytes::new(env);
     b.push_back(PROTOCOL_VERSION);
     b.push_back(MSG_FILL_INSTRUCTION);
     b.append(&Bytes::from_array(env, &fi.intent_hash.to_array()));
     b.append(&Bytes::from_array(env, &fi.src_eid.to_be_bytes()));
     b.append(&Bytes::from_array(env, &strkey_field::<56>(&fi.recipient)));
-    b.append(&Bytes::from_array(env, &strkey_field::<69>(&fi.dest_asset)));
+    b.append(&Bytes::from_array(env, &dest_asset_field));
     b.append(&Bytes::from_array(
         env,
         &(fi.min_dest_amount as u128).to_be_bytes(),
@@ -689,5 +750,53 @@ mod tests {
         }
         assert_eq!(msg.len(), FILL_INSTRUCTION_LENGTH);
         assert!(decode_fill_instruction(&env, &msg).is_err());
+    }
+
+    fn vector_bytes(env: &Env, hex: &str) -> Bytes {
+        let mut msg = Bytes::new(env);
+        for b in decode_hex(hex) {
+            msg.push_back(b);
+        }
+        msg
+    }
+
+    /// Each of the three canonical `destAsset` forms decodes from its golden
+    /// vector, and the identifier is preserved byte-for-byte (padding stripped).
+    #[test]
+    fn test_decode_fill_instruction_keeps_each_dest_asset_form() {
+        let env = Env::default();
+        let cases: [(&str, &[u8]); 3] = [
+            (
+                include_str!("../../../shared/wire-vectors/fill_instruction.hex"),
+                b"CDGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZLND",
+            ),
+            (
+                include_str!("../../../shared/wire-vectors/fill_instruction_native_asset.hex"),
+                b"native",
+            ),
+            (
+                include_str!("../../../shared/wire-vectors/fill_instruction_classic_asset.hex"),
+                b"USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            ),
+        ];
+        for (hex, id) in cases {
+            let fi = decode_fill_instruction(&env, &vector_bytes(&env, hex))
+                .expect("golden vector must decode");
+            assert_eq!(fi.dest_asset, Bytes::from_slice(&env, id));
+            assert_eq!(fi.min_dest_amount, 1_000_000_000);
+        }
+    }
+
+    /// A `G...` account strkey is a valid strkey but not an asset identifier.
+    #[test]
+    fn test_decode_fill_instruction_rejects_account_dest_asset() {
+        const ACCOUNT: &str = include_str!(
+            "../../../shared/wire-vectors/neg/fill_instruction_account_dest_asset.hex"
+        );
+        let env = Env::default();
+        assert_eq!(
+            decode_message(&env, &vector_bytes(&env, ACCOUNT)).err(),
+            Some(PerihelionError::MalformedPayload)
+        );
     }
 }

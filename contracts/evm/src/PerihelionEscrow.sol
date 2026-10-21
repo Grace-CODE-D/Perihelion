@@ -169,7 +169,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///         LayerZero fee or cause a decode failure on the Soroban side.
     uint256 public constant MAX_DESTINATION_LEN = 56;
     /// @notice Maximum byte length of `Intent.destAsset`. The longest valid form
-    ///         is `<CODE>:<ISSUER>` (12 + 1 + 56 = 69 bytes); `"native"` is 6.
+    ///         is `<CODE>:<ISSUER>` (12 + 1 + 56 = 69 bytes); a `C...` token
+    ///         contract strkey is 56 and `"native"` is 6.
     uint256 public constant MAX_DEST_ASSET_LEN = 69;
 
     // --- Immutable / config --------------------------------------------------
@@ -1095,7 +1096,8 @@ contract PerihelionEscrow is ILayerZeroReceiver {
     ///      `intent.destination` is a Stellar strkey (exactly 56 chars) encoded as a
     ///      fixed 56-byte field (zero-padded on the right if shorter — should never happen
     ///      given the pre-dispatch length check).
-    ///      `intent.destAsset` is up to 69 bytes (`CODE:ISSUER` or `"native"`) encoded as
+    ///      `intent.destAsset` is up to 69 bytes (`"native"`, `CODE:ISSUER` or a `C...`
+    ///      token contract strkey) encoded as
     ///      a fixed 69-byte field (zero-padded on the right). Using the full 69 bytes
     ///      prevents truncation of CODE:ISSUER assets whose ISSUER runs past byte 32.
     ///      `intent.preferredSolver` is an EVM address left-padded to 32 bytes; all-zeros
