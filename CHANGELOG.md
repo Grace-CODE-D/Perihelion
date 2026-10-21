@@ -14,6 +14,15 @@ versioned independently.
 
 ### Added
 
+- **sdk**: `PerihelionEscrowClient.isRefundable(intentHash)` and
+  `refundStatus(intentHash)` decide refundability from chain state. They read
+  `locks`, `confirmationGrace` and the timestamp from the latest block, apply
+  `cancelExpired`'s checks in the contract's order, and report the revert it
+  would hit (`NotLocked`, `AlreadyFinalized`, `DeadlineNotPassed`) plus
+  `refundableAt`. They are verified against `cancelExpired` on an Anvil
+  deployment. `PerihelionClient.isRefundable(record, …)` is now documented as an
+  off-chain hint only, since mempool statuses are best-effort and can be wrong
+  or stale.
 - `make sdk-abi` / `make sdk-abi-check`: `sdk/src/escrow-abi.ts` is now
   generated from the PerihelionEscrow Foundry build artefact, and CI fails if
   the committed file is stale.

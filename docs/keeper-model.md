@@ -33,7 +33,7 @@ If the Stellar-side settlement also fails:
 
 ### EVM: `cancelExpired` (issue #175)
 
-**Expected caller**: The user, via the SDK's `waitForSettlement` status query and `isRefundable` helper.
+**Expected caller**: The user, via the SDK's `waitForSettlement` status query and the on-chain `PerihelionEscrowClient.isRefundable` check.
 
 **Incentive**: None. The user is refunding their own funds, so self-interest is the motivation.
 
@@ -43,7 +43,7 @@ If the Stellar-side settlement also fails:
 
 **Operational model**:
 - Best practice: Frontend/SDK detects an expired, unrefunded intent via `waitForSettlement` timeout or `record.status === "expired"`.
-- Calls `isRefundable(record)` to check if recovery is possible.
+- Calls `escrowClient.isRefundable(hash)` to check from chain state whether `cancelExpired` would succeed. The mempool-based `client.isRefundable(record, graceMs)` is only a hint: mempool statuses are best-effort and can be wrong or stale.
 - Presents a "recover funds" button to the user.
 - User clicks to call `escrow.cancelExpired(hash)` (gas cost ~100k units, paid by user).
 - Funds are refunded to `l.user`.
@@ -141,12 +141,16 @@ The two keeper paths treat an underfunded reserve differently. Operators must mo
    });
    ```
 
-2. **Detect refundable intents**: When settlement times out or returns `expired`, check:
+2. **Detect refundable intents**: When settlement times out or returns `expired`, check the escrow itself:
    ```ts
-   if (client.isRefundable(record, confirmationGraceMs)) {
+   const status = await escrowClient.refundStatus(hash);
+   if (status.refundable) {
      // Offer recovery button to user
+   } else if (status.reason === "DeadlineNotPassed") {
+     // Refundable from status.refundableAt (unix seconds)
    }
    ```
+   `client.isRefundable(record, confirmationGraceMs)` reads only the mempool record. Use it at most as a cheap pre-filter, never as the decision to call `cancelExpired`.
 
 3. **Provide recovery flow**:
    - Button: "Recover your funds"
@@ -172,4 +176,4 @@ The two keeper paths treat an underfunded reserve differently. Operators must mo
 - **Technical architecture**: `docs/TECHNICAL-ARCHITECTURE.md` (idempotency & reentrancy invariants)
 - **EVM contract**: `contracts/evm/src/PerihelionEscrow.sol` (NatSpec on `cancelExpired`)
 - **Soroban contract**: `contracts/soroban/settlement/src/lib.rs` (NatSpec on `cancel_expired_intent`, `set_keeper_reward`)
-- **SDK**: `sdk/src/client.ts` (methods: `waitForSettlement`, `isRefundable`)
+- **SDK**: `sdk/src/escrow-client.ts` (methods: `isRefundable`, `refundStatus`, `cancelExpired`); `sdk/src/client.ts` (methods: `waitForSettlement`, mempool-hint `isRefundable`)
