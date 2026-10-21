@@ -18,6 +18,9 @@ import {
   PerihelionValidationError,
 } from "./errors.js";
 import { parseIntentRecord, parseIntentRecordArray } from "./validate.js";
+
+/** A 32-byte `0x`-prefixed intent hash, as accepted in mempool URLs. */
+const INTENT_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 import type {
   Address,
   Hex,
@@ -126,6 +129,23 @@ export class PerihelionClient {
     this.maxRetries = opts.maxRetries ?? 3;
   }
 
+  /**
+   * Build the URL for an intent resource after checking that `hash` really is
+   * a 32-byte `0x` hex string. `Hex` is only a compile-time type; a value from
+   * JSON or user input such as `../admin` or `x?y=` would otherwise change the
+   * request path or query, and `reportStatus` would attach its bearer token to
+   * that URL. The hash is lower-cased and percent-encoded before use.
+   */
+  private intentUrl(method: string, hash: unknown, suffix = ""): string {
+    if (typeof hash !== "string" || !INTENT_HASH_RE.test(hash)) {
+      throw new PerihelionValidationError(
+        `[Perihelion] ${method}: hash must be a 32-byte 0x-prefixed hex string, got: ${JSON.stringify(hash)}`,
+        "hash",
+      );
+    }
+    return new URL(`${this.base}/intents/${encodeURIComponent(hash.toLowerCase())}${suffix}`).toString();
+  }
+
   private get domain(): TypedDataDomain {
     if (this.opts.chainId == null || this.opts.verifyingContract == null) {
       throw new PerihelionValidationError(
@@ -228,9 +248,10 @@ export class PerihelionClient {
    * @throws {@link PerihelionNetworkError} on network / transport failure.
    */
   async reportStatus(hash: Hex, status: MempoolIntentStatus, statusToken: string): Promise<void> {
+    const url = this.intentUrl("reportStatus", hash, "/status");
     let res: Response;
     try {
-      res = await this.fetchWithTimeout(`${this.base}/intents/${hash}/status`, {
+      res = await this.fetchWithTimeout(url, {
         method: "PATCH",
         headers: {
           "content-type": "application/json",
@@ -265,12 +286,14 @@ export class PerihelionClient {
    * **Retry policy**: Retries transient failures (network errors and 5xx HTTP responses)
    * up to `maxRetries` times with exponential backoff. Aborts and timeouts are never retried.
    *
+   * @throws {@link PerihelionValidationError} if `hash` is not a 32-byte hex string (no request is made).
    * @throws {@link PerihelionHttpError} on non-2xx responses (e.g. 404 not found).
    * @throws {@link PerihelionTimeoutError} if the request exceeds `requestTimeoutMs`.
    * @throws {@link PerihelionNetworkError} on non-retryable network failure.
    */
   async getIntent(hash: Hex, signal?: AbortSignal): Promise<IntentRecord> {
-    const res = await this.fetchWithRetry("getIntent", `${this.base}/intents/${hash}`, {}, signal);
+    const url = this.intentUrl("getIntent", hash);
+    const res = await this.fetchWithRetry("getIntent", url, {}, signal);
     if (!res.ok) {
       throw new PerihelionHttpError("getIntent", res.status, await res.text());
     }
